@@ -1,0 +1,31 @@
+# Rust build output
+/target/
+
+# Nix build output
+/result
+/result-*
+
+# direnv
+/.direnv/
+
+# Editors
+*.swp
+*~
+.idea/
+.vscode/
+
+# Never commit key material or decrypted data by accident.
+*.age
+keys.txt
+*.dec
+*.dec.*
+*.plain
+*.plaintext
+
+# secrit temp copies and backups (ciphertext only, but never commit them)
+.*.secrit-*.yaml
+*.secrit-bak.*
+
+# insta pending snapshots
+*.snap.new
+*.pending-snap

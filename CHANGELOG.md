@@ -52,6 +52,8 @@ All notable changes to this project are recorded here. The format follows
   path, and no longer leaves value copies in JSON parser buffers.
 - sops stderr lines that may hold the value are dropped, not redacted inline.
 - SIGQUIT is deferred like SIGINT, so it cannot leave a temp copy behind.
+- Piped input is read with `read(2)` straight into the fixed value buffer. std's stdin
+  buffer kept up to 8 KiB of a value between 56 and 64 KiB, and never wiped it (REG-2).
 
 ### Changed from docs/PLAN.md
 

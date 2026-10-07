@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::io::{self, IsTerminal, Read};
+use std::os::fd::{AsFd, BorrowedFd};
 
 use secrecy::{ExposeSecret, SecretBox};
 use subtle::ConstantTimeEq;
@@ -127,7 +128,18 @@ pub fn read_value(name: &Name, mode: InputMode) -> Result<SecretValue, InputErro
         read_from_tty(name, mode)
     } else {
         let mut wait = || tty::wait_readable(io::stdin()).map_err(InputError::from);
-        read_piped(&mut stdin.lock(), mode, &mut wait)
+        read_piped(&mut FdReader(stdin.as_fd()), mode, &mut wait)
+    }
+}
+
+/// `read(2)` with no buffer of its own. std's stdin `BufReader` keeps up to
+/// 8 KiB of a value in a buffer that is never wiped (REG-2).
+#[derive(Debug)]
+pub struct FdReader<'a>(pub BorrowedFd<'a>);
+
+impl Read for FdReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Ok(rustix::io::read(self.0, buf)?)
     }
 }
 
@@ -370,6 +382,40 @@ mod tests {
         let shown = format!("{v:?}");
         assert_eq!(shown, "SecretValue([REDACTED])");
         assert!(!shown.contains("hunter2"));
+    }
+
+    /// REG-2: the piped reader takes only what fits in the slice it is
+    /// given, so nothing waits in a hidden buffer. The rest stays in the pipe.
+    #[test]
+    fn fd_reader_does_not_read_ahead() {
+        let (mut r, mut w) = io::pipe().unwrap();
+        std::io::Write::write_all(&mut w, &[b'a'; 100]).unwrap();
+        drop(w);
+        let mut small = [0u8; 10];
+        let n = FdReader(r.as_fd()).read(&mut small).unwrap();
+        assert_eq!(n, 10);
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest.len(), 90, "the reader took bytes it did not return");
+    }
+
+    /// REG-2: a value between 56 and 64 KiB, the sizes that went through
+    /// std's buffer, is read exactly through the fd reader.
+    #[test]
+    fn fd_reader_reads_values_near_the_cap() {
+        for len in [
+            MAX_VALUE_BYTES - 8 * 1024 + 1,
+            MAX_VALUE_BYTES - 1,
+            MAX_VALUE_BYTES,
+        ] {
+            let (r, mut w) = io::pipe().unwrap();
+            let writer = std::thread::spawn(move || {
+                std::io::Write::write_all(&mut w, &vec![b'x'; len]).unwrap();
+            });
+            let v = read_piped(&mut FdReader(r.as_fd()), LINE, &mut || Ok(())).unwrap();
+            writer.join().unwrap();
+            assert_eq!(v.expose().len(), len);
+        }
     }
 
     #[test]

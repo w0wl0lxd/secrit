@@ -73,6 +73,8 @@ pub fn run(
 ) -> Result<(), Error> {
     let env = |k: &str| std::env::var_os(k);
     let report = collect(config_flag, store_flag, hardened, &env);
+    // A signal during a sops or git child made that row a false failure.
+    super::interrupted()?;
     let mut out = std::io::stdout().lock();
     let written = if json {
         serde_json::to_writer_pretty(&mut out, &report.0)
@@ -349,12 +351,17 @@ fn age_key(path: Option<&Path>) -> (Status, String) {
         );
     };
     let shown = p.display();
-    match std::fs::metadata(p) {
+    // Like init, which refuses a symlinked key (PLAN 4.7, age identity).
+    match std::fs::symlink_metadata(p) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             Status::Fail,
             format!("{shown} does not exist; run 'secrit init'"),
         ),
         Err(e) => (Status::Fail, format!("{shown}: {e}")),
+        Ok(m) if m.is_symlink() => (
+            Status::Fail,
+            format!("{shown} is a symlink; point age_key_file at the key file itself"),
+        ),
         Ok(m) if !m.is_file() => (Status::Fail, format!("{shown} is not a regular file")),
         Ok(m) if m.uid() != rustix::process::getuid().as_raw() => {
             (Status::Fail, format!("{shown} is owned by another user"))
@@ -362,9 +369,14 @@ fn age_key(path: Option<&Path>) -> (Status, String) {
         Ok(m) if m.mode() & 0o077 != 0 => (
             Status::Fail,
             format!(
-                "{shown} has mode {:04o}; run 'chmod 600 {shown}'",
-                m.mode() & 0o7777
+                "{shown} has mode {:04o}; run 'chmod 600 {}'",
+                m.mode() & 0o7777,
+                super::shell_path(p)
             ),
+        ),
+        Ok(m) if m.len() == 0 => (
+            Status::Fail,
+            format!("{shown} is empty; remove it and run 'secrit init'"),
         ),
         Ok(_) => (Status::Ok, shown.to_string()),
     }
@@ -643,5 +655,33 @@ mod tests {
         assert_eq!(age_key(Some(&k)).0, Status::Ok);
         assert_eq!(age_key(Some(d.path())).0, Status::Fail);
         assert_eq!(age_key(None).0, Status::Fail);
+
+        // A symlink to a good key is reported, as init refuses it.
+        let link = d.path().join("link.txt");
+        std::os::unix::fs::symlink(&k, &link).unwrap();
+        let (s, detail) = age_key(Some(&link));
+        assert_eq!(s, Status::Fail);
+        assert!(detail.contains("is a symlink"), "{detail}");
+
+        let empty = d.path().join("empty.txt");
+        std::fs::write(&empty, "").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (s, detail) = age_key(Some(&empty));
+        assert_eq!(s, Status::Fail);
+        assert!(detail.contains("is empty"), "{detail}");
+    }
+
+    /// The chmod hint is one shell word, as in init.
+    #[test]
+    fn the_chmod_hint_is_quoted() {
+        let d = tempfile::tempdir().unwrap();
+        let k = d.path().join("my keys; rm -rf x.txt");
+        std::fs::write(&k, "x").unwrap();
+        std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (_, detail) = age_key(Some(&k));
+        assert!(
+            detail.ends_with(&format!("run 'chmod 600 '{}''", k.display())),
+            "{detail}"
+        );
     }
 }

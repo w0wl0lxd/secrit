@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::shell_path;
+use super::{interrupted, shell_path};
 use crate::backend::BackendError;
 use crate::backend::sops::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
 use crate::child;
@@ -20,7 +20,7 @@ use crate::config::{
     BackendKind, Config, ConfigError, StoreConfig, ToolSetting, ToolsConfig, config_path, home,
 };
 use crate::display::escape;
-use crate::error::Error;
+use crate::error::{Error, Exit};
 use crate::git::{Repo, find_root};
 use crate::signals;
 use crate::tools;
@@ -59,6 +59,23 @@ impl Out {
 }
 
 pub fn run(
+    config_flag: Option<&Path>,
+    store_flag: Option<&str>,
+    quiet: bool,
+    args: &InitArgs,
+) -> Result<(), Error> {
+    // An earlier step may have made a file, so "nothing was changed" (and
+    // the backend's "the original file is untouched") would be false here.
+    steps(config_flag, store_flag, quiet, args).map_err(|e| {
+        if e.exit() == Exit::Interrupted {
+            Error::InitInterrupted
+        } else {
+            e
+        }
+    })
+}
+
+fn steps(
     config_flag: Option<&Path>,
     store_flag: Option<&str>,
     quiet: bool,
@@ -140,8 +157,8 @@ pub fn run(
     interrupted()?;
 
     // 6. Next steps.
-    next_steps(&store.file, &env, &out);
-    Ok(())
+    next_steps(&store.file, &env, &out)?;
+    interrupted()
 }
 
 /// The store that this run sets up: the flags, else the config.
@@ -167,7 +184,7 @@ fn store_config(
             )));
         }
     };
-    Ok(StoreConfig {
+    let store = StoreConfig {
         backend: BackendKind::Sops,
         file,
         sops_config: match &args.sops_config {
@@ -180,7 +197,49 @@ fn store_config(
         },
         wire_hint: configured.is_some_and(|s| s.wire_hint),
         name,
-    })
+    };
+    if let Some(have) = configured {
+        refuse_a_differing_flag(have, &store)?;
+    }
+    Ok(store)
+}
+
+/// init never edits the config, so a flag that names another file than the
+/// configured store would set up files that the config does not use.
+fn refuse_a_differing_flag(have: &StoreConfig, store: &StoreConfig) -> Result<(), Error> {
+    let shown = |p: Option<&Path>| {
+        p.map_or_else(
+            || "(not set)".to_owned(),
+            |p| escape(&p.to_string_lossy()).into_owned(),
+        )
+    };
+    let mut differ = Vec::new();
+    if have.file != store.file {
+        differ.push(format!(
+            "--sops-file (the config has file = {})",
+            shown(Some(&have.file))
+        ));
+    }
+    if have.sops_config != store.sops_config {
+        differ.push(format!(
+            "--sops-config (the config has sops_config = {})",
+            shown(have.sops_config.as_deref())
+        ));
+    }
+    if have.age_key_file != store.age_key_file {
+        differ.push(format!(
+            "--age-key (the config has age_key_file = {})",
+            shown(have.age_key_file.as_deref())
+        ));
+    }
+    if differ.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "the config already names store '{}', and {} differs; init never edits the config. Drop the flag, pass --store with a new name, or edit the config first",
+        store.name,
+        differ.join(" and ")
+    )))
 }
 
 fn new_store_file(backend: &SopsBackend, out: &Out) -> Result<(), Error> {
@@ -212,14 +271,6 @@ fn make_dir(dir: &Path) -> Result<(), Error> {
         .mode(0o700)
         .create(dir)
         .map_err(|e| Error::Failed(format!("create {}: {e}", dir.display())))
-}
-
-fn interrupted() -> Result<(), Error> {
-    if signals::pending() {
-        Err(Error::Interrupted)
-    } else {
-        Ok(())
-    }
 }
 
 fn keygen_command(keygen: &Path) -> Command {
@@ -265,6 +316,12 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
                     shell_path(key)
                 )));
             }
+            if m.len() == 0 {
+                return Err(Error::Refused(format!(
+                    "the age key {shown} is empty, so it holds no key; remove it ('rm {}') and run 'secrit init' again",
+                    shell_path(key)
+                )));
+            }
             out.note(&format!("age key {shown} exists; unchanged"));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -277,9 +334,7 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
             {
                 make_dir(dir)?;
             }
-            let mut cmd = keygen_command(keygen);
-            cmd.arg("-o").arg(key);
-            run_keygen(cmd, 0, "-o")?;
+            new_key(keygen, key)?;
             eprintln!(
                 "secrit: warning: back up {shown} now. Without it, nobody can decrypt the secrets."
             );
@@ -302,6 +357,86 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
     }
     out.note(&format!("age recipient: {}", recipients.join(", ")));
     Ok(recipients)
+}
+
+/// A directory that this run made next to the new key, removed with what is
+/// left in it when it drops.
+struct KeyTemp(PathBuf);
+
+impl KeyTemp {
+    /// `mkdir` with mode 0700 under a random name. `mkdir` fails on a name
+    /// that exists, so the directory and all it holds are this run's.
+    fn create(dir: &Path, base: &std::ffi::OsStr) -> Result<Self, Error> {
+        for _ in 0..8 {
+            let mut rnd = [0u8; 8];
+            getrandom::fill(&mut rnd)
+                .map_err(|_| Error::Failed("no randomness for a temp name".into()))?;
+            let mut name = OsString::from(".");
+            name.push(base);
+            name.push(format!(".secrit-{}.tmp", crate::lock::hex(&rnd)));
+            let path = dir.join(name);
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(Error::Failed(format!("create {}: {e}", path.display())));
+                }
+            }
+        }
+        Err(Error::Failed(format!(
+            "could not find a free temp name in {}",
+            dir.display()
+        )))
+    }
+}
+
+impl Drop for KeyTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `age-keygen -o` into a temp directory next to `key`, then a rename with
+/// `RENAME_NOREPLACE`. age-keygen creates its output file before it writes
+/// the key, so a run stopped in between must not leave that empty file at
+/// `key`, where the next init would take it for the key.
+fn new_key(keygen: &Path, key: &Path) -> Result<(), Error> {
+    let shown = escape(&key.to_string_lossy()).into_owned();
+    let (Some(dir), Some(base)) = (key.parent(), key.file_name()) else {
+        return Err(Error::Usage(format!(
+            "the age key path {shown} names no file"
+        )));
+    };
+    // A signal must not end secrit while the temp directory holds the key.
+    let _critical = signals::Critical::enter();
+    let temp = KeyTemp::create(dir, base)?;
+    let made = temp.0.join(base);
+    let mut cmd = keygen_command(keygen);
+    cmd.arg("-o").arg(&made);
+    run_keygen(cmd, 0, "-o")?;
+    let fail = |step: &str, e: &dyn std::fmt::Display| {
+        Error::Failed(format!("{step} the new age key {shown}: {e}"))
+    };
+    std::fs::File::open(&made)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| fail("fsync", &e))?;
+    interrupted()?;
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &made,
+        rustix::fs::CWD,
+        key,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|e| match e {
+        rustix::io::Errno::EXIST => Error::Refused(format!(
+            "the age key {shown} appeared while init created it; nothing was replaced"
+        )),
+        e => fail("rename", &e),
+    })?;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| fail("fsync the directory of", &e))
 }
 
 /// The `.sops.yaml` that covers a new store file. Returns the backend to
@@ -447,32 +582,15 @@ fn write_config(
 ) -> Result<(), Error> {
     let shown = escape(&path.to_string_lossy()).into_owned();
     if let Some(config) = existing {
-        let Some(have) = config.stores.get(&store.name) else {
+        if config.stores.contains_key(&store.name) {
+            // store_config refused every flag that differs from this store.
+            out.note(&format!("config {shown} exists; unchanged"));
+        } else {
             out.note(&format!(
                 "config {shown} has no store '{}'; unchanged. Add it by hand:",
                 store.name
             ));
             print!("{}", config_text(store, args)?);
-            return Ok(());
-        };
-        let mut differ = Vec::new();
-        if have.file != store.file {
-            differ.push(format!("file = {}", have.file.display()));
-        }
-        if args.sops_config.is_some() && have.sops_config != store.sops_config {
-            differ.push("sops_config".to_owned());
-        }
-        if args.age_key.is_some() && have.age_key_file != store.age_key_file {
-            differ.push("age_key_file".to_owned());
-        }
-        if differ.is_empty() {
-            out.note(&format!("config {shown} exists; unchanged"));
-        } else {
-            out.note(&format!(
-                "config {shown} exists and differs from this run in stores.{}: {}; unchanged",
-                store.name,
-                escape(&differ.join(", "))
-            ));
         }
         return Ok(());
     }
@@ -507,7 +625,7 @@ fn config_text(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
     .map_err(|e| Error::Failed(format!("could not write the config: {e}")))
 }
 
-fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) {
+fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) -> Result<(), Error> {
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
@@ -516,14 +634,22 @@ fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) {
             ".{}.secrit-0000000000000000.yaml",
             file.file_name().unwrap_or_default().to_string_lossy()
         ));
-        if repo.is_ignored(&sample).is_ok_and(|i| !i) {
+        let ignored = repo.is_ignored(&sample);
+        super::git_interrupted(&ignored)?;
+        if ignored.is_ok_and(|i| !i) {
             out.note(&format!(
                 "next: ignore temp copies: echo {} >> {}",
                 super::shell_word(TEMP_IGNORE),
                 shell_path(&repo.root.join(".gitignore"))
             ));
         }
-        if file.exists() && repo.is_tracked(file).is_ok_and(|t| !t) {
+        let tracked = if file.exists() {
+            repo.is_tracked(file)
+        } else {
+            Ok(true)
+        };
+        super::git_interrupted(&tracked)?;
+        if tracked.is_ok_and(|t| !t) {
             out.note(&format!(
                 "next: {}",
                 super::doctor::git_add_hint(&repo, file)
@@ -534,6 +660,7 @@ fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) {
         "next: with home-manager, set programs.secrit.settings to the config (README, section 'Install')",
     );
     out.note("next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza");
+    Ok(())
 }
 
 #[cfg(test)]

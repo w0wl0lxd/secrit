@@ -216,7 +216,8 @@ file only when the file is yours and group and others cannot read it (for exampl
 Exit codes: `0` success, `1` failed, `2` usage error, `3` refused by a safety rule (agent,
 terminal, overwrite, name rule, an unsafe store file, store directory, config file, lock
 directory, `.sops.yaml` or `sops`), `4` lock timeout or a
-concurrent change, `130` a signal cancelled the command before a write took effect.
+concurrent change, `130` a signal cancelled the command before a write took effect. `init`
+keeps the files of the steps it finished; run it again to finish the setup.
 
 ### Rules secrit enforces
 

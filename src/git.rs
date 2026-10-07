@@ -13,6 +13,9 @@ pub enum GitError {
     NotFound,
     #[error("git {0} failed")]
     Failed(&'static str),
+    /// A deferred signal arrived while git ran.
+    #[error("git {0} was stopped by a signal")]
+    Interrupted(&'static str),
 }
 
 /// The repository that holds a path, and the git binary to ask.
@@ -95,7 +98,10 @@ impl Repo {
         if let Some(h) = &self.home {
             cmd.env("HOME", h);
         }
-        let out = child::run(cmd, None, 0, child::timeout()).map_err(|_| GitError::Failed(what))?;
+        let out = child::run(cmd, None, 0, child::timeout()).map_err(|e| match e {
+            child::ChildError::Interrupted => GitError::Interrupted(what),
+            _ => GitError::Failed(what),
+        })?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),

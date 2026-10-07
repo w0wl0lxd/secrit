@@ -2,6 +2,7 @@
 //! commands to apply it. It changes nothing and runs neither command (N7).
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,7 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
         Err(e) => return Err(e.into()),
     }
     if format == WireFormat::Nix {
-        next_steps(ctx, &env);
+        next_steps(ctx, &env)?;
     }
     Ok(())
 }
@@ -51,18 +52,21 @@ fn warn(ctx: &Ctx, msg: &str) {
     ctx.status(&format!("secrit: warning: {msg}"));
 }
 
-fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) {
+fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), Error> {
     let file = &ctx.store.file;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
         && file.exists()
-        && repo.is_tracked(file).is_ok_and(|t| !t)
     {
-        ctx.status(&format!(
-            "then run: {}",
-            super::doctor::git_add_hint(&repo, file)
-        ));
+        let tracked = repo.is_tracked(file);
+        super::git_interrupted(&tracked)?;
+        if tracked.is_ok_and(|t| !t) {
+            ctx.status(&format!(
+                "then run: {}",
+                super::doctor::git_add_hint(&repo, file)
+            ));
+        }
     }
     if let Some(nix) = &ctx.nix {
         ctx.status(&format!(
@@ -70,6 +74,7 @@ fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) {
             shell_word(&format!("{}#{}", nix.flake.to_string_lossy(), nix.host))
         ));
     }
+    Ok(())
 }
 
 /// `--owner`, else `$USER`, else `$LOGNAME`. The value goes into Nix text, so
@@ -124,6 +129,10 @@ fn nix_path_ok(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "/._+-".contains(c))
 }
 
+/// `s` as a Nix string literal. Nix has no `\xNN` escape, so a character
+/// that must not reach the terminal raw (`display::is_unsafe`) is spliced in
+/// from a JSON `\uNNNN` escape: the text stays printable and Nix still
+/// evaluates it to the same path.
 fn nix_string(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -134,6 +143,13 @@ fn nix_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if crate::display::is_unsafe(c) => {
+                let _ = write!(
+                    out,
+                    "${{builtins.fromJSON ''\"\\u{:04x}\"''}}",
+                    u32::from(c)
+                );
+            }
             c => out.push(c),
         }
     }
@@ -229,6 +245,26 @@ mod tests {
             "u",
         );
         assert!(s.contains("sopsFile = \"/f/s p.yaml\";"), "{s}");
+    }
+
+    /// A control character in the path never reaches stdout raw, and the
+    /// Nix text still names the same path.
+    #[test]
+    fn the_stanza_escapes_control_characters() {
+        let s = nix_stanza(
+            &name("a"),
+            Path::new("/s/a\u{1b}]0;x\u{7}\u{202e}b.yaml"),
+            None,
+            "u",
+        );
+        assert!(!s.chars().any(|c| c != '\n' && c.is_control()), "{s:?}");
+        assert!(!s.contains('\u{202e}'), "{s:?}");
+        assert!(
+            s.contains(
+                "sopsFile = \"/s/a${builtins.fromJSON ''\"\\u001b\"''}]0;x${builtins.fromJSON ''\"\\u0007\"''}${builtins.fromJSON ''\"\\u202e\"''}b.yaml\"; # absolute"
+            ),
+            "{s}"
+        );
     }
 
     #[test]

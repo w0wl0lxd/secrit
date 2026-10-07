@@ -112,7 +112,7 @@ Exit codes: `0` success; `1` operation failed; `2` usage error; `3` refused by a
 (agent, TTY, overwrite, name rule, an unsafe store file, store directory, config file, lock
 directory, `.sops.yaml` or `sops` binary); `1` also covers a `sops` older than 3.11; `4` lock timeout or
 concurrent change after 3 retries; `130` a signal cancelled the command before a write took
-effect. A name is checked before the config loads, so a bad name exits 3 even with no config
+effect (`init` keeps the files of the steps it finished, 4.6). A name is checked before the config loads, so a bad name exits 3 even with no config
 (R6).
 
 The v0.1 command set is `store`, `get`, `ls`, `rm`, `init`, `doctor`, `wire` and the hidden
@@ -166,6 +166,14 @@ tab stays, and every other control character, bidirectional override or invalid 
 as `\xNN` in reverse video (SEC-1). SIGINT, SIGTERM, SIGHUP and SIGQUIT during the wait clear
 the screen, restore the terminal and exit 130 (SEC-13). The docs warn that Kitty remote
 control and screen recorders can read the screen while the value shows.
+
+The writes to the terminal stay blocking inside the critical section. A stopped terminal
+(Ctrl-S) or a slow link can hold such a write, and a deferred signal then waits for it. That
+is the safe order: nothing new shows while output is stopped, and when it resumes the wait
+sees the flag within 100 ms and clears the screen. A write that gave up on the signal would
+exit with value bytes already queued in the terminal or the ssh channel, and the clear
+sequence must pass the same stalled channel, so the value would show later and stay. A
+hang-up makes the write fail at once (EIO), and SIGKILL still ends secrit.
 
 ### 4.3 `secrit ls`
 
@@ -242,9 +250,13 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
    instructions, then exit 1. `init` does not install packages itself (open question Q6).
 2. **Age key.** Path: `--age-key`, else config, else `$XDG_CONFIG_HOME/sops/age/keys.txt`.
    If the file exists, secrit does not touch it; it runs `age-keygen -y PATH` once to get the
-   public recipient (the output is a public key). If the file is missing, secrit creates the
-   parent directory with mode 0700 and runs `age-keygen -o PATH` (refuses an existing file,
-   mode 0600; F11). secrit prints a warning: back up this key; without it the secrets are lost.
+   public recipient (the output is a public key). An empty key file is refused (exit 3) with
+   the hint to remove it. If the file is missing, secrit creates the parent directory with
+   mode 0700, runs `age-keygen -o` (mode 0600; F11) into a new mode-0700 directory next to
+   PATH, fsyncs the key and renames it to PATH with `RENAME_NOREPLACE`. age-keygen creates
+   its output before it writes the key, so a run stopped by a signal must not leave an empty
+   file at PATH; the temp directory is removed on every path but SIGKILL. secrit prints a
+   warning: back up this key; without it the secrets are lost.
 3. **sops config.** Only a new sops file needs one: writes to an existing file keep its own
    recipients (F3). Path: `--sops-config`, else config, else the nearest `.sops.yaml` upward
    from the sops file's directory (not from the current directory; F10). If one exists, it
@@ -264,13 +276,23 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
    renames it with `RENAME_NOREPLACE`.
 5. **Config.** If the config file is missing, write it (mode 0600, `O_EXCL`): `default_store`,
    and `backend` and `file` for the store, plus `sops_config` and `age_key_file` only when a
-   flag gave them. If it exists and differs, name the keys that differ and do not change it.
+   flag gave them. If it exists, do not change it. When it names the store and
+   `--sops-file`, `--sops-config` or `--age-key` differs from it, `init` refuses before
+   step 1 (exit 2) and names the flags that differ: it would otherwise set up files that the
+   config does not use. When it does not name the store, print the store's section for the
+   user to add.
 6. **Next steps.** On stderr: the `.gitignore` line when the repository does not ignore temp
    copies, `git -C <repo> add <file>` when the file is untracked (F14), the home-manager hint
    (section 10.3), and `secrit store` then `secrit wire`.
 
-`--dry-run` prints each step as `would: ...` and changes nothing. A signal between steps ends
-`init` with exit 130; each write step is a critical section (8.1, step 8).
+`--dry-run` prints each step as `would: ...` and changes nothing. A signal between steps, or
+during a sops, age-keygen or git child, ends `init` with exit 130; each write step is a
+critical section (8.1, step 8). The message says that the files from earlier steps are kept
+and that a rerun finishes the setup, because `init` is idempotent.
+
+A `--sops-config` outside the store file's tree gets a rule with the absolute path
+(`(^|/)/abs/path$`): sops 3.13.3 matches `path_regex` against the absolute path when the
+file is not under the `.sops.yaml` directory (lab, 2026-10-07).
 
 ### 4.7 `secrit doctor`
 
@@ -281,7 +303,9 @@ secrit doctor [--json]
 Read-only: it creates, changes and decrypts nothing. One line per check,
 `<status>  <check>: <detail>`, with the status `ok`, `info`, `warn` or `fail`; control
 characters in paths and names are escaped. `--json` prints an array of
-`{check, status, detail}`. Exit 1 if any check fails. `doctor` works without a config (the
+`{check, status, detail}`. Exit 1 if any check fails. A signal while a sops or git child
+runs exits 130 and prints no rows, since the stopped child would read as a failed check.
+`doctor` works without a config (the
 config row fails with a pointer to `init`). It checks the store from `--store`, else every
 store in the config. v0.1 has no `doctor --fix`.
 
@@ -289,7 +313,7 @@ store in the config. v0.1 has no `doctor --fix`.
 |---|---|
 | sops binary | missing, or a configured path fails the trust rule (fail); older than 3.11 (fail); resolved through a mise shim or PATH (warn) |
 | age-keygen | missing (warn: only `init` needs it); resolved through a mise shim or PATH (warn) |
-| age identity | no key file in the configured path or the sops default path (fail); a symlink or not a regular file, another owner, or any group or other mode bit (fail) |
+| age identity | no key file in the configured path or the sops default path (fail); a symlink (not followed) or not a regular file, another owner, any group or other mode bit, or an empty file (fail); the `chmod` hint is shell-quoted |
 | age key exposure | `SOPS_AGE_KEY` or `SOPS_AGE_KEY_CMD` is set in secrit's environment (warn) |
 | `.sops.yaml` | it fails the trust rule (fail); none found (warn: writes need none, F3, but `init` needs one to create a file); no creation rule covers the store file (warn) |
 | store file | missing, not a regular file, a symlink, link count > 1, owned by another uid, or writable by group or others; not a sops YAML file (fail) |
@@ -327,13 +351,15 @@ sops.secrets."NAME" = {
 relative to the nearest git repository that has a `flake.nix`; a comment says the path
 assumes the stanza sits at that root. Otherwise it is absolute, with a comment that pure
 flake evaluation needs a path inside the flake. A path that is not a valid Nix path literal
-becomes a quoted, escaped string. The owner must be a plain user name (`a-z`, `0-9`, `_`,
+becomes a quoted, escaped string. Nix has no `\xNN` escape, so a control character or
+bidirectional control in that string is written as `${builtins.fromJSON ''"\uNNNN"''}`: it
+never reaches the terminal raw, and Nix still evaluates the string to the same path. The owner must be a plain user name (`a-z`, `0-9`, `_`,
 `-`, at most 32 bytes); the default is `$USER`, then `$LOGNAME`.
 
 The stanza goes to stdout. On stderr, secrit then prints `git -C <repo> add <file>` when the
 file is untracked, and `sudo nixos-rebuild switch --flake <flake>#<host>` with `<flake>` and
 `<host>` from config, each shell-quoted. secrit does not run either command. A name that is
-not in the store yet gives a warning, not an error.
+not in the store yet gives a warning, not an error. A signal during the git query exits 130.
 
 `--format env` prints `NAME_FILE=/run/secrets/NAME` instead, with `NAME` upper-cased and
 every character outside `A-Z0-9` turned into `_`.

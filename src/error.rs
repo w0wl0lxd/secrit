@@ -44,6 +44,11 @@ pub enum Error {
     Failed(String),
     #[error("interrupted by a signal; nothing was changed")]
     Interrupted,
+    /// `init` makes several files, so an earlier step may have made one.
+    #[error(
+        "interrupted by a signal; files that init made before the signal are kept; run 'secrit init' again to finish"
+    )]
+    InitInterrupted,
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -65,7 +70,9 @@ impl Error {
             | Error::Name(_)
             | Error::Config(ConfigError::Unsafe { .. })
             | Error::Tool(ToolError::Unsafe { .. }) => Exit::Refused,
-            Error::Interrupted | Error::Input(InputError::Interrupted) => Exit::Interrupted,
+            Error::Interrupted | Error::InitInterrupted | Error::Input(InputError::Interrupted) => {
+                Exit::Interrupted
+            }
             Error::Failed(_) | Error::Config(_) | Error::Input(_) | Error::Tool(_) => Exit::Failed,
             Error::Backend(e) => e.exit(),
         }
@@ -107,6 +114,12 @@ mod tests {
         assert_eq!(
             Error::Input(InputError::Interrupted).exit(),
             Exit::Interrupted
+        );
+        assert_eq!(Error::InitInterrupted.exit(), Exit::Interrupted);
+        assert!(
+            !Error::InitInterrupted
+                .to_string()
+                .contains("nothing was changed")
         );
     }
 }

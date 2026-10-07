@@ -69,6 +69,22 @@ All notable changes to this project are recorded here. The format follows
   signal that arrives as a sops, age-keygen or git child exits is no longer lost.
 - Piped input is read with `read(2)` straight into the fixed value buffer. std's stdin
   buffer kept up to 8 KiB of a value between 56 and 64 KiB, and never wiped it (REG-2).
+- A signal while `doctor`, `wire` or `init` waits for sops or git exits 130. Before, the
+  stopped child showed as a failed or warning row, or as a missing hint, and the command
+  exited 0 or 1.
+- `init` makes a new age key in a temp directory next to the key path and renames it into
+  place with `RENAME_NOREPLACE`. A signal during `age-keygen -o` left an empty key file,
+  which the next `init` took for the key. `init` and `doctor` now refuse an empty key file.
+- A signal during `init` says that the files of the finished steps are kept and that a
+  rerun finishes the setup. It said "nothing was changed".
+- `init` refuses (exit 2) a `--sops-file`, `--sops-config` or `--age-key` that differs
+  from the store the config already names. Before, it created the new file, kept the old
+  config and exited 0.
+- `doctor` reports a symlinked age key, as `init` refuses it, and shell-quotes the
+  `chmod` hint.
+- `wire` writes a control character in a quoted store path as
+  `${builtins.fromJSON ''"\uNNNN"''}`, so it never reaches the terminal raw and the Nix
+  string keeps the same path.
 
 ### Changed from docs/PLAN.md
 

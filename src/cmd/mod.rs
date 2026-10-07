@@ -120,6 +120,25 @@ pub fn shell_path(p: &Path) -> String {
     shell_word(&p.to_string_lossy())
 }
 
+/// `Err(Error::Interrupted)` when a deferred signal arrived. A step that
+/// turns a child's errors into rows or hints checks this after it, so a
+/// signal during that child still exits 130 and prints no false result.
+pub fn interrupted() -> Result<(), Error> {
+    if crate::signals::pending() {
+        Err(Error::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `r` is a git query that a signal stopped.
+fn git_interrupted<T>(r: &Result<T, crate::git::GitError>) -> Result<(), Error> {
+    match r {
+        Err(crate::git::GitError::Interrupted(_)) => Err(Error::Interrupted),
+        _ => Ok(()),
+    }
+}
+
 pub fn parse_name(s: &str) -> Result<Name, Error> {
     Ok(Name::parse(s)?)
 }

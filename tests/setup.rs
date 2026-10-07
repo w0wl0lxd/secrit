@@ -6,13 +6,229 @@ mod common;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use common::{TestEnv, code, run_cmd, stderr};
+use common::{TestEnv, bin, code, run_cmd, stderr};
 use serde_json::Value;
 
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A program that writes its pid to `pid_file` and then hangs. With `-o
+/// PATH` it first creates PATH empty, as age-keygen does before it writes
+/// the key.
+fn hanging(env: &TestEnv, name: &str, pid_file: &Path) -> PathBuf {
+    env.script(
+        name,
+        &format!(
+            "[ \"$1\" = -o ] && : > \"$2\"\necho $$ > '{}'\nexec '{}' 30",
+            pid_file.display(),
+            bin("sleep").display()
+        ),
+    )
+}
+
+/// Run `cmd` with `args`, wait until `pid_file` names the hanging child,
+/// send TERM to secrit, and return what secrit left.
+fn term_while_waiting(mut cmd: Command, args: &[&str], pid_file: &Path) -> Output {
+    let child = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_to_string(pid_file).is_ok_and(|s| s.ends_with('\n')) {
+        assert!(Instant::now() < deadline, "the hanging child never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let hung = std::fs::read_to_string(pid_file).unwrap().trim().to_owned();
+    let st = Command::new(bin("kill"))
+        .args(["-s", "TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !Path::new(&format!("/proc/{hung}")).exists(),
+        "the child outlived secrit"
+    );
+    out
+}
+
+/// secrit with a git on its PATH that hangs, and a `.git` above the store.
+fn with_hanging_git(env: &TestEnv, pid_file: &Path) -> Command {
+    let dir = env.root.path().join("fake-git");
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = hanging(env, "git-hang", pid_file);
+    std::fs::rename(&git, dir.join("git")).unwrap();
+    std::fs::create_dir_all(env.store_dir.parent().unwrap().join(".git")).unwrap();
+    let mut c = env.cmd();
+    let dirs: Vec<PathBuf> = [&env.sops, &env.age_keygen]
+        .iter()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .chain([dir])
+        .collect();
+    c.env("PATH", std::env::join_paths(dirs).unwrap());
+    c
+}
+
+/// Finding 1: a signal while doctor waits for sops or git exits 130 and
+/// prints no rows, instead of rows that blame the stopped child.
+#[test]
+fn a_signal_stops_doctor_with_130() {
+    let env = TestEnv::new();
+    let pid_file = env.root.path().join("sops.pid");
+    let sops = hanging(&env, "sops-hang", &pid_file);
+    env.write_config_with(&sops, "");
+    let out = term_while_waiting(env.cmd(), &["doctor", "--json"], &pid_file);
+    assert_eq!(code(&out), 130, "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(stderr(&out).contains("interrupted"), "{}", stderr(&out));
+
+    let env = TestEnv::new();
+    let pid_file = env.root.path().join("git.pid");
+    let cmd = with_hanging_git(&env, &pid_file);
+    let out = term_while_waiting(cmd, &["doctor"], &pid_file);
+    assert_eq!(code(&out), 130, "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+}
+
+/// Finding 1: the same for the git queries of wire and init.
+#[test]
+fn a_signal_during_git_stops_wire_and_init_with_130() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"v\n")), 0);
+    let pid_file = env.root.path().join("git.pid");
+    let cmd = with_hanging_git(&env, &pid_file);
+    let out = term_while_waiting(cmd, &["wire", "n", "--owner", "a"], &pid_file);
+    assert_eq!(code(&out), 130, "{}", stderr(&out));
+    assert!(!stderr(&out).contains("then run"), "{}", stderr(&out));
+
+    std::fs::remove_file(&pid_file).unwrap();
+    let cmd = with_hanging_git(&env, &pid_file);
+    let out = term_while_waiting(cmd, &["init"], &pid_file);
+    assert_eq!(code(&out), 130, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("run 'secrit init' again"), "{err}");
+    assert!(!err.contains("nothing was changed"), "{err}");
+}
+
+/// Findings 2 and 3: a signal while age-keygen writes the new key leaves no
+/// file at the key path and no temp directory, and says that init can be
+/// run again. A rerun then makes the key. An empty key file is refused.
+#[test]
+fn an_interrupted_keygen_leaves_no_key() {
+    let env = TestEnv::new();
+    let key = env.root.path().join("newkey").join("keys.txt");
+    let file = env.store_dir.join("fresh.yaml");
+    let pid_file = env.root.path().join("keygen.pid");
+    let keygen = hanging(&env, "keygen-hang", &pid_file);
+    let config = |keygen: &Path| {
+        let text = format!(
+            "default_store = \"main\"\n\n[stores.main]\nbackend = \"sops\"\nfile = \"{}\"\nage_key_file = \"{}\"\n\n[tools]\nsops = \"{}\"\nage_keygen = \"{}\"\n",
+            file.display(),
+            key.display(),
+            env.sops.display(),
+            keygen.display()
+        );
+        std::fs::write(&env.config_file, text).unwrap();
+    };
+    config(&keygen);
+    let out = term_while_waiting(env.cmd(), &["init"], &pid_file);
+    assert_eq!(code(&out), 130, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("run 'secrit init' again"), "{err}");
+    assert!(!err.contains("nothing was changed"), "{err}");
+    assert!(!key.exists(), "an empty key was left at the key path");
+    let left: Vec<_> = std::fs::read_dir(key.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "the temp directory was left: {left:?}");
+
+    config(&env.age_keygen);
+    let out = env.run(["init"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(std::fs::metadata(&key).unwrap().len() > 0);
+    assert_eq!(std::fs::metadata(&key).unwrap().mode() & 0o777, 0o600);
+    assert!(file.is_file());
+
+    std::fs::write(&key, "").unwrap();
+    let out = env.run(["init"], None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("is empty"), "{}", stderr(&out));
+}
+
+/// Finding 5: a flag that names another file than the configured store is
+/// refused before any step, so init makes no file the config does not use.
+#[test]
+fn init_refuses_a_flag_that_differs_from_the_config() {
+    let env = TestEnv::new();
+    let other = env.store_dir.join("other.yaml");
+    let out = env.run(
+        [
+            "init",
+            "--sops-file",
+            other.to_str().unwrap(),
+            "--write-sops-config",
+        ],
+        None,
+    );
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--sops-file"), "{}", stderr(&out));
+    assert!(
+        !other.exists(),
+        "init created a file the config does not use"
+    );
+
+    let key = env.root.path().join("keys").join("other.txt");
+    let out = env.run(["init", "--age-key", key.to_str().unwrap()], None);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--age-key"), "{}", stderr(&out));
+    assert!(!key.exists());
+
+    let same = env.store_file.to_str().unwrap();
+    let out = env.run(["init", "--sops-file", same], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("exists; unchanged"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Finding 4 (refuted): a new `.sops.yaml` outside the store file's tree
+/// gets a rule with the absolute path, and sops matches it, so init and
+/// the first write succeed.
+#[test]
+fn init_with_a_sops_config_elsewhere_works() {
+    let env = TestEnv::new();
+    let f = Fresh::new(&env, "apart");
+    let rules = env
+        .root
+        .path()
+        .join("apart")
+        .join("rules")
+        .join(".sops.yaml");
+    let out = f.run(
+        &env,
+        &[
+            "--sops-config",
+            rules.to_str().unwrap(),
+            "--write-sops-config",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = std::fs::read_to_string(&rules).unwrap();
+    assert!(text.contains("path_regex: '(^|/)/"), "{text}");
+    assert!(f.file.is_file());
+    let out = f.secrit(&env, &["store", "first"], Some(b"value\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = f.secrit(&env, &["ls"], None);
+    assert_eq!(stdout(&out), "first\n");
 }
 
 /// secrit with git on its PATH.

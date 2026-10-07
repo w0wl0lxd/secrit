@@ -3,6 +3,7 @@
 
 mod agent;
 mod backend;
+mod child;
 mod cli;
 mod cmd;
 mod config;

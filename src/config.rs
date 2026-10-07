@@ -144,37 +144,50 @@ pub struct Config {
     pub lock_timeout: Duration,
 }
 
+/// Where the config path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Flag,
+    /// `$SECRIT_CONFIG`. secrit names the file on stderr each time, because a
+    /// variable is not visible on the command line (SEC-10).
+    Env,
+    Default,
+}
+
 /// The config file path: `--config`, then `$SECRIT_CONFIG`, then
 /// `$XDG_CONFIG_HOME/secrit/config.toml`, then `~/.config/secrit/config.toml`.
 pub fn config_path(
     flag: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<PathBuf, ConfigError> {
+) -> Result<(PathBuf, ConfigSource), ConfigError> {
     if let Some(p) = flag {
-        return std::path::absolute(p).map_err(|source| ConfigError::Io {
-            path: p.to_path_buf(),
-            source,
-        });
+        return std::path::absolute(p)
+            .map(|p| (p, ConfigSource::Flag))
+            .map_err(|source| ConfigError::Io {
+                path: p.to_path_buf(),
+                source,
+            });
     }
     if let Some(v) = env(ENV_CONFIG).filter(|v| !v.is_empty()) {
         let p = PathBuf::from(v);
         return if p.is_absolute() {
-            Ok(p)
+            Ok((p, ConfigSource::Env))
         } else {
             Err(ConfigError::RelativeEnvPath)
         };
     }
     // The XDG spec says to ignore a relative XDG_CONFIG_HOME.
-    if let Some(x) = env("XDG_CONFIG_HOME")
+    let dir = match env("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
     {
-        return Ok(x.join("secrit").join("config.toml"));
-    }
-    Ok(home(env)?
-        .join(".config")
-        .join("secrit")
-        .join("config.toml"))
+        Some(x) => x,
+        None => home(env)?.join(".config"),
+    };
+    Ok((
+        dir.join("secrit").join("config.toml"),
+        ConfigSource::Default,
+    ))
 }
 
 /// `$HOME`, which must be absolute.
@@ -463,17 +476,23 @@ timeout_secs = 5
         ]);
         assert_eq!(
             config_path(Some(Path::new("/flag.toml")), &all).unwrap(),
-            Path::new("/flag.toml")
+            (PathBuf::from("/flag.toml"), ConfigSource::Flag)
         );
-        assert_eq!(config_path(None, &all).unwrap(), Path::new("/env/c.toml"));
+        assert_eq!(
+            config_path(None, &all).unwrap(),
+            (PathBuf::from("/env/c.toml"), ConfigSource::Env)
+        );
         let xdg = env_of(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/home/u")]);
         assert_eq!(
             config_path(None, &xdg).unwrap(),
-            Path::new("/xdg/secrit/config.toml")
+            (
+                PathBuf::from("/xdg/secrit/config.toml"),
+                ConfigSource::Default
+            )
         );
         let rel_xdg = env_of(&[("XDG_CONFIG_HOME", "rel"), ("HOME", "/home/u")]);
         assert_eq!(
-            config_path(None, &rel_xdg).unwrap(),
+            config_path(None, &rel_xdg).unwrap().0,
             Path::new("/home/u/.config/secrit/config.toml")
         );
         let rel_env = env_of(&[("SECRIT_CONFIG", "c.toml")]);

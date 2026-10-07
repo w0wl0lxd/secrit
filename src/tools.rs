@@ -8,10 +8,24 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::config::ToolSetting;
+use crate::trust::{self, TrustError};
 
 pub const BAKED_SOPS: Option<&str> = option_env!("SECRIT_SOPS_BIN");
-#[allow(dead_code, reason = "used by init (milestone M4)")]
 pub const BAKED_AGE_KEYGEN: Option<&str> = option_env!("SECRIT_AGE_KEYGEN_BIN");
+
+/// The text of `secrit --version`: the version and the baked-in tool paths.
+/// It also keeps both store paths in the binary, so the Nix closure carries
+/// `age` as the README says (NIX-1).
+#[must_use]
+pub fn long_version() -> String {
+    let show = |p: Option<&'static str>| p.unwrap_or("not baked in (resolved from config or PATH)");
+    format!(
+        "{}\nsops: {}\nage-keygen: {}",
+        env!("CARGO_PKG_VERSION"),
+        show(BAKED_SOPS),
+        show(BAKED_AGE_KEYGEN)
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -26,6 +40,12 @@ pub enum ToolError {
     Missing {
         program: &'static str,
         path: PathBuf,
+    },
+    #[error("refusing configured {program} at {}: {reason}", path.display())]
+    Unsafe {
+        program: &'static str,
+        path: PathBuf,
+        reason: String,
     },
 }
 
@@ -55,7 +75,7 @@ pub const SOPS: Program = Program {
     baked: BAKED_SOPS,
 };
 
-#[allow(dead_code, reason = "used by init (milestone M4)")]
+#[expect(dead_code, reason = "used by init (milestone M4)")]
 pub const AGE_KEYGEN: Program = Program {
     name: "age-keygen",
     config_key: "age_keygen",
@@ -69,16 +89,22 @@ pub fn resolve(
     path_env: Option<&OsStr>,
 ) -> Result<ResolvedTool, ToolError> {
     if let ToolSetting::Path(p) = setting {
-        return if p.is_file() {
-            Ok(ResolvedTool {
+        // The configured binary receives the plaintext value on stdin, so it
+        // must be as trusted as the config file itself (SEC-10).
+        return match trust::check_file(p) {
+            Ok(_) => Ok(ResolvedTool {
                 path: p.clone(),
                 source: ToolSource::Configured,
-            })
-        } else {
-            Err(ToolError::Missing {
+            }),
+            Err(TrustError::Io(_)) => Err(ToolError::Missing {
                 program: program.name,
                 path: p.clone(),
-            })
+            }),
+            Err(TrustError::Unsafe(reason)) => Err(ToolError::Unsafe {
+                program: program.name,
+                path: p.clone(),
+                reason: reason.into(),
+            }),
         };
     }
     if let Some(b) = program.baked.map(Path::new).filter(|p| p.is_file()) {

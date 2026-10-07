@@ -3,6 +3,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -18,11 +19,12 @@ pub const ARGV_VALUE_MESSAGE: &str = "a value on the command line is already in 
 #[command(
     name = "secrit",
     version,
+    long_version = long_version(),
     about = "Store secrets in a sops + age file, with no value on the command line",
     propagate_version = true
 )]
 pub struct Cli {
-    /// Config file [default: $SECRIT_CONFIG, then $XDG_CONFIG_HOME/secrit/config.toml]
+    /// Config file [default: $SECRIT_CONFIG, then $XDG_CONFIG_HOME/secrit/config.toml, then ~/.config/secrit/config.toml]
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -42,6 +44,7 @@ pub struct Cli {
 pub enum Command {
     /// Store a secret read from a no-echo prompt or from stdin
     Store {
+        /// The secret name: A-Z, a-z, 0-9, '.', '_' and '-', at most 128 bytes
         name: String,
         /// Overwrite an existing secret (a ciphertext backup is kept)
         #[arg(long)]
@@ -58,8 +61,9 @@ pub enum Command {
     },
     /// Show a secret on the alternate screen, or write it to a pipe with --stdout
     Get {
+        /// The secret name
         name: String,
-        /// Write the exact value to stdout; refused when stdout is a terminal
+        /// Write the exact value to stdout; refused when stdout is a terminal, or a file that group or others can read
         #[arg(long)]
         stdout: bool,
     },
@@ -71,12 +75,13 @@ pub enum Command {
     },
     /// Remove a secret (a ciphertext backup is kept)
     Rm {
+        /// The secret name
         name: String,
         /// Do not ask for confirmation
         #[arg(long)]
         yes: bool,
     },
-    /// Run a command with secrets in memfd files or environment variables
+    /// (not implemented yet) Run a command with secrets in memfd files or environment variables
     Run {
         /// VAR=NAME: put NAME in a sealed memfd and set VAR=/dev/fd/N
         #[arg(long = "file", value_name = "VAR=NAME")]
@@ -87,43 +92,58 @@ pub enum Command {
         /// Turn output masking off
         #[arg(long)]
         no_mask: bool,
+        /// The command and its arguments, after '--'
         #[arg(last = true, required = true, value_name = "CMD")]
         cmd: Vec<OsString>,
     },
-    /// Set up a machine: age key, sops file, config (never overwrites)
+    /// (not implemented yet) Set up a machine: age key, sops file, config (never overwrites)
     Init {
+        /// The sops file to create [default: the store file from the config]
         #[arg(long, value_name = "PATH")]
         sops_file: Option<PathBuf>,
+        /// The .sops.yaml to use [default: the nearest one upward from the sops file]
         #[arg(long, value_name = "PATH")]
         sops_config: Option<PathBuf>,
+        /// The age key file [default: the config, else $XDG_CONFIG_HOME/sops/age/keys.txt]
         #[arg(long, value_name = "PATH")]
         age_key: Option<PathBuf>,
+        /// Create a .sops.yaml when none exists (never edits one)
         #[arg(long)]
         write_sops_config: bool,
+        /// Print the plan and change nothing
         #[arg(long)]
         dry_run: bool,
     },
-    /// Check the setup; read-only
+    /// (not implemented yet) Check the setup; read-only
     Doctor {
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Print the sops-nix stanza for a secret; changes nothing
+    /// (not implemented yet) Print the sops-nix stanza for a secret; changes nothing
     Wire {
+        /// The secret name
         name: String,
+        /// The owner of /run/secrets/NAME [default: the current user]
         #[arg(long, value_name = "USER")]
         owner: Option<String>,
+        /// The output form
         #[arg(long, value_enum, default_value_t = WireFormat::Nix)]
         format: WireFormat,
     },
     /// Print shell completions
     #[command(hide = true)]
-    Completions { shell: CompletionShell },
+    Completions {
+        /// The shell
+        shell: CompletionShell,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum WireFormat {
+    /// A sops-nix `sops.secrets` stanza
     Nix,
+    /// Shell variable assignments
     Env,
 }
 
@@ -132,6 +152,12 @@ pub enum CompletionShell {
     Bash,
     Fish,
     Zsh,
+}
+
+/// `--version` text, built once (clap needs a `'static` string).
+fn long_version() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(crate::tools::long_version).as_str()
 }
 
 impl From<CompletionShell> for clap_complete::Shell {

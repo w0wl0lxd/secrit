@@ -449,7 +449,8 @@ fn unsafe_config_is_refused() {
     let env = TestEnv::new();
     std::fs::set_permissions(&env.config_file, std::fs::Permissions::from_mode(0o666)).unwrap();
     let out = env.run(["ls"], None);
-    assert_eq!(code(&out), 1);
+    // R3: an unsafe file is a refusal (exit 3), as PLAN section 4 says.
+    assert_eq!(code(&out), 3);
     assert!(stderr(&out).contains("writable by group or others"));
 }
 

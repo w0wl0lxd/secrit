@@ -87,7 +87,8 @@ impl BackendError {
             BackendError::Exists(_)
             | BackendError::Unsafe { .. }
             | BackendError::Name(_)
-            | BackendError::CleartextRule { .. } => Exit::Refused,
+            | BackendError::CleartextRule { .. }
+            | BackendError::Lock(LockError::UnsafeDir { .. }) => Exit::Refused,
             BackendError::Lock(LockError::Timeout { .. }) | BackendError::Changed(_) => Exit::Busy,
             BackendError::Interrupted => Exit::Interrupted,
             _ => Exit::Failed,

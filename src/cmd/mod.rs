@@ -9,7 +9,10 @@ use std::ffi::OsString;
 
 use crate::backend::Backend;
 use crate::backend::sops::SopsBackend;
-use crate::config::{BackendKind, Config, StoreConfig, config_path, home};
+use crate::config::{
+    BackendKind, Config, ConfigSource, ENV_CONFIG, StoreConfig, config_path, home,
+};
+use crate::display::escape;
 use crate::error::Error;
 use crate::name::Name;
 use crate::tools::{self, ResolvedTool, ToolSource};
@@ -29,7 +32,15 @@ impl Ctx {
         quiet: bool,
     ) -> Result<Self, Error> {
         let env = |k: &str| std::env::var_os(k);
-        let path = config_path(config_flag, &env)?;
+        let (path, source) = config_path(config_flag, &env)?;
+        // A variable is not visible on the command line, so name the file it
+        // picked (SEC-10).
+        if source == ConfigSource::Env && !quiet {
+            eprintln!(
+                "secrit: using config {} from {ENV_CONFIG}",
+                escape(&path.display().to_string())
+            );
+        }
         let config = Config::load(&path, &home(&env)?)?;
         let store = config.store(store_flag)?.clone();
         let backend: Box<dyn Backend> = match store.backend {

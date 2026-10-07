@@ -6,6 +6,7 @@ mod backend;
 mod cli;
 mod cmd;
 mod config;
+mod display;
 mod error;
 mod harden;
 mod lock;
@@ -13,24 +14,31 @@ mod name;
 mod secret;
 mod signals;
 mod tools;
+mod trust;
+mod tty;
 
 use std::process::ExitCode;
 
 use clap::CommandFactory;
 
 use crate::cli::{Cli, Command};
-use crate::cmd::{Ctx, StoreArgs};
+use crate::cmd::{Ctx, StoreArgs, parse_name};
 use crate::error::Error;
 
 fn main() -> ExitCode {
     // Before any input is read (PLAN 8.5).
-    let _ = harden::harden();
+    let hardened = harden::harden();
     harden::install_panic_hook();
 
     let cli = match cli::parse(std::env::args_os()) {
         Ok(cli) => cli,
         Err(outcome) => return ExitCode::from(outcome.exit_code()),
     };
+    if !cli.quiet {
+        for warning in hardened.warnings() {
+            eprintln!("secrit: warning: {warning}");
+        }
+    }
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -47,6 +55,9 @@ fn dispatch(cli: Cli) -> Result<(), Error> {
         quiet,
         command,
     } = cli;
+    // From here on INT, TERM, HUP and QUIT only set a flag. Every blocking
+    // wait polls it and stops cleanly (PLAN 8.1, step 8).
+    signals::defer().map_err(|e| Error::Failed(format!("could not install signal handlers: {e}")))?;
     let ctx = || Ctx::load(config.as_deref(), store.as_deref(), quiet);
     match command {
         Command::Store {
@@ -64,11 +75,19 @@ fn dispatch(cli: Cli) -> Result<(), Error> {
                 extra,
             };
             cmd::store::check_argv(&args)?;
-            cmd::store::run(&ctx()?, &args)
+            // The name rules come before the config (PLAN 4.1, step 1).
+            let name = parse_name(&args.name)?;
+            cmd::store::run(&ctx()?, &name, &args)
         }
-        Command::Get { name, stdout } => cmd::get::run(&ctx()?, &name, stdout),
+        Command::Get { name, stdout } => {
+            let name = parse_name(&name)?;
+            cmd::get::run(&ctx()?, &name, stdout)
+        }
         Command::Ls { json } => cmd::ls::run(&ctx()?, json),
-        Command::Rm { name, yes } => cmd::rm::run(&ctx()?, &name, yes),
+        Command::Rm { name, yes } => {
+            let name = parse_name(&name)?;
+            cmd::rm::run(&ctx()?, &name, yes)
+        }
         Command::Run { .. } => Err(Error::NotImplemented {
             command: "run",
             milestone: "M3",

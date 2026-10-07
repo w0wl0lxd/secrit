@@ -16,11 +16,14 @@ pub enum Exit {
     Failed = 1,
     /// The command line was wrong.
     Usage = 2,
-    /// A safety rule refused the operation (agent, TTY, overwrite, name rule).
+    /// A safety rule refused the operation (agent, TTY, overwrite, name rule,
+    /// an unsafe store file, store directory, config file, tool or lock
+    /// directory).
     Refused = 3,
     /// Lock timeout, or a concurrent change after 3 retries.
     Busy = 4,
-    /// A signal (INT, TERM, HUP) cancelled a write before it took effect.
+    /// A signal (INT, TERM, HUP, QUIT) stopped secrit before a write took
+    /// effect, or while it waited at a prompt, the reveal screen or sops.
     Interrupted = 130,
 }
 
@@ -39,8 +42,10 @@ pub enum Error {
     Refused(String),
     #[error("{0}")]
     Failed(String),
+    #[error("interrupted by a signal; nothing was changed")]
+    Interrupted,
     #[error(
-        "'secrit {command}' is not implemented yet (planned for milestone {milestone}; see docs/PLAN.md)"
+        "'secrit {command}' is not implemented yet (planned for milestone {milestone}; see the README, section 'What works')"
     )]
     NotImplemented {
         command: &'static str,
@@ -63,7 +68,11 @@ impl Error {
     pub fn exit(&self) -> Exit {
         match self {
             Error::Usage(_) => Exit::Usage,
-            Error::Refused(_) | Error::Name(_) => Exit::Refused,
+            Error::Refused(_)
+            | Error::Name(_)
+            | Error::Config(ConfigError::Unsafe { .. })
+            | Error::Tool(ToolError::Unsafe { .. }) => Exit::Refused,
+            Error::Interrupted | Error::Input(InputError::Interrupted) => Exit::Interrupted,
             Error::Failed(_)
             | Error::NotImplemented { .. }
             | Error::Config(_)
@@ -71,5 +80,44 @@ impl Error {
             | Error::Tool(_) => Exit::Failed,
             Error::Backend(e) => e.exit(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lock::LockError;
+    use std::path::PathBuf;
+
+    /// R3: every "unsafe file" refusal exits 3, as the README says.
+    #[test]
+    fn unsafe_files_exit_3() {
+        let p = PathBuf::from("/x");
+        let cases = [
+            Error::Config(ConfigError::Unsafe {
+                path: p.clone(),
+                reason: "writable by group or others",
+            }),
+            Error::Tool(ToolError::Unsafe {
+                program: "sops",
+                path: p.clone(),
+                reason: "writable by group or others".into(),
+            }),
+            Error::Backend(BackendError::Lock(LockError::UnsafeDir {
+                path: p.clone(),
+                reason: "owned by another user",
+            })),
+            Error::Backend(BackendError::Unsafe {
+                path: p,
+                reason: "it is a symlink".into(),
+            }),
+        ];
+        for e in &cases {
+            assert_eq!(e.exit(), Exit::Refused, "{e}");
+        }
+        assert_eq!(
+            Error::Input(InputError::Interrupted).exit(),
+            Exit::Interrupted
+        );
     }
 }

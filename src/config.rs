@@ -330,8 +330,7 @@ fn read_checked(path: &Path) -> Result<String, ConfigError> {
         return Err(unsafe_("not a regular file"));
     }
     let uid = rustix::process::getuid().as_raw();
-    let in_nix_store = meta.uid() == 0 && target.starts_with("/nix/store/");
-    if meta.uid() != uid && !in_nix_store {
+    if meta.uid() != uid && !crate::trust::in_nix_store(&target, &meta) {
         return Err(unsafe_("owned by another user"));
     }
     if meta.mode() & 0o022 != 0 {

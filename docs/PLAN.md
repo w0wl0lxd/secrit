@@ -3,6 +3,11 @@
 Status: draft for review, 2026-10-06. Author: planning agent (workflow `00000000`).
 Owner: w0wl0lxd. Repository: `~/dev/secrit` (private GitHub repository later; the lead creates it).
 
+Revised 2026-10-06 after the scaffold review (findings SEC-1 to SEC-16, R1 to R15, PF-1 to
+PF-5, UX-1 to UX-4, OQ-1 to OQ-3, NIX-1, NIX-2, TEST-1, CI-1, FOSS-1). Where the code and an
+earlier draft disagreed, this text now follows the code. `CHANGELOG.md`, section "Changed
+from docs/PLAN.md", lists each change.
+
 ## 1. Summary
 
 `secrit` is a small Rust command-line tool. `secrit store NAME` reads a value from a no-echo
@@ -85,7 +90,8 @@ age keys from `age-keygen`. No real secret was read or decrypted.
 | F19 | `secret_service::blocking::SecretService::connect(encryption: EncryptionType)` exists in 5.2.0. | docs.rs page for 5.2.0 |
 | F20 | rustix 1.1.5 has `fs::memfd_create`, `fs::renameat_with`, `process::set_dumpable_behavior`, and `mm::Advice::LinuxDontDump`. | docs.rs pages for 1.1.5 |
 | F21 | crane v0.24.0 (2026-08-21) is the newest release. cargo-deny 0.20.2 is installed. | `gh api`, `command -v` |
-| F22 | Local `rustc` resolves to a nightly. Stable 1.98.1 is installed under `/srv/build/rustup`. | `rustc --version`, `ls /srv/build/rustup/toolchains` |
+| F22 | Local `rustc` resolves to a nightly. Stable 1.98.1 and 1.99.0 (2026-09-28) are installed under `/srv/build/rustup`. The locked nixpkgs has rustc 1.98.1, so `rust-toolchain.toml` pins `1.98.1` (R15). | `rustc --version`, `ls /srv/build/rustup/toolchains`, `nix eval --inputs-from . nixpkgs#rustc.version` |
+| F23 | sops 3.13.3 runs `decrypt --extract '["NAME"]' /dev/stdin` with `HOME=/nonexistent` and prints the raw string. A passphrase-protected key (age or SSH) makes sops read `/dev/tty`, which stops a background process group with SIGTTIN. | Lab, temp keys only |
 
 Facts taken from the research reports and not re-checked here: the 27-of-40 lost-update lab
 result, the clipd and cliphist clipboard behaviour, Kitty remote control, and the
@@ -102,7 +108,14 @@ Global flags, valid on every subcommand:
 | `-q`, `--quiet` | Print errors only. |
 
 Exit codes: `0` success; `1` operation failed; `2` usage error; `3` refused by a safety rule
-(agent, TTY, overwrite, name rule); `4` lock timeout or concurrent change after 3 retries.
+(agent, TTY, overwrite, name rule, an unsafe store file, store directory, config file, lock
+directory, `.sops.yaml` or `sops` binary); `1` also covers a `sops` older than 3.11; `4` lock timeout or
+concurrent change after 3 retries; `130` a signal cancelled the command before a write took
+effect. A name is checked before the config loads, so a bad name exits 3 even with no config
+(R6).
+
+Commands that are not implemented yet (`run`, `init`, `doctor`, `wire`) say so in `--help`
+and exit 1 (open question Q12).
 
 ### 4.1 `secrit store NAME`
 
@@ -113,8 +126,8 @@ secrit store NAME [--replace] [--multiline] [--raw]
 | Flag | Behaviour |
 |---|---|
 | (none) | Fail with exit 3 if NAME exists. Existence is checked by parsing the cleartext key names; nothing is decrypted. |
-| `--replace` | Allow overwrite. Before the write, copy the old ciphertext file to `<file>.secrit-bak.<UTC>` with mode 0600 and print its path. |
-| `--multiline` | Allow `\n` inside the value. TTY input then reads until a line that holds only `.` (pass convention). |
+| `--replace` | Allow overwrite. Before the rename, copy the old ciphertext file to the backup directory (section 8.1, step 11a) and print its path. |
+| `--multiline` | Allow `\n` inside the value. TTY input then reads until a line that holds only `.` (pass convention). It is asked once, not twice. |
 | `--raw` | Piped input: keep the bytes exactly, including a trailing newline. Implies `--multiline`. |
 
 Behaviour:
@@ -139,14 +152,19 @@ secrit get NAME [--stdout]
 | Condition | Result |
 |---|---|
 | Agent detected (section 8.3) | Refuse, exit 3. No flag overrides this (open question Q5). |
-| No flag, stdout is a TTY, `/dev/tty` opens | Reveal mode: switch to the alternate screen, show NAME and the value, wait for Enter on `/dev/tty`, clear the alternate screen, switch back. Nothing reaches scrollback. |
-| No flag, stdout is not a TTY | Refuse, exit 3: `stdout is not a terminal; use --stdout, or better 'secrit run'`. |
-| `--stdout`, stdout is not a TTY | Write the exact value bytes to stdout, no trailing newline. |
+| No flag, stdout is a TTY, `/dev/tty` opens | Reveal mode: switch to the alternate screen, show NAME and the value, wait for any key on `/dev/tty` (raw mode), clear the alternate screen, switch back. Nothing reaches scrollback. |
+| No flag, stdout is not a TTY | Refuse, exit 3: `stdout is not a terminal; use --stdout to write the value to a pipe`. |
+| `--stdout`, stdout is a pipe, a socket or a character device | Write the exact value bytes to stdout, no trailing newline. |
+| `--stdout`, stdout is a regular file | Allowed only when the file is the user's own and group and others cannot read it (mode 0600); else refuse, exit 3 (SEC-3). A block device is refused. |
 | `--stdout`, stdout is a TTY | Refuse, exit 3: `--stdout would leave the value in scrollback; run 'secrit get NAME' without --stdout`. |
+| No `/dev/tty` (cron, `ssh -T`) | Refuse, exit 3: `there is no terminal (/dev/tty cannot be opened)`. |
 
 The reveal-mode escape sequences are written by hand (`ESC[?1049h`, `ESC[2J`, `ESC[?1049l`).
-No terminal crate is needed. The docs warn that Kitty remote control and screen recorders can
-read the screen while the value shows.
+No terminal crate is needed. The value never reaches the terminal raw: `\n` becomes `\r\n`,
+tab stays, and every other control character, bidirectional override or invalid byte shows
+as `\xNN` in reverse video (SEC-1). SIGINT, SIGTERM, SIGHUP and SIGQUIT during the wait clear
+the screen, restore the terminal and exit 130 (SEC-13). The docs warn that Kitty remote
+control and screen recorders can read the screen while the value shows.
 
 ### 4.3 `secrit ls`
 
@@ -156,7 +174,9 @@ secrit ls [--json]
 
 Parse the encrypted YAML and print the top-level key names, sorted, one per line. Skip the
 `sops` key. Decrypt nothing. `--json` prints a JSON array of strings. Names are not secret
-(they are cleartext in the file and in git history); the docs say so.
+(they are cleartext in the file and in git history); the docs say so. The plain output
+escapes control characters and bidirectional overrides in a name that another tool wrote
+(R5).
 
 ### 4.4 `secrit rm NAME`
 
@@ -167,8 +187,8 @@ secrit rm NAME [--yes]
 1. Fail with exit 1 if NAME does not exist.
 2. Without `--yes`, ask `remove NAME from <file>? [y/N]` on `/dev/tty`. With no TTY and no
    `--yes`, exit 3.
-3. Copy the old file to `<file>.secrit-bak.<UTC>` (mode 0600), then run the write protocol
-   with `sops unset`.
+3. Run the write protocol with `sops unset`. It copies the old file to the backup directory
+   (section 8.1, step 11a).
 4. Print: `removed NAME. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked.`
 
 ### 4.5 `secrit run`
@@ -186,8 +206,10 @@ secrit run [--file VAR=NAME]... [--env VAR=NAME]... [--no-mask] -- CMD [ARGS...]
 Behaviour:
 
 1. At least one `--file` or `--env` is required. `VAR` must match `^[A-Za-z_][A-Za-z0-9_]*$`.
-2. Decrypt all names with one `sops decrypt` call per store file (the whole file through a
-   pipe into secrit's memory; see section 8.2). Never one call per name.
+2. Decrypt each name as `get` does (section 6.2): one `sops decrypt --extract` per name, on
+   the checked snapshot bytes, into a capped buffer. The earlier rule "one decrypt of the
+   whole file per store" is withdrawn: parsing the whole-file JSON left unwiped copies of
+   every value in `serde_json` scratch buffers (SEC-8).
 3. Run CMD directly with `execvp` semantics. Never through a shell.
 4. **Masking.** Masking is on when stdout or stderr is not a TTY, or when an agent is detected.
    With masking on, secrit stays as the parent. It pipes the child's stdout and stderr and
@@ -210,7 +232,8 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
 
 `init` is idempotent. It changes only what is missing, and it prints each step it takes.
 
-1. **Tools.** Resolve `sops` and `age-keygen` (section 10.2). Check `sops` is 3.11 or newer.
+1. **Tools.** Resolve `sops` and `age-keygen` (section 10.2). Check `sops` is 3.11 or newer
+   (every command that runs sops already does this once, PF-4).
    If a tool is missing, print `nix profile add nixpkgs#sops nixpkgs#age` or the flake
    instructions, then exit 1. `init` does not install packages itself (open question Q6).
 2. **Age key.** Path: `--age-key`, else config, else `$XDG_CONFIG_HOME/sops/age/keys.txt`.
@@ -249,9 +272,12 @@ Read-only. One line per check with `ok`, `warn` or `fail`. Exit 1 if any check f
 | age key exposure | `SOPS_AGE_KEY` or `SOPS_AGE_KEY_CMD` is set in secrit's environment (warn) |
 | `.sops.yaml` | none found, or no rule matches the store file (fail) |
 | store file | missing, not a regular file, a symlink, link count > 1, owned by another uid, or writable by group or others (fail) |
-| store directory | not owned by the uid, or writable by others (fail) |
+| store directory | not owned by the uid, or writable by group or others and not sticky (fail) |
+| `.sops.yaml` and `sops` trust | owned by another user, or the file or its directory writable by group or others (fail) |
 | plaintext risk | `.sops.yaml` has `unencrypted_regex`, `unencrypted_suffix`, `encrypted_regex` or `encrypted_suffix` (warn); any top-level leaf outside `sops` that does not start with `ENC[` (fail) |
-| leftover temp files | `.*.secrit-*.yaml` older than 1 hour in the store directory (warn; `doctor --fix` removes them when the lock is free) |
+| leftover temp files | `.*.secrit-*.yaml` older than 1 hour in the store directory (warn; `doctor --fix` removes them when the lock is free). A SIGKILL or a crash leaves one; SIGINT, SIGTERM, SIGHUP and SIGQUIT do not. |
+| backups | the backup directory (section 8.1, step 11a) is not mode 0700, or holds files another user owns (fail); the count and the oldest date (info) |
+| git ignore | the store repository does not ignore `.*.secrit-*.yaml` (warn) |
 | git | the store file is untracked in a flake repository (warn, F14) |
 | agent | agent variables set or no `/dev/tty` (info: `get` and `--no-mask` are off) |
 | core dumps | `RLIMIT_CORE` could not be set to 0 (warn) |
@@ -320,8 +346,13 @@ Rules:
 - `~` expands to `$HOME`. No other expansion. Relative paths are an error.
 - Unknown keys are an error (`#[serde(deny_unknown_fields)]`), so a typo cannot silently fall
   back to a default.
-- Environment overrides: `SECRIT_CONFIG` only. No `SECRIT_FILE` or similar, so an agent cannot
-  redirect a write by setting a variable that the user does not see.
+- Environment overrides: `SECRIT_CONFIG` only. No `SECRIT_FILE` or similar. `SECRIT_CONFIG`
+  can still point at a config that names another store file and another `sops` binary, so
+  it is not hidden (SEC-10): each run that uses it prints
+  `secrit: using config PATH from SECRIT_CONFIG` on stderr (not with `-q`), and a configured
+  `tools.sops` and the `.sops.yaml` must pass the trust rule: owned by the uid, root or the
+  Nix store, and neither the file nor its directory writable by group or others (a sticky
+  directory passes). A failed trust check exits 3.
 
 ## 6. Backends
 
@@ -333,10 +364,11 @@ pub trait Backend {
     /// Names only. Must not decrypt.
     fn list(&self) -> Result<Vec<Name>, BackendError>;
     fn exists(&self, name: &Name) -> Result<bool, BackendError>;
-    /// One decrypt for all names.
+    /// One locked snapshot; each name is decrypted from it.
     fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError>;
     fn put(&self, name: &Name, value: &SecretValue, mode: PutMode) -> Result<PutReport, BackendError>;
-    fn remove(&self, name: &Name) -> Result<(), BackendError>;
+    /// Returns the backup path, like `put`.
+    fn remove(&self, name: &Name) -> Result<PutReport, BackendError>;
 }
 
 pub enum PutMode { CreateOnly, Replace }
@@ -349,10 +381,13 @@ pub enum PutMode { CreateOnly, Replace }
 
 - Runs `sops` by absolute path with a clean environment (section 8.2).
 - `list` and `exists` parse the ciphertext YAML with `serde-saphyr` and read top-level keys.
-- `get_many` runs `sops --config C decrypt --input-type yaml --output-type json FILE` once and
-  parses the JSON from the pipe into `SecretValue`s. It keeps the requested names and zeroizes
-  the rest of the buffer. A non-string value (int, bool, map) is an error that names the key
-  and the type, never the value.
+- `get_many` reads one snapshot of the file through the directory fd. It checks the
+  ciphertext type tag of each wanted entry first: a non-string value (int, bool, map) is an
+  error that names the key and the type, never the value. Then, for each name, it runs
+  `sops --config C decrypt --input-type yaml --output-type yaml --extract '["NAME"]' /dev/stdin`
+  with the snapshot bytes on stdin, and reads the raw value into a capped, zeroized buffer.
+  sops never reopens the store file by path, so it decrypts the bytes that secrit checked
+  (SEC-8, SEC-11). This costs one sops run per name.
 - `put` and `remove` use the write protocol in section 8.1.
 
 ### 6.3 Secret Service (v0.2)
@@ -383,12 +418,15 @@ pub enum PutMode { CreateOnly, Replace }
 
 | stdin | Source | Rules |
 |---|---|---|
-| A TTY | `/dev/tty` through `rpassword`, no echo | Ask twice; a mismatch fails with exit 1. One line; the newline is not stored. With `--multiline`, read lines until a line that holds only `.`. |
+| A TTY | `/dev/tty`, read by secrit with echo off | Ask twice; a mismatch fails with exit 1. One line; the newline is not stored. With `--multiline`, read lines until a line that holds only `.`, in one no-echo session, asked once. |
 | Not a TTY | stdin to EOF | Strip exactly one trailing `\n` or `\r\n`, unless `--raw`. |
 
 - No value from argv, ever. No value from an environment variable in v0.1.
-- `rpassword` returns a plain `String`. secrit moves it into `SecretBox` at once and the
-  `String` buffer is zeroized (`zeroize::Zeroize` on the `String` before drop).
+- secrit reads `/dev/tty` itself in canonical mode with `ECHO` off, through `poll`, into a
+  pre-sized zeroized buffer. `rpassword` is not used: it dropped tab and other control
+  characters, and it restored echo between multiline lines (SEC-5, SEC-7). A tab is kept.
+  The terminal limits one line to 4095 bytes; a longer line is refused. A signal during the
+  prompt restores the terminal and exits 130.
 - Piped input is read into a pre-allocated `Vec<u8>` with a hard cap of 64 KiB. Input past the
   cap fails with exit 1; the buffer is zeroized.
 
@@ -415,40 +453,69 @@ pub enum PutMode { CreateOnly, Replace }
 
 ### 8.1 The sops write protocol
 
-Used by `store` and `rm`. All file operations are relative to one directory fd (rustix
-`openat`, `renameat_with`).
+Used by `store` and `rm`. secrit's own file operations are relative to one directory fd
+(rustix `openat`, `renameat_with`). The sops child opens the temp copy by path (step 8);
+the readback and `get` give sops the bytes on stdin instead (SEC-11).
 
+0. Defer SIGINT, SIGTERM, SIGHUP and SIGQUIT (step 8), so a signal while secrit waits for
+   the lock also exits 130 (R1).
 1. Resolve the store file path once. Open its parent with `O_DIRECTORY | O_NOFOLLOW`.
-2. Check the parent: owned by the uid, not writable by others.
+2. Check the parent: owned by the uid, and not writable by group or others unless the
+   sticky bit is set (SEC-4).
 3. `fstatat(AT_SYMLINK_NOFOLLOW)` on the file: a regular file, owned by the uid, not writable
-   by group or others, link count 1. A symlink fails (exit 3).
-4. Take an exclusive `flock` on `$XDG_RUNTIME_DIR/secrit/<dev>-<ino>.lock` (directory mode
-   0700), with the configured timeout. If `XDG_RUNTIME_DIR` is unset, fail; do not fall back to
-   `/tmp`.
+   by group or others, link count 1. A symlink fails (exit 3). A missing file fails with
+   "create it first" and a pointer to the README.
+4. Take an exclusive `flock` on `$XDG_RUNTIME_DIR/secrit/<dir dev>-<dir ino>-<name hash>.lock`
+   (directory mode 0700), with the configured timeout. The key is the directory and a hash of
+   the file name, not the file's inode: each write renames a new inode over the file, so an
+   inode key let two writers hold "the" lock at once. The lock is taken before steps 2 and 3
+   repeat on the locked file. If `XDG_RUNTIME_DIR` is unset, fail; do not fall back to `/tmp`.
+   A signal stops the wait (exit 130).
 5. Snapshot the original: dev, inode, size, mtime, and a SHA-256 of the ciphertext.
 6. Parse the original names. For `store` without `--replace`, fail if NAME exists. For `rm`,
    fail if it does not.
 7. Create `.<basename>.secrit-<random>.yaml` in the same directory with `O_EXCL | O_NOFOLLOW`,
    mode 0600, and copy the ciphertext into it. The copy holds ciphertext only.
-8. Block SIGINT, SIGTERM and SIGHUP in secrit (the stuck-process reaper signals a whole process
-   group). Run sops in its own session (`setsid`) so a group signal does not reach it:
+8. SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred in secrit (the stuck-process reaper
+   signals a whole process group). Run sops in its own process group, so a group signal does
+   not reach it:
    `sops --config C set --input-type yaml --output-type yaml --value-stdin COPY '["NAME"]'`
-   (or `unset COPY '["NAME"]'`). The JSON-encoded value goes on stdin.
+   (or `unset COPY '["NAME"]'`). The JSON-encoded value goes on stdin. Every sops run is
+   bounded (R1, SEC-6):
+   - secrit polls the child every 20 ms with `waitid(WEXITED | WSTOPPED | WNOHANG | WNOWAIT)`.
+     A stopped child (SIGTTIN from a sops passphrase prompt on `/dev/tty`) is killed at once,
+     and secrit says that passphrase-protected identities are not supported.
+   - A deferred signal kills the sops process group; the command exits 130.
+   - A wall-clock limit of 120 s kills the group; the command exits 1.
+   - stdout is read into a capped buffer; output past the cap kills the group.
+   - On every path, secrit kills the group and reaps the child before it returns (R10).
+   `setsid` is not used: `CommandExt::setsid` is unstable, and a `pre_exec` hook needs
+   `unsafe`, which the crate forbids. The stop detection gives the same fail-fast result.
 9. Validate the copy:
    - it parses, and the `sops` block with `mac` and at least one recipient is present;
    - the recipient list equals the original's;
    - every top-level leaf outside `sops` starts with `ENC[AES256_GCM,`;
    - the set of names equals the old set plus NAME (`store`) or minus NAME (`rm`);
-   - for `store`, decrypt only NAME from the copy (`decrypt --extract '["NAME"]'` through a
-     pipe) and compare it to the input with `subtle::ConstantTimeEq`.
+   - every other entry has the same parsed value as before (not a byte compare);
+   - for `store`, decrypt only NAME from the copy's bytes (`decrypt --extract '["NAME"]'
+     /dev/stdin`) and compare it to the input with `subtle::ConstantTimeEq`.
 10. `fsync` the copy, then `fchmod` it to the original mode.
-11. Snapshot the original again. If it changed since step 5, unlink the copy and retry from
-    step 5, at most 3 times; then exit 4.
-12. `renameat` the copy over the original. `fsync` the directory.
-13. Unblock signals. Release the lock.
+11. Snapshot the original again (dev, inode, size, mtime, mode and hash). If it changed
+    since step 5, unlink the copy and retry from step 5, at most 3 times; then exit 4.
+    a. Back up the original ciphertext (`store --replace` and `rm`) to
+       `$XDG_STATE_HOME/secrit/backups/<id>-<basename>/<basename>.<UTC>` (directory mode
+       0700, file mode 0600, fsynced), where `<id>` is a short hash of the store path. The
+       backups stay out of the store repository (SEC-2, UX-1).
+12. `renameat` the copy over the original. `fsync` the directory. If the rename fails,
+    unlink the backup of step 11a.
+13. Keep the newest 10 backups of this store and remove the rest. Release the lock.
+    secrit checks for a deferred signal last just before step 11a. A signal that arrives
+    after that check does not stop the write, and the command completes.
 
-On any failure before step 12, unlink the copy and leave the original untouched. A crash
-between steps 7 and 12 can leave a ciphertext-only temp file; `doctor` reports it.
+On any failure before step 12, unlink the copy and leave the original untouched. A crash or
+a SIGKILL between steps 7 and 12 can leave a ciphertext-only temp file; `doctor` reports it.
+The README tells the user to add `.*.secrit-*.yaml` to the store repository's `.gitignore`,
+and `init` and `wire` will print that line too.
 
 Known limit, in the docs: a raw `sops set` or `sops edit` that runs against the old file at the
 same time does not take secrit's lock. secrit's step 11 detects a change that lands before the
@@ -457,13 +524,20 @@ rename, but not one that lands after it.
 ### 8.2 Child processes
 
 - Run children by absolute path only (section 10.2). Never through a shell.
-- Clear the child environment, then set only: `HOME`, `XDG_CONFIG_HOME` (if set),
-  `SOPS_DISABLE_VERSION_CHECK=1`, and `SOPS_AGE_KEY_FILE` when config names a key file.
+- Clear the child environment, then set only: `HOME=/nonexistent`,
+  `SOPS_DISABLE_VERSION_CHECK=1`, and `SOPS_AGE_KEY_FILE`. The key file comes from config,
+  else `$XDG_CONFIG_HOME/sops/age/keys.txt`, else `~/.config/sops/age/keys.txt` (the sops
+  default, made explicit). With no usable HOME, sops cannot find `~/.ssh/id_ed25519` or
+  `~/.ssh/id_rsa`, so only age key files work (R2, T19; open question Q18).
   `SOPS_AGE_KEY`, `SOPS_AGE_KEY_CMD` and the SSH key variables are never passed. secrit never
   puts key material into any environment.
-- Always pass `--config` to sops (F10).
-- Capture child stderr. Before showing it, replace any occurrence of the value with
-  `[REDACTED]`, then show at most 20 lines. Never echo child stdout of a decrypt.
+- Always pass `--config` to sops (F10). With no `.sops.yaml`, pass `--config /dev/null`.
+- Before the first sops run, check the `.sops.yaml` trust (section 5) and run
+  `sops --version --disable-version-check` once. A sops older than 3.11 is refused (PF-4).
+- Capture child stderr. Before showing it, drop every line that holds the value, its JSON
+  form, or any line of the value with 4 or more bytes; escape control characters in the
+  rest; show at most 20 lines, and say how many lines were dropped (SEC-15). Never echo
+  child stdout of a decrypt.
 - No value on any child argv. A test reads `/proc/<pid>/cmdline` of the children (section 15).
 
 ### 8.3 Agent detection
@@ -478,6 +552,8 @@ An agent is detected when any of these is true:
 When an agent is detected: `get` is refused; `run --no-mask` is refused; `run` masks; `store`,
 `ls`, `rm --yes`, `doctor`, `wire` and `init` work. There is no override variable, because an
 agent can set any variable (open question Q5). The list lives in one constant and the docs.
+Whether an agent may write the store file at all is open question Q13: with the Q1 default,
+`store` and `rm --yes` rewrite a file under `/etc/nixos`.
 
 ### 8.4 Output
 
@@ -499,8 +575,13 @@ At start, before reading any input:
 3. Set the umask to `0o077`.
 4. `panic = "abort"` in the release profile; the panic hook prints a fixed message with no
    payload.
-5. Best effort: `mlock` and `madvise(MADV_DONTDUMP)` on value buffers. `EPERM` or `ENOMEM` is
-   ignored; `doctor` reports it.
+5. Deferred (open question Q14): `mlock` and `madvise(MADV_DONTDUMP)` on value buffers.
+   rustix 1.1.5 exposes both as `unsafe fn`, and the crate has `unsafe_code = "forbid"`.
+   v0.1 relies on small values (64 KiB cap), zeroized buffers and `RLIMIT_CORE=0`.
+6. A step of 1 to 3 that fails prints one warning line (not with `-q`).
+7. SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred while secrit writes, waits for the lock,
+   reads the prompt or shows a value (section 8.1, step 0). SIGQUIT is in the set because its
+   default action would end secrit before the temp copy is removed (SEC-14).
 
 Limits the docs state: a child (sops, CMD) is dumpable again after `execve`, and secrit cannot
 zeroize copies inside sops (Go).
@@ -526,20 +607,26 @@ flake.nix
   inputs:  nixpkgs (nixos-unstable), crane (v0.24)
   outputs:
     packages.<system>.default    secrit, built with crane
-    apps.<system>.default        nix run github:w0wl0lxd/secrit
-    checks.<system>.*            fmt, clippy (-D warnings), nextest, cargo-deny, the package
-    devShells.<system>.default   crane devShell + sops, age, cargo-nextest, cargo-deny, dbus
-    homeManagerModules.default   programs.secrit
-    overlays.default             pkgs.secrit
+    apps.<system>.default        nix run path:. -- ls
+    checks.<system>.*            fmt, clippy (-D warnings), nextest, cargo-deny, the package,
+                                 hm-module (evaluates the module, runs secrit on its config)
+    devShells.<system>.default   crane devShell + sops, age, cargo-nextest, cargo-deny,
+                                 util-linux, openssh, coreutils, diffutils (test tools)
+    homeManagerModules.default   programs.secrit (nix/hm-module.nix)
+    overlays.default             pkgs.secrit, built from the consumer's nixpkgs
 ```
 
-Systems: `x86_64-linux` and `aarch64-linux`. No flake-utils; a small `forAllSystems` helper.
+Systems: `x86_64-linux` only. CI builds no other system, so `aarch64-linux` comes back with an
+arm runner job (CI-1). No flake-utils; a small `forAllSystems` helper.
 
 ### 10.2 Pinned tools
 
 The crane build sets `SECRIT_SOPS_BIN = "${pkgs.sops}/bin/sops"` and
-`SECRIT_AGE_KEYGEN_BIN = "${pkgs.age}/bin/age-keygen"`. The code reads them with
-`option_env!` at compile time. Tool resolution for `tools.sops = "auto"`:
+`SECRIT_AGE_KEYGEN_BIN = "${pkgs.age}/bin/age-keygen"` on the package, clippy and nextest
+derivations, not on `buildDepsOnly`, so a sops or age bump does not rebuild the
+dependencies (NIX-2). The code reads them with `option_env!` at compile time.
+`secrit --version` prints both paths, which keeps both store paths in the binary, so the
+package closure carries `age` too (NIX-1). Tool resolution for `tools.sops = "auto"`:
 
 1. the compile-time path, if set and the file exists;
 2. else the first `sops` on PATH, resolved to an absolute path with `which`, with a `doctor`
@@ -553,14 +640,18 @@ A build-time constant cannot be changed by a variable at run time, and it avoids
 ```nix
 programs.secrit = {
   enable = true;
-  package = pkgs.secrit;          # default: this flake's package
+  package = pkgs.secrit;          # default: this flake's package, built from the consumer's nixpkgs
   settings = { ... };             # rendered with pkgs.formats.toml to xdg.configFile."secrit/config.toml"
-  enableFishIntegration = true;   # completions; also bash and zsh
 };
 ```
 
-The module installs the package, the config, and completions. It does not import the sops-nix
-home-manager module: `/etc/nixos` removed user-level sops-nix because of a login race.
+The module installs the package and the config. The package ships the bash, fish and zsh
+completions in `share/`, so no `enable*Integration` option is needed. An empty `settings`
+writes no file. The config is a symlink into `/nix/store`, which the config trust rule
+accepts (section 5). The module does not import the sops-nix home-manager module:
+`/etc/nixos` removed user-level sops-nix because of a login race. The `hm-module` flake
+check evaluates the module with stub `home.packages` and `xdg.configFile` options, and runs
+the installed secrit on the generated file (PF-2).
 
 ### 10.4 What "sets it up for you" means
 
@@ -577,8 +668,8 @@ M6), not v0.1.
 ## 11. Repository layout
 
 ```text
-Cargo.toml  Cargo.lock  rust-toolchain.toml (channel = "stable")
-deny.toml  rustfmt.toml  clippy.toml
+Cargo.toml  Cargo.lock  rust-toolchain.toml (channel = "1.98.1")
+deny.toml
 flake.nix  flake.lock  nix/hm-module.nix
 src/
   main.rs        parse, harden, dispatch, map errors to exit codes
@@ -587,16 +678,26 @@ src/
   name.rs        Name newtype and rules
   secret.rs      SecretValue, input reading, JSON encoding
   agent.rs       agent detection
-  harden.rs      rlimit, dumpable, umask, mlock (Linux only)
+  harden.rs      rlimit, dumpable, umask (Linux only)
   lock.rs        flock under XDG_RUNTIME_DIR
-  tools.rs       binary resolution and version check
+  tools.rs       binary resolution, the --version text
+  trust.rs       owner and mode checks for .sops.yaml and a configured sops
+  signals.rs     deferred INT, TERM, HUP and QUIT
+  tty.rs         /dev/tty prompt and key reads through poll, termios guard
+  display.rs     escaping of names and revealed values
+  error.rs       error type and exit codes
   backend/mod.rs     Backend trait
-  backend/sops.rs    sops backend and write protocol
-  cmd/{store,get,ls,rm,run,init,doctor,wire}.rs
-  mask.rs        streaming redactor for run
-tests/           integration tests (assert_cmd)
-docs/PLAN.md  README.md  SECURITY.md  CHANGELOG.md
+  backend/sops.rs    sops backend, write protocol, bounded child runs, sops version check
+  cmd/{mod,store,get,ls,rm}.rs
+tests/
+  common/mod.rs  TestEnv harness
+  cli.rs  safety.rs  tty.rs   integration and pty tests (std::process::Command)
+docs/PLAN.md  README.md  SECURITY.md  CHANGELOG.md  LICENSE-MIT  LICENSE-APACHE
 ```
+
+Planned and not yet present: `cmd/{run,init,doctor,wire}.rs` and `mask.rs` (the streaming
+redactor for `run`). `rustfmt.toml` and `clippy.toml` are not needed: the defaults and the
+`[lints]` table in `Cargo.toml` hold every setting.
 
 `clap` errors echo the offending argument text. `cli.rs` uses `try_parse` and, on an error,
 prints the error kind and usage only. A test feeds `store NAME --value=hunter2` and checks
@@ -613,28 +714,34 @@ caret requirements at these versions; `Cargo.lock` is committed.
 | clap_complete | 4.6.11 | completions |
 | serde (derive) | 1.0.229 | config |
 | toml | 1.1.6 | config |
-| serde_json | 1.0.151 | JSON-encode values; parse `decrypt --output-type json` |
-| serde-saphyr | 1.3.0 | read ciphertext YAML key names |
+| serde_json | 1.0.151 | JSON-encode values for `sops set` |
+| serde-saphyr | 1.3.0 | read ciphertext YAML key names and type tags |
 | secrecy | 0.10.3 | `SecretBox<Vec<u8>>` |
 | zeroize | 1.9.1 | wipe buffers |
 | subtle | 2.6.1 | constant-time readback compare |
-| rpassword | 7.5.4 | no-echo prompt |
-| rustix (fs, process, mm, termios) | 1.1.5 | openat, renameat, memfd, flock, prctl, rlimit, mlock, isatty |
+| rustix (event, fs, process, termios) | 1.1.5 | openat, renameat, flock, prctl, rlimit, waitid, kill, poll, termios |
+| signal-hook | 0.4.5 | deferred INT, TERM, HUP and QUIT |
 | getrandom | 0.4.3 | temp-file suffix |
 | which | 8.0.6 | PATH fallback |
-| sha2 | 0.11.0 | file snapshot hash |
-| base64 | 0.23.1 | masking patterns |
+| sha2 | 0.11.0 | file snapshot hash, lock and backup directory names |
 | thiserror | 2.0.21 | error types |
-| anyhow | 1.0.104 | `main` only |
 
-Dev: assert_cmd 2.2.2 (`cargo_bin_cmd!`), assert_fs 1.1.4, predicates 3.1.4, insta 1.49.0,
-tempfile 3.27.0.
+Later, with the command that needs it: `base64` (masking patterns for `run`), the rustix `mm`
+feature (memfd for `run`; `mlock` waits on Q14), `insta` (snapshots for `wire` and `doctor`).
+
+Dev: tempfile 3.27.0. The integration tests drive the binary with `std::process::Command`,
+so `assert_cmd`, `assert_fs` and `predicates` are not used.
+
+Dropped during the scaffold: `rpassword` (it dropped tab and restored echo between lines;
+secrit reads `/dev/tty` itself, SEC-5, SEC-7) and `anyhow` (`main` maps the typed errors to
+exit codes directly).
 
 Rejected: `rops`, `keepass`, `keyring`, `oo7` (v0.1), `arboard`, `dialoguer`, `serde_yaml`
 (deprecated), `serde_yml` (RUSTSEC-2025-0068), `memsecurity`, `age` (not needed in v0.1),
 `tokio` (no async in v0.1), `fs4` (rustix has `flock`).
 
-MSRV: the newest stable at scaffold time (1.98.1 installed). Edition 2024.
+MSRV: 1.98 (`rust-version`). `rust-toolchain.toml` pins 1.98.1, the rustc in the locked
+nixpkgs (F22, R15). Edition 2024.
 
 ## 13. Threat model
 
@@ -652,10 +759,10 @@ A4 concurrent writers; A5 the stuck-process reaper and the OOM killer.
 | T4 | Value in an agent transcript (A2) | Agent detection refuses `get` and `--no-mask`; `run` masks (8.3, 4.5) | `CLAUDECODE=1 secrit get N --stdout` exits 3; `run` with a child that prints the value shows `[secrit:N]` |
 | T5 | Value in a child environment (A2) | `--file` memfd preferred; `--env` documented (4.5) | `run --file V=N -- cat $V` reads the value; `/proc/<child>/environ` has only `/dev/fd/N` |
 | T6 | Core dump or ptrace read (A2, A3) | `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, `panic=abort` (8.5) | Read `/proc/<secrit pid>/status` during a blocked prompt; `prctl` read-back in a unit test |
-| T7 | Value in swap (A3) | Best-effort `mlock` and `MADV_DONTDUMP`; small values (8.5, 7.1) | Unit: buffer over 64 KiB refused |
+| T7 | Value in swap (A3) | Small values and zeroized buffers (7.1). `mlock` and `MADV_DONTDUMP` are deferred (8.5, Q14) | Unit: buffer over 64 KiB refused |
 | T8 | Value in logs or errors (A3) | `SecretValue` has redacted `Debug`; child stderr redacted (6.1, 8.2) | Fake sops that echoes stdin to stderr and exits 1: value absent from output |
 | T9 | Lost update from concurrent writers (A4) | flock + snapshot compare + rename (8.1) | 40 parallel `store` calls, 40 names present |
-| T10 | Torn file after a kill mid-write (A5) | Edit a copy; block signals; `setsid`; rename (8.1) | SIGKILL secrit at a test hook between steps 8 and 12: original byte-identical |
+| T10 | Torn file after a kill mid-write (A5) | Edit a copy; defer signals; sops in its own process group; bounded child runs; rename (8.1) | SIGKILL secrit at a test hook between steps 8 and 12: original byte-identical |
 | T11 | Symlink or hard-link swap of the target (A1, A2) | `O_NOFOLLOW`, owner and mode checks, link count 1, dir-fd relative ops (8.1) | Symlinked target refused; hard-linked target refused |
 | T12 | Accidental overwrite | `--replace` required; ciphertext backup (4.1) | Second `store` of a name exits 3; `--replace` makes a 0600 backup |
 | T13 | Value stored in cleartext by `.sops.yaml` rules | Name rules (7.3); validation that every leaf is `ENC[` (8.1) | Name `x_unencrypted` refused; `.sops.yaml` with `unencrypted_regex` that matches refused |
@@ -664,7 +771,9 @@ A4 concurrent writers; A5 the stuck-process reaper and the OOM killer.
 | T16 | Value stored as a non-string type | Always a JSON string (7.2, F5) | Store `123`, decrypt in the test: type is string |
 | T17 | Trailing newline stored by mistake | Strip one `\n` or `\r\n` on piped input unless `--raw` (7.1) | Piped `v\n` decrypts to `v`; `--raw` keeps it |
 | T18 | Hijacked `sops` on PATH (mise shim, `PATH` edit) | Compile-time absolute path; warning on fallback (10.2) | Unit: resolution order; `doctor` warns on PATH fallback |
-| T19 | sops picks up a different key (`SOPS_AGE_KEY`, `~/.ssh/id_ed25519`) | Clean child environment (8.2) | Tests run with a temp HOME holding a decoy `~/.ssh/id_ed25519`; decoy never used |
+| T19 | sops picks up a different key (`SOPS_AGE_KEY`, `~/.ssh/id_ed25519`) | Clean child environment; sops gets `HOME=/nonexistent` and an explicit `SOPS_AGE_KEY_FILE` (8.2) | Tests run with a temp HOME holding a passphrase-protected decoy `~/.ssh/id_ed25519` that is not a recipient; `store` under a pty never prompts. A store encrypted only to an SSH key in HOME cannot be read through secrit, while a direct sops run with that HOME can (control) |
+| T25 | sops blocks on a terminal prompt or hangs (A5) | Stop detection, a 120 s limit and signal kill on every sops run (8.1, step 8) | A fake sops that reads `/dev/tty` fails fast; a hung sops times out; a signal ends a running sops with exit 130 |
+| T26 | A stored value moves the terminal off the alternate screen (A3) | Reveal escapes control characters (4.2) | PTY test with `ESC[?1049l` and an OSC 52 sequence in the value |
 | T20 | Leftover ciphertext temp file in a git repository | Unlink on failure; `doctor` reports old ones (4.7) | Fault-injected sops exit: no `.secrit-*` file left |
 | T21 | Clipboard history keeps the value (A2, A3) | No clipboard in v0.1 (8.4) | None in v0.1 |
 | T22 | Plaintext temp files from an editor | No `edit` command (N2) | None |
@@ -689,7 +798,11 @@ A `TestEnv` helper (in `tests/common/mod.rs`) builds, per test:
 - a temp directory (`tempfile`) holding `home/`, `config/`, `runtime/` (mode 0700),
   `store/secrets/`, a new age key from `age-keygen`, a second recipient key, `.sops.yaml`, and
   a `config.toml` that names these paths;
-- a decoy `home/.ssh/id_ed25519` that is not a recipient (T19);
+- a passphrase-protected decoy `home/.ssh/id_ed25519` that is not a recipient (T19);
+- test tools found through `SECRIT_TEST_SOPS`, `SECRIT_TEST_AGE_KEYGEN` and
+  `SECRIT_TEST_SSH_KEYGEN` (the devShell and the Nix check set them), else `PATH`;
+- pty tests through util-linux `script`, and no-terminal tests through `setsid -w`. A
+  missing `script` or `setsid` fails the test; it never skips silently (TEST-1, R9);
 - an environment for the secrit child that is cleared, then set: `HOME`, `XDG_CONFIG_HOME`,
   `XDG_RUNTIME_DIR`, `SECRIT_CONFIG`, `PATH` (Nix store paths of sops and age only),
   `SOPS_AGE_KEY_FILE` (the temp key). `SOPS_AGE_KEY*`, `SOPS_AGE_SSH_*`,
@@ -743,22 +856,25 @@ env -u CARGO_UNSTABLE_GIT CARGO_HOME=<that dir> cargo +stable nextest run > next
 
 One workflow, `ci.yml`, on pull requests and pushes to `main`:
 
-| Job | Command |
+| Job | Steps |
 |---|---|
-| fmt | `cargo fmt --all --check` |
-| clippy | `cargo clippy --all-targets --all-features -- -D warnings` |
-| test | `cargo nextest run --all-features` (installs `sops` and `age` from nixpkgs through `cachix/install-nix-action` + `nix develop -c`) |
-| deny | `cargo deny check` (advisories, bans, licences, sources) |
-| nix | `nix flake check` |
+| cargo | `cargo fmt --all --check`; `cargo clippy --all-targets --all-features -- -D warnings`; the same clippy without features; `cargo nextest run --all-features`; `cargo deny check` (advisories, bans, licences, sources). All through `nix develop -c` after `cachix/install-nix-action`. |
+| nix | `nix flake check -L` |
 
-`deny.toml` allows MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2/3-Clause, ISC,
-Unicode-3.0, Zlib. Workflow actions are pinned to commit SHAs. `permissions: contents: read`.
+The cargo gates share one job, so the devShell and the dependencies build once per run
+(CI-1). A Nix store cache (cachix or magic-nix-cache) is a later step.
+
+`deny.toml` allows MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-3-Clause and
+Unicode-3.0, the licences the current dependency tree uses. Add a licence only when a new
+dependency needs it. Workflow actions are pinned to commit SHAs.
+`permissions: contents: read`.
 
 ## 17. Licence
 
 `MIT OR Apache-2.0`. It matches nearly every dependency and the Rust ecosystem default, and it
-allows a later open-source release with no relicensing. The private repository carries both
-licence files from the first commit (open question Q7).
+allows a later open-source release with no relicensing. The repository carries both licence
+files, `LICENSE-MIT` and `LICENSE-APACHE` (open question Q7). Before a public release, see
+Q17 for the machine-specific text in this plan.
 
 ## 18. Milestones
 
@@ -769,6 +885,10 @@ licence files from the first commit (open question Q7).
 | M2 | Write protocol, `store`, `rm`, fault-injection tests, 40-writer test | T1, T2, T8-T17, T19, T20 tests pass |
 | M3 | `get` (reveal, `--stdout`), `run` (`--file`, `--env`, masking) | T3-T6 tests pass |
 | M4 | `init`, `wire`, home-manager module, completions | `init` round trip on an empty HOME; HM module evaluates in a `nix flake check` test |
+
+State on 2026-10-06: `store`, `ls`, `rm`, `get`, completions, the home-manager module and
+its check are done. `run` (M3), `doctor` (M1), `init` and `wire` (M4) are stubs that say "not
+implemented yet". Open question Q12 decides whether v0.1 ships without them.
 | M5 | Owner trial on myhost with a dedicated file; README with the limits from N1 and 8.x | Owner confirms `secrit store`, `wire`, rebuild, `/run/secrets/NAME` |
 | M6 (v0.2) | Secret Service backend, `generate`, `--binary`, optional `--clip`, optional NixOS manifest module | Separate plan |
 | M7 (v0.3) | KeePassXC backend (opt-in) | Separate plan |
@@ -789,7 +909,7 @@ Each question has the default this plan assumes and the reason.
 
 | # | Question | Assumed default | Why |
 |---|---|---|---|
-| Q1 | Which sops file does `secrit store` write by default? | A new dedicated `/etc/nixos/secrets/secrit.yaml`, set in config, not in code. | It matches the existing myhost + recovery rule (F13), so sops-nix can wire it. It avoids `secrets.yaml`, which has other writers and an uncommitted change now. It needs one `git add` (F14). |
+| Q1 | Which sops file does `secrit store` write by default? | A new dedicated `/etc/nixos/secrets/secrit.yaml`, set in config, not in code. | It matches the existing myhost + recovery rule (F13), so sops-nix can wire it. It avoids `secrets.yaml`, which has other writers and an uncommitted change now. It needs one `git add` (F14). It also needs an owner change in `/etc/nixos` (OQ-1): the typos pre-commit hook (`flake-modules/checks/pre-commit.nix`) excludes only `secrets/secrets.yaml` and `secrets/otherhost-gcp.yaml`, and a lab run of typos on a 200-value sops file exited 2. Add `secrets/secrit.yaml` to that exclude list. `init` and `wire` will print this reminder next to the `git add` line. |
 | Q2 | Should `store` also mirror to KeePassXC or the Secret Service, as `set-example-key` does? | No. v0.1 writes sops only. Mirroring comes with the v0.2 backends as an explicit `--also BACKEND` flag that reports each store's result. | One write path keeps the crash-safety story simple. A partial multi-store write needs its own design. |
 | Q3 | When the KeePassXC backend arrives, may secrit stop and restart `keepassxc.service` (it feeds the SSH agent)? | Yes, only for a KDBX write, as `set-example-key` does, and only after a printed notice. | KeePassXC overwrites CLI changes from its stale memory copy otherwise. |
 | Q4 | Clipboard support? | None in v0.1. In v0.2, `--clip` only if clipd is reconfigured or removed, or `doctor` finds no unsafe history daemon. | clipd writes history to disk and restores it after a clear. |
@@ -799,4 +919,11 @@ Each question has the default this plan assumes and the reason.
 | Q8 | Repository name and place: `~/dev/secrit`, private `w0wl0lxd/secrit` on GitHub? | Yes, as the request says. | Stated in the request. |
 | Q9 | Should a later version be allowed to write `.nix` files (a `hosts/<host>/secrit.nix`) behind a flag? | No in v0.1; `wire` prints only. Revisit for v0.2. | `/etc/nixos` changes are owner-gated, and printed snippets keep the owner in review. |
 | Q10 | Should `secrit-egress-guard.sh` learn the patterns `secrit get` and `--stdout`? | Suggested only. It is an `/etc/nixos` change for the owner. | secrit cannot edit that file. |
-| Q11 | Agents may run `secrit rm NAME --yes`. Should `rm` be refused under agent detection? | No: agents act for the owner, and `rm` keeps a ciphertext backup. | A backup makes `rm` reversible. Refusing would block the owner's own automation. |
+| Q11 | Agents may run `secrit rm NAME --yes`. Should `rm` be refused under agent detection? | No: agents act for the owner, and `rm` keeps a ciphertext backup. | A backup makes `rm` reversible. Refusing would block the owner's own automation. Q13 asks the wider question. |
+| Q12 | `run`, `init`, `doctor` and `wire` are stubs (PF-1). Does v0.1 ship with them, or without them? | Undecided; the owner decides. Until then the README "What works" table and `--help` mark them "not implemented yet", and G3, G5 and G6 stay open. | Shipping without them changes the v0.1 command set (section 4) and the milestones. Building them first delays the owner trial (M5). |
+| Q13 | Q9 calls `/etc/nixos` changes owner-gated, but 8.3 and Q11 let an agent run `store` and `rm --yes`, which rewrite `/etc/nixos/secrets/secrit.yaml` under the Q1 default (OQ-2). Which rule wins? | Undecided; the owner decides. The code lets agents write today. The two choices: (a) an agent may write the store file, and Q9 narrows to `.nix` files; (b) under agent detection, `store` and `rm` need a confirmation typed on `/dev/tty`. | (a) keeps agent automation; (b) keeps every `/etc/nixos` change in the owner's hands. A variable cannot be a gate, because an agent can set it. |
+| Q14 | May secrit have one audited `unsafe` block for `mlock` and `madvise(MADV_DONTDUMP)` on value buffers (PF-3, SEC-9, R7)? | No for v0.1. The crate keeps `unsafe_code = "forbid"`; values are small, zeroized, and core dumps are off. | rustix 1.1.5 has both calls only as `unsafe fn`. A `forbid` lint is easier to audit than one exception. |
+| Q15 | Where do backups go, and how many stay (UX-1, SEC-2)? | `$XDG_STATE_HOME/secrit/backups/<id>-<basename>/` (mode 0700), newest 10 per store. | Backups in the store directory sat one `git add` away from git history in `/etc/nixos`. A count cap bounds old values on disk. A config key for the place and the count can come later. |
+| Q16 | How does myhost consume the private flake (OQ-3)? `github:w0wl0lxd/secrit` does not exist yet, and a private `github:` input needs a token, which root fetches during `nixos-rebuild`. | `path:/home/alice/dev/secrit` for personal use, or a `git+ssh://` input once the repository exists; home-manager over `nix profile`. The README installs with `nix profile add path:.` until then. | A `path:` or `git+ssh://` input needs no GitHub token in the Nix config. |
+| Q17 | This plan holds machine-specific facts: key paths, host and recipient names, private script names, local paths, repository state (F12-F17, F22, Q1-Q4, 15.5) (FOSS-1). How do they stay out of a public release? | Before the first push to a public remote, move those facts to an uncommitted myhost note and rewrite the history, or publish a new repository from a clean first commit. | A later delete leaves the text in git history. |
+| Q18 | sops gets `HOME=/nonexistent`, so it cannot use `~/.ssh/id_ed25519` or `id_rsa`, and only age key files work (R2). Should SSH identities be supported? | No in v0.1. A later version may pass `SOPS_AGE_SSH_PRIVATE_KEY_FILE` from an explicit config key. | An implicit key in HOME is the T19 threat. A passphrase-protected key also needs a terminal, which sops cannot have in a background process group. |

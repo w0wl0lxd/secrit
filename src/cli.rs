@@ -40,6 +40,7 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[allow(clippy::doc_markdown, reason = "doc comments are clap help text")]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Store a secret read from a no-echo prompt or from stdin

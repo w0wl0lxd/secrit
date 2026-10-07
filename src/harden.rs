@@ -18,7 +18,7 @@ pub struct HardenReport {
 impl HardenReport {
     /// One message for each step that failed.
     #[must_use]
-    pub fn warnings(&self) -> Vec<&'static str> {
+    pub fn warnings(self) -> Vec<&'static str> {
         let mut w = Vec::new();
         if !self.no_core_dumps {
             w.push("could not set RLIMIT_CORE to 0; a crash could write a core dump");

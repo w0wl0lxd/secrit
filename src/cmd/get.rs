@@ -65,8 +65,8 @@ pub enum StdoutKind {
 pub fn classify_stdout(file_type: FileType, mode: u32, owner_is_me: bool) -> StdoutKind {
     match file_type {
         FileType::Fifo | FileType::Socket | FileType::CharacterDevice => StdoutKind::Stream,
-        FileType::RegularFile if owner_is_me && mode & 0o077 == 0 => StdoutKind::PrivateFile,
-        FileType::RegularFile => StdoutKind::SharedFile,
+        FileType::RegularFile if !owner_is_me || mode & 0o077 != 0 => StdoutKind::SharedFile,
+        FileType::RegularFile => StdoutKind::PrivateFile,
         _ => StdoutKind::Other,
     }
 }

@@ -132,6 +132,9 @@ mod tests {
     fn plain_values_are_unchanged() {
         let (out, escaped) = render_secret("pässwörd 123".as_bytes());
         assert!(!escaped);
-        assert!(out.as_slice() == "pässwörd 123".as_bytes());
+        assert!(
+            out.as_slice() == "pässwörd 123".as_bytes(),
+            "plain text changed"
+        );
     }
 }

@@ -57,7 +57,8 @@ fn dispatch(cli: Cli) -> Result<(), Error> {
     } = cli;
     // From here on INT, TERM, HUP and QUIT only set a flag. Every blocking
     // wait polls it and stops cleanly (PLAN 8.1, step 8).
-    signals::defer().map_err(|e| Error::Failed(format!("could not install signal handlers: {e}")))?;
+    signals::defer()
+        .map_err(|e| Error::Failed(format!("could not install signal handlers: {e}")))?;
     let ctx = || Ctx::load(config.as_deref(), store.as_deref(), quiet);
     match command {
         Command::Store {

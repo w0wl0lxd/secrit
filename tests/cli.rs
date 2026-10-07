@@ -5,7 +5,6 @@ mod common;
 
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
 use std::process::Command;
 
 use common::{TestEnv, assert_absent, code, run_cmd, stderr};
@@ -41,6 +40,11 @@ fn store_ls_rm_round_trip() {
         std::fs::metadata(&backups[0]).unwrap().mode() & 0o777,
         0o600
     );
+    // SEC-2: backups live in a private directory outside the store's tree.
+    assert!(!backups[0].starts_with(&env.store_dir));
+    let dir = backups[0].parent().unwrap();
+    assert_eq!(std::fs::metadata(dir).unwrap().mode() & 0o777, 0o700);
+    assert!(stderr(&out).contains(&dir.display().to_string()));
     assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
 }
 
@@ -185,15 +189,18 @@ fn value_never_reaches_child_argv() {
 fn sops_failure_is_redacted_and_cleaned_up() {
     let env = TestEnv::new();
     let before = env.store_bytes();
-    let fake = env.script(
+    let fake = env.fake_sops(
         "sops-fail",
-        "while IFS= read -r l || [ -n \"$l\" ]; do printf 'sops says: %s\\n' \"$l\" >&2; done\nexit 1",
+        "echo 'sops: a fixed line' >&2\nwhile IFS= read -r l || [ -n \"$l\" ]; do printf 'sops says: %s\\n' \"$l\" >&2; done\nexit 1",
     );
     env.write_config_with(&fake, "");
     let out = env.store_value("n", b"stderr-canary-5c2e");
     assert_eq!(code(&out), 1);
     assert_absent(&out, "stderr-canary-5c2e");
-    assert!(stderr(&out).contains("[REDACTED]"), "{}", stderr(&out));
+    // SEC-15: the whole line goes, and the rest is kept.
+    assert!(!stderr(&out).contains("sops says"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("sops: a fixed line"));
+    assert!(stderr(&out).contains("1 line(s) not shown"));
     assert_eq!(
         env.temp_files(),
         Vec::<std::path::PathBuf>::new(),
@@ -365,12 +372,13 @@ fn get_is_refused_for_agents_and_without_tty() {
     assert!(stderr(&out).contains("CLAUDECODE"));
     assert_absent(&out, "get-canary-77aa");
 
-    // The test runner has no controlling terminal, so this is "no tty".
-    let out = env.run(["get", "n", "--stdout"], None);
-    if !Path::new("/dev/tty").exists() || std::fs::File::open("/dev/tty").is_err() {
-        assert_eq!(code(&out), 3);
-        assert_absent(&out, "get-canary-77aa");
-    }
+    // A new session with no controlling terminal: always "no tty" (R9).
+    let mut cmd = common::no_tty(&env.cmd());
+    cmd.args(["get", "n", "--stdout"]);
+    let out = run_cmd(cmd, std::iter::empty::<&str>(), None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("there is no terminal"));
+    assert_absent(&out, "get-canary-77aa");
 }
 
 /// `get --stdout` to a pipe returns the exact bytes. `script` gives the child
@@ -381,13 +389,47 @@ fn get_stdout_to_a_pipe_returns_exact_bytes() {
     let out = env.run(["store", "n", "--raw"], Some(b"exact\nbytes\n"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let dest = env.root.path().join("out.bin");
-    let inner = format!("'{}' get n --stdout > '{}'", common::BIN, dest.display());
-    let Some(out) = env.under_script(&inner) else {
-        return;
-    };
+    let inner = format!(
+        "'{}' get n --stdout | '{}' > '{}'",
+        common::BIN,
+        common::bin("cat").display(),
+        dest.display()
+    );
+    let out = env.under_script(&inner);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(
         std::fs::read(&dest).unwrap() == b"exact\nbytes\n",
+        "get --stdout bytes differ"
+    );
+}
+
+/// SEC-3: a plain file that group or others can read is refused; a private
+/// one is accepted.
+#[test]
+fn get_stdout_refuses_a_shared_file() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"file-canary-3a1f")), 0);
+    let shared = env.root.path().join("shared.out");
+    let inner = format!(
+        "umask 022; '{}' get n --stdout > '{}'",
+        common::BIN,
+        shared.display()
+    );
+    let out = env.under_script(&inner);
+    assert_eq!(code(&out), 3, "{}", String::from_utf8_lossy(&out.stdout));
+    assert_absent(&out, "file-canary-3a1f");
+    assert_eq!(std::fs::read(&shared).unwrap(), b"");
+
+    let private = env.root.path().join("private.out");
+    let inner = format!(
+        "umask 077; '{}' get n --stdout > '{}'",
+        common::BIN,
+        private.display()
+    );
+    let out = env.under_script(&inner);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        std::fs::read(&private).unwrap() == b"file-canary-3a1f",
         "get --stdout bytes differ"
     );
 }
@@ -397,13 +439,11 @@ fn get_with_tty_refuses_stdout_and_fails_on_missing_names() {
     let env = TestEnv::new();
     assert_eq!(code(&env.store_value("n", b"tty-canary-0b1d")), 0);
     let inner = format!("'{}' get nope --stdout > /dev/null", common::BIN);
-    let Some(out) = env.under_script(&inner) else {
-        return;
-    };
+    let out = env.under_script(&inner);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     // stdout is the terminal here, so --stdout is refused (T3).
     let inner = format!("'{}' get n --stdout", common::BIN);
-    let out = env.under_script(&inner).unwrap();
+    let out = env.under_script(&inner);
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert_absent(&out, "tty-canary-0b1d");
 }
@@ -472,26 +512,32 @@ fn crash_before_rename_leaves_original_intact() {
 }
 
 /// A signal during the write cancels it cleanly: exit 130, no temp file.
+/// SIGQUIT is deferred too, so Ctrl-\ leaves no temp copy (SEC-14).
 #[cfg(feature = "test-hooks")]
 #[test]
 fn signal_during_write_cancels_cleanly() {
     let env = TestEnv::new();
     let before = env.store_bytes();
-    let mut cmd = env.cmd();
-    cmd.env("SECRIT_TEST_HOOK", "after-sops=sigint");
-    let out = run_cmd(cmd, ["store", "n"], Some(b"v"));
-    assert_eq!(code(&out), 130, "{}", stderr(&out));
-    assert_eq!(env.store_bytes(), before);
-    assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
+    for sig in ["sigint", "sigterm", "sigquit"] {
+        let mut cmd = env.cmd();
+        cmd.env("SECRIT_TEST_HOOK", format!("after-sops={sig}"));
+        let out = run_cmd(cmd, ["store", "n"], Some(b"v"));
+        assert_eq!(code(&out), 130, "{sig}: {}", stderr(&out));
+        assert_eq!(env.store_bytes(), before, "{sig}");
+        assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new(), "{sig}");
+    }
 }
 
 /// A concurrent change between snapshot and rename is detected and retried.
+/// The hook pauses secrit after its first sops run until the raw write is
+/// done, and its log shows the second pass (R9).
 #[cfg(feature = "test-hooks")]
 #[test]
 fn concurrent_raw_change_is_retried() {
     let env = TestEnv::new();
     let mut cmd = env.cmd();
-    cmd.env("SECRIT_TEST_HOOK", "after-sops=sleep-1500");
+    cmd.env("SECRIT_TEST_HOOK", "after-sops=pause")
+        .env("SECRIT_TEST_HOOK_DIR", env.hook_dir());
     cmd.args(["store", "slow"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -500,7 +546,7 @@ fn concurrent_raw_change_is_retried() {
     {
         child.stdin.take().unwrap().write_all(b"v").unwrap();
     }
-    std::thread::sleep(std::time::Duration::from_millis(700));
+    env.wait_for_hook(1);
     // A raw sops write that ignores secrit's lock, like a manual `sops set`.
     let st = env
         .sops_cmd()
@@ -515,7 +561,9 @@ fn concurrent_raw_change_is_retried() {
         })
         .unwrap();
     assert!(st.success());
+    std::fs::write(env.hook_dir().join("go"), b"").unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert_eq!(env.ls(), ["raw", "slow"]);
+    assert_eq!(env.wait_for_hook(2), ["after-sops", "after-sops"]);
 }

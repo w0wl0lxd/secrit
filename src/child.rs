@@ -178,7 +178,7 @@ fn read_capped(
 fn wait_child(pid: Pid, overflow: &AtomicBool, timeout: Duration) -> Result<(), ChildError> {
     let deadline = Instant::now() + timeout;
     loop {
-        match waitid(
+        let exited = match waitid(
             WaitId::Pid(pid),
             WaitIdOptions::EXITED
                 | WaitIdOptions::STOPPED
@@ -186,12 +186,17 @@ fn wait_child(pid: Pid, overflow: &AtomicBool, timeout: Duration) -> Result<(), 
                 | WaitIdOptions::NOWAIT,
         ) {
             Ok(Some(st)) if st.stopped() => return Err(ChildError::Stopped),
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) | Err(Errno::INTR) => {}
+            Ok(Some(_)) => true,
+            Ok(None) | Err(Errno::INTR) => false,
             Err(e) => return Err(ChildError::Io(e.into())),
-        }
+        };
+        // Checked before an exit counts: a signal that arrives in the same
+        // interval as the exit is not lost.
         if signals::pending() {
             return Err(ChildError::Interrupted);
+        }
+        if exited {
+            return Ok(());
         }
         if overflow.load(Ordering::SeqCst) {
             return Err(ChildError::Overflow);

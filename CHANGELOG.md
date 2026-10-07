@@ -65,7 +65,8 @@ All notable changes to this project are recorded here. The format follows
   default action, so TERM ends a `get --stdout` or `ls` that blocks on a stalled pipe. The
   first fix deferred them for the whole command, and only SIGKILL could stop such a write
   (REG-1). A signal that arrives with the end of piped input now exits 130 as well: poll
-  reports the ready input, not EINTR, so the wait checks the flag after every poll.
+  reports the ready input, not EINTR, so the wait checks the flag after every poll. A
+  signal that arrives as a sops, age-keygen or git child exits is no longer lost.
 - Piped input is read with `read(2)` straight into the fixed value buffer. std's stdin
   buffer kept up to 8 KiB of a value between 56 and 64 KiB, and never wiped it (REG-2).
 

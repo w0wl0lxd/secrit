@@ -4,13 +4,14 @@
 //! prints `[REDACTED]`. Every buffer that holds a value is zeroized on drop.
 
 use std::fmt;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 
 use secrecy::{ExposeSecret, SecretBox};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::name::Name;
+use crate::tty;
 
 /// The largest value secrit accepts, in bytes.
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
@@ -31,8 +32,26 @@ pub enum InputError {
     ControlChar,
     #[error("the two entries do not match; nothing was stored")]
     Mismatch,
+    #[error(
+        "a line at the terminal prompt is too long ({} bytes or more), so the terminal may have cut it; pipe the value instead",
+        tty::CANON_LINE_MAX
+    )]
+    TtyLineTooLong,
+    #[error("interrupted by a signal; nothing was stored")]
+    Interrupted,
     #[error("could not read the value: {0}")]
     Io(String),
+}
+
+impl From<tty::ReadError> for InputError {
+    fn from(e: tty::ReadError) -> Self {
+        match e {
+            tty::ReadError::Interrupted => InputError::Interrupted,
+            tty::ReadError::BufferFull => InputError::TooLarge,
+            tty::ReadError::LineTooLong => InputError::TtyLineTooLong,
+            tty::ReadError::Io(e) => e.into(),
+        }
+    }
 }
 
 impl From<io::Error> for InputError {
@@ -101,27 +120,39 @@ impl InputMode {
 }
 
 /// Read the value: a no-echo prompt on `/dev/tty` when stdin is a terminal,
-/// else stdin to EOF.
+/// else stdin to EOF. Both wait in `poll`, so a deferred signal stops them.
 pub fn read_value(name: &Name, mode: InputMode) -> Result<SecretValue, InputError> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
         read_from_tty(name, mode)
     } else {
-        read_from_reader(&mut stdin.lock(), mode)
+        let mut wait = || tty::wait_readable(io::stdin()).map_err(InputError::from);
+        read_piped(&mut stdin.lock(), mode, &mut wait)
     }
 }
 
 /// Read piped input: at most [`MAX_VALUE_BYTES`], one trailing `\n` or
 /// `\r\n` stripped unless `mode.raw`.
+#[cfg(test)]
 pub fn read_from_reader(
     reader: &mut impl Read,
     mode: InputMode,
+) -> Result<SecretValue, InputError> {
+    read_piped(reader, mode, &mut || Ok(()))
+}
+
+/// [`read_from_reader`], with `wait` called before each read.
+fn read_piped(
+    reader: &mut impl Read,
+    mode: InputMode,
+    wait: &mut dyn FnMut() -> Result<(), InputError>,
 ) -> Result<SecretValue, InputError> {
     // A fixed, pre-sized buffer: reads never reallocate, so no unzeroized
     // copy of a partial value is left in freed memory.
     let mut buf = Zeroizing::new(vec![0u8; MAX_VALUE_BYTES + 1]);
     let mut len = 0;
     loop {
+        wait()?;
         // While len <= MAX_VALUE_BYTES the slice has at least one byte, so
         // Ok(0) always means EOF.
         match reader.read(&mut buf[len..]) {
@@ -151,56 +182,82 @@ pub fn read_from_reader(
     Ok(SecretValue::new(bytes))
 }
 
+/// A no-echo prompt on `/dev/tty`. Tab and every other byte reach
+/// [`validate`] unchanged, so a control character fails instead of being
+/// dropped (SEC-5).
 fn read_from_tty(name: &Name, mode: InputMode) -> Result<SecretValue, InputError> {
+    let tty = tty::open()?;
+    let _mode = tty::ModeGuard::no_echo(&tty)?;
     if mode.allows_newline() {
-        return read_multiline_from_tty(name);
+        return read_multiline_from_tty(&tty, name);
     }
-    let first = prompt(&format!("value for {name}: "))?;
-    let second = prompt("again: ")?;
-    let same: bool = first.as_bytes().ct_eq(second.as_bytes()).into();
-    if !same {
+    tty::say(&tty, &format!("value for {name}: "))?;
+    let first = read_tty_line(&tty)?;
+    tty::say(&tty, "again: ")?;
+    let second = read_tty_line(&tty)?;
+    if !first.ct_eq(second.expose()) {
         return Err(InputError::Mismatch);
     }
     drop(second);
-    let mut first = first;
-    let bytes = std::mem::take(&mut *first).into_bytes();
-    let value = SecretValue::new(bytes);
-    validate(value.expose(), mode)?;
-    Ok(value)
+    validate(first.expose(), mode)?;
+    Ok(first)
 }
 
-fn read_multiline_from_tty(name: &Name) -> Result<SecretValue, InputError> {
-    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-    writeln!(
+/// One line from the terminal into a fixed buffer.
+fn read_tty_line(tty: &std::fs::File) -> Result<SecretValue, InputError> {
+    let mut buf = Zeroizing::new(vec![0u8; MAX_VALUE_BYTES + 1]);
+    let mut len = 0;
+    tty::read_line(tty, &mut buf, &mut len)?;
+    let mut bytes = std::mem::take(&mut *buf);
+    bytes.truncate(len);
+    // `truncate` keeps the capacity; the zeroize impl wipes all of it.
+    Ok(SecretValue::new(bytes))
+}
+
+/// Lines until one that holds only `.` (or end of input), in one no-echo
+/// session (SEC-7). Asked once: a pasted block is hard to paste twice, and
+/// the readback after `sops set` still checks what was stored.
+fn read_multiline_from_tty(tty: &std::fs::File, name: &Name) -> Result<SecretValue, InputError> {
+    tty::say(
         tty,
-        "value for {name}; end with a line that holds only '.':"
+        &format!("value for {name}; end with a line that holds only '.':\n"),
     )?;
-    drop(tty);
-    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_VALUE_BYTES + 1));
+    // One byte more than the cap, so an over-long value is detected.
+    let mut buf = Zeroizing::new(vec![0u8; MAX_VALUE_BYTES + 1]);
+    let mut len = 0;
     loop {
-        let line = Zeroizing::new(rpassword::read_password()?);
-        if line.as_str() == "." {
+        let before = len;
+        if len > 0 {
+            if len == buf.len() {
+                return Err(InputError::TooLarge);
+            }
+            buf[len] = b'\n';
+            len += 1;
+        }
+        let line_start = len;
+        let end = tty::read_line(tty, &mut buf, &mut len)?;
+        let line = &buf[line_start..len];
+        if line == b"." || (end == tty::LineEnd::Eof && line.is_empty()) {
+            len = before;
             break;
         }
-        let extra = usize::from(!buf.is_empty());
-        if buf.len() + extra + line.len() > MAX_VALUE_BYTES {
-            return Err(InputError::TooLarge);
+        if end == tty::LineEnd::Eof {
+            break;
         }
-        if extra == 1 {
-            buf.push(b'\n');
-        }
-        buf.extend_from_slice(line.as_bytes());
     }
-    let mode = InputMode {
-        multiline: true,
-        raw: false,
-    };
-    validate(&buf, mode)?;
-    Ok(SecretValue::new(std::mem::take(&mut *buf)))
-}
-
-fn prompt(text: &str) -> Result<Zeroizing<String>, InputError> {
-    Ok(Zeroizing::new(rpassword::prompt_password(text)?))
+    if len > MAX_VALUE_BYTES {
+        return Err(InputError::TooLarge);
+    }
+    validate(
+        &buf[..len],
+        InputMode {
+            multiline: true,
+            raw: false,
+        },
+    )?;
+    let mut bytes = std::mem::take(&mut *buf);
+    bytes.truncate(len);
+    Ok(SecretValue::new(bytes))
 }
 
 /// Check the content rules of PLAN section 7.2.

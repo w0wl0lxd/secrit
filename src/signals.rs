@@ -1,14 +1,20 @@
-//! Deferred INT, TERM and HUP during a write (PLAN section 8.1, step 8).
+//! Deferred INT, TERM, HUP and QUIT (PLAN section 8.1, step 8).
 //!
-//! Once [`defer`] runs, these signals only set a flag. The write protocol
-//! checks the flag before its rename and cancels cleanly. The handlers stay
-//! for the rest of the (short-lived) process.
+//! Once [`defer`] runs, these signals only set a flag. Every blocking wait in
+//! secrit (the no-echo prompt, the reveal screen, a sops child, the write
+//! protocol before its rename) polls the flag and stops cleanly: it restores
+//! the terminal, kills the sops process group, and removes the temp copy.
+//! The handlers stay for the rest of the (short-lived) process.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+
+/// The signals that [`defer`] turns into a flag. SIGQUIT is here because its
+/// default action ends the process with no cleanup (SEC-14).
+pub const DEFERRED: [i32; 4] = [SIGINT, SIGTERM, SIGHUP, SIGQUIT];
 
 static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
@@ -18,7 +24,7 @@ pub fn defer() -> std::io::Result<()> {
         return Ok(());
     }
     let flag = Arc::new(AtomicBool::new(false));
-    for sig in [SIGINT, SIGTERM, SIGHUP] {
+    for sig in DEFERRED {
         signal_hook::flag::register(sig, Arc::clone(&flag))?;
     }
     let _ = FLAG.set(flag);

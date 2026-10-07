@@ -31,6 +31,8 @@ pub enum LockError {
     },
     #[error("timed out after {secs}s waiting for lock {}", path.display())]
     Timeout { path: PathBuf, secs: u64 },
+    #[error("interrupted by a signal while waiting for the lock; nothing was written")]
+    Interrupted,
 }
 
 /// A held lock. Dropping it closes the file, which releases the `flock`.
@@ -85,6 +87,9 @@ pub fn acquire(path: &Path, timeout: Duration) -> Result<StoreLock, LockError> {
                 });
             }
             Err(Errno::WOULDBLOCK | Errno::INTR) => {
+                if crate::signals::pending() {
+                    return Err(LockError::Interrupted);
+                }
                 if Instant::now() >= deadline {
                     return Err(LockError::Timeout {
                         path: path.to_path_buf(),

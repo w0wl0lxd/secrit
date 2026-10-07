@@ -24,13 +24,15 @@ pub struct WriteReport {
 }
 
 pub trait Backend {
-    #[allow(dead_code, reason = "read by doctor and init (milestones M1 and M4)")]
+    #[expect(dead_code, reason = "read by doctor and init (milestones M1 and M4)")]
     fn kind(&self) -> BackendKind;
     /// Top-level names, sorted, as the file holds them. Must not decrypt.
     fn list(&self) -> Result<Vec<String>, BackendError>;
     /// Must not decrypt.
     fn exists(&self, name: &Name) -> Result<bool, BackendError>;
-    /// One decrypt for all names.
+    /// The string values of `names`, from one checked snapshot of the file.
+    /// The sops backend runs one `--extract` decrypt per name, so each value
+    /// lands in its own fixed buffer (SEC-8).
     fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError>;
     fn put(
         &self,
@@ -78,6 +80,31 @@ pub enum BackendError {
     NotString { name: String, kind: &'static str },
     #[error("interrupted by a signal; the original file is untouched")]
     Interrupted,
+    #[error(
+        "the store file {} does not exist; create it first (see the README, section 'Set up a store')",
+        .0.display()
+    )]
+    NoStoreFile(PathBuf),
+    #[error(
+        "neither XDG_STATE_HOME nor HOME is an absolute path; secrit needs one for the backup directory"
+    )]
+    NoBackupDir,
+    #[error(
+        "sops stopped to ask for input on the terminal (a passphrase-protected key?) and was ended. secrit v0.1 supports only an age key file without a passphrase: set age_key_file in the config"
+    )]
+    SopsPrompt,
+    #[error(
+        "sops did not finish within {} ms and was ended; the original file is untouched",
+        .0.as_millis()
+    )]
+    SopsTimeout(std::time::Duration),
+    #[error("sops printed more than secrit accepts; values are at most 64 KiB")]
+    SopsOutputTooLarge,
+    #[error(
+        "{} is sops {found}; secrit needs sops 3.11 or newer (for 'set --value-stdin' and 'unset')",
+        path.display()
+    )]
+    SopsTooOld { found: String, path: PathBuf },
 }
 
 impl BackendError {
@@ -90,7 +117,9 @@ impl BackendError {
             | BackendError::CleartextRule { .. }
             | BackendError::Lock(LockError::UnsafeDir { .. }) => Exit::Refused,
             BackendError::Lock(LockError::Timeout { .. }) | BackendError::Changed(_) => Exit::Busy,
-            BackendError::Interrupted => Exit::Interrupted,
+            BackendError::Interrupted | BackendError::Lock(LockError::Interrupted) => {
+                Exit::Interrupted
+            }
             _ => Exit::Failed,
         }
     }

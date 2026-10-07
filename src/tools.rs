@@ -75,7 +75,6 @@ pub const SOPS: Program = Program {
     baked: BAKED_SOPS,
 };
 
-#[expect(dead_code, reason = "used by init (milestone M4)")]
 pub const AGE_KEYGEN: Program = Program {
     name: "age-keygen",
     config_key: "age_keygen",

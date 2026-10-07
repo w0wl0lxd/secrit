@@ -23,13 +23,14 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, fchmod, fstat, fsync, openat, renameat, unlinkat,
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, openat, renameat,
+    renameat_with, unlinkat,
 };
 use rustix::io::Errno;
-use rustix::process::Signal;
+
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -45,10 +46,20 @@ use crate::trust::{self, TrustError};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ATTEMPTS: usize = 3;
+/// What `create_file` gives sops to encrypt.
+const EMPTY_DOC: &[u8] = b"{}\n";
+/// The cap on the sops output for a new, empty store file.
+const MAX_NEW_FILE_BYTES: usize = 1024 * 1024;
+/// The sops regex rules that leave some entries in cleartext. secrit v0.1
+/// does not evaluate them, so it does not write a file that sets one. The
+/// suffix rules are enforced by the name check instead.
+const REGEX_RULES: &[&str] = &["unencrypted_regex", "encrypted_regex"];
+/// The `.gitignore` pattern that matches every temp copy.
+pub const TEMP_IGNORE: &str = ".*.secrit-*.yaml";
 /// Backups kept for each store file; older ones are deleted.
 pub const MAX_BACKUPS: usize = 10;
 /// The oldest sops that has `set --value-stdin` and `unset` (PLAN 4.6).
-const MIN_SOPS: (u64, u64) = (3, 11);
+pub const MIN_SOPS: (u64, u64) = (3, 11);
 /// The `HOME` that sops gets. sops looks for `~/.ssh/id_ed25519` and
 /// `~/.ssh/id_rsa` as age identities, so the real HOME is never passed (R2).
 const CHILD_HOME: &str = "/nonexistent";
@@ -74,6 +85,7 @@ pub struct SopsBackend {
     child_env: Vec<(OsString, OsString)>,
     runtime_dir: Option<PathBuf>,
     backup_dir: Option<PathBuf>,
+    age_key_file: Option<PathBuf>,
     lock_timeout: Duration,
     /// Set once the sops version and the `.sops.yaml` passed their checks.
     checked: OnceLock<()>,
@@ -83,6 +95,17 @@ pub struct SopsBackend {
 enum Op<'a> {
     Put(&'a SecretValue, PutMode),
     Remove,
+}
+
+/// What `inspect` found in the store file. Holds names only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreFacts {
+    /// Top-level entries outside `sops`.
+    pub names: usize,
+    /// Top-level names that hold a leaf that is not `ENC[...]`.
+    pub plaintext: Vec<String>,
+    /// The regex rules in the file's sops metadata.
+    pub rules: Vec<&'static str>,
 }
 
 struct Snapshot {
@@ -156,6 +179,7 @@ impl SopsBackend {
             sops,
             child_env,
             runtime_dir: abs("XDG_RUNTIME_DIR"),
+            age_key_file: None,
             lock_timeout,
             checked: OnceLock::new(),
         };
@@ -165,11 +189,12 @@ impl SopsBackend {
                 .or_else(|| home.map(|h| h.join(".config")))
                 .map(|c| c.join("sops").join("age").join("keys.txt"))
         });
-        if let Some(k) = key_file {
+        if let Some(k) = &key_file {
             backend
                 .child_env
-                .push(("SOPS_AGE_KEY_FILE".into(), k.into_os_string()));
+                .push(("SOPS_AGE_KEY_FILE".into(), k.clone().into_os_string()));
         }
+        backend.age_key_file = key_file;
         Ok(backend)
     }
 
@@ -188,30 +213,31 @@ impl SopsBackend {
         if self.checked.get().is_some() {
             return Ok(());
         }
-        if let Some(p) = &self.sops_config {
-            trust::check_file(p).map_err(|e| match e {
-                TrustError::Io(source) => BackendError::Io {
-                    step: "check",
-                    path: p.clone(),
-                    source,
-                },
-                TrustError::Unsafe(reason) => BackendError::Unsafe {
-                    path: p.clone(),
-                    reason: reason.into(),
-                },
-            })?;
-        }
+        self.check_sops_config()?;
         self.check_version()?;
         let _ = self.checked.set(());
         Ok(())
     }
 
     fn check_version(&self) -> Result<(), BackendError> {
+        let found = self.sops_version();
+        match found {
+            Ok(v) if (v.0, v.1) >= MIN_SOPS => Ok(()),
+            Ok((a, b, c)) => Err(BackendError::SopsTooOld {
+                found: format!("{a}.{b}.{c}"),
+                path: self.sops.clone(),
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The version that `sops --version` reports.
+    pub fn sops_version(&self) -> Result<(u64, u64, u64), BackendError> {
         let mut cmd = Command::new(&self.sops);
         cmd.env_clear()
             .envs(self.child_env.iter().map(|(k, v)| (k, v)))
             .args(["--version", "--disable-version-check"])
-            .current_dir(&self.dir)
+            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -219,15 +245,167 @@ impl SopsBackend {
         let out = self.run_unchecked(cmd, None, 4096)?;
         let text = String::from_utf8_lossy(&out.stdout);
         match parse_sops_version(&text) {
-            Some(v) if out.status.success() && (v.0, v.1) >= MIN_SOPS => Ok(()),
-            found => Err(BackendError::SopsTooOld {
-                found: found.map_or_else(
-                    || "an unknown version".into(),
-                    |(a, b, c)| format!("{a}.{b}.{c}"),
-                ),
+            Some(v) if out.status.success() => Ok(v),
+            _ => Err(BackendError::SopsTooOld {
+                found: "an unknown version".into(),
                 path: self.sops.clone(),
             }),
         }
+    }
+
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn base(&self) -> &OsStr {
+        &self.base
+    }
+
+    pub fn sops(&self) -> &Path {
+        &self.sops
+    }
+
+    /// The `.sops.yaml` secrit passes to sops, if any.
+    pub fn sops_config(&self) -> Option<&Path> {
+        self.sops_config.as_deref()
+    }
+
+    /// The age key file sops gets as `SOPS_AGE_KEY_FILE`.
+    pub fn age_key_file(&self) -> Option<&Path> {
+        self.age_key_file.as_deref()
+    }
+
+    /// This store's backup directory.
+    pub fn backup_dir(&self) -> Option<&Path> {
+        self.backup_dir.as_deref()
+    }
+
+    /// The trust rule for the `.sops.yaml` (SEC-12).
+    pub fn check_sops_config(&self) -> Result<(), BackendError> {
+        let Some(p) = &self.sops_config else {
+            return Ok(());
+        };
+        trust::check_file(p).map(|_| ()).map_err(|e| match e {
+            TrustError::Io(source) => BackendError::Io {
+                step: "check",
+                path: p.clone(),
+                source,
+            },
+            TrustError::Unsafe(reason) => BackendError::Unsafe {
+                path: p.clone(),
+                reason: reason.into(),
+            },
+        })
+    }
+
+    /// The store directory checks of the write path (section 8.1, step 2).
+    pub fn check_store_dir(&self) -> Result<(), BackendError> {
+        let dir = self.open_dir()?;
+        self.check_dir(&dir).map(|_| ())
+    }
+
+    /// The store file under the write-path checks, without decrypting.
+    pub fn inspect(&self) -> Result<StoreFacts, BackendError> {
+        let dir = self.open_dir()?;
+        let snap = self.snapshot(&dir, true)?;
+        let doc = parse_doc(&snap.bytes, &self.file)?;
+        let rules = REGEX_RULES
+            .iter()
+            .copied()
+            .filter(|k| {
+                doc.meta
+                    .get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            })
+            .collect();
+        let plaintext = doc
+            .entries
+            .iter()
+            .filter(|(_, v)| has_plaintext(v))
+            .map(|(k, _)| k.clone())
+            .collect();
+        Ok(StoreFacts {
+            names: doc.entries.len(),
+            plaintext,
+            rules,
+        })
+    }
+
+    /// Whether a creation rule of the `.sops.yaml` covers the store file:
+    /// sops encrypts an empty document for it, and the output is dropped.
+    pub fn rule_matches(&self) -> Result<bool, BackendError> {
+        if self.sops_config.is_none() {
+            return Ok(false);
+        }
+        let out = self.run(self.encrypt_empty(), Some(EMPTY_DOC), 0)?;
+        if out.status.success() {
+            return Ok(true);
+        }
+        if String::from_utf8_lossy(&out.stderr).contains("no matching creation rules") {
+            return Ok(false);
+        }
+        Err(sops_failed("encrypt", &out, &[]))
+    }
+
+    /// Create the store file with no entries (PLAN section 4.6, step 4): sops
+    /// encrypts `{}` under the `.sops.yaml` rule, secrit writes a temp file,
+    /// fsyncs it and renames it with `RENAME_NOREPLACE`, so an existing file
+    /// is never replaced.
+    pub fn create_file(&self) -> Result<(), BackendError> {
+        let _critical = signals::Critical::enter();
+        let dir = self.open_dir()?;
+        self.check_dir(&dir)?;
+        if self.sops_config.is_none() {
+            return Err(BackendError::NoSopsConfig(self.file.clone()));
+        }
+        let out = self.run(self.encrypt_empty(), Some(EMPTY_DOC), MAX_NEW_FILE_BYTES)?;
+        if !out.status.success() {
+            return Err(sops_failed("encrypt", &out, &[]));
+        }
+        let doc = parse_doc(&out.stdout, &self.file)?;
+        if !has_recipients(&doc.meta) {
+            return Err(BackendError::Validation(
+                "the new file has no recipients".into(),
+            ));
+        }
+        let tmp = TempCopy::create(&dir, &self.dir, &self.base, &out.stdout)?;
+        let (fd, _) = read_entry(&dir, &tmp.name, &tmp.path, true)?;
+        fsync(&fd).map_err(|e| io_err("fsync the new store file", &tmp.path, e))?;
+        if signals::pending() {
+            return Err(BackendError::Interrupted);
+        }
+        renameat_with(&dir, &tmp.name, &dir, &self.base, RenameFlags::NOREPLACE).map_err(|e| {
+            match e {
+                Errno::EXIST => BackendError::Unsafe {
+                    path: self.file.clone(),
+                    reason: "it appeared while secrit created it; nothing was replaced".into(),
+                },
+                e => io_err("rename the new store file into place", &self.file, e),
+            }
+        })?;
+        tmp.disarm();
+        fsync(&dir).map_err(|e| io_err("fsync the store directory", &self.dir, e))
+    }
+
+    fn encrypt_empty(&self) -> Command {
+        let mut cmd = self.command();
+        cmd.current_dir("/")
+            .args([
+                "encrypt",
+                "--input-type",
+                "json",
+                "--output-type",
+                "yaml",
+                "--filename-override",
+            ])
+            .arg(&self.file)
+            .arg("/dev/stdin");
+        cmd
     }
 
     fn command(&self) -> Command {
@@ -410,7 +588,7 @@ impl SopsBackend {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
         };
-        for key in ["unencrypted_regex", "encrypted_regex"] {
+        for &key in REGEX_RULES {
             if rule(key).is_some() {
                 return Err(BackendError::CleartextRule {
                     path: self.file.clone(),
@@ -852,6 +1030,17 @@ fn has_recipients(meta: &Map<String, Value>) -> bool {
     })
 }
 
+/// Whether `v` holds a leaf that sops did not encrypt.
+fn has_plaintext(v: &Value) -> bool {
+    match v {
+        Value::String(s) => !s.starts_with("ENC["),
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::Null => false,
+        Value::Array(a) => a.iter().any(has_plaintext),
+        Value::Object(m) => m.values().any(has_plaintext),
+    }
+}
+
 /// The metadata that a `set` or `unset` must not change.
 fn stable_meta(meta: &Map<String, Value>) -> Map<String, Value> {
     let mut m = meta.clone();
@@ -1053,7 +1242,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// most 60 s, or until a signal) for the file `$SECRIT_TEST_HOOK_DIR/go`.
 #[cfg(feature = "test-hooks")]
 fn hook(step: &str) {
-    use rustix::process::{getpid, kill_process};
+    use rustix::process::{Signal, getpid, kill_process};
     let Ok(spec) = std::env::var("SECRIT_TEST_HOOK") else {
         return;
     };
@@ -1090,8 +1279,8 @@ fn pause(step: &str) {
     {
         let _ = writeln!(log, "{step}");
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !dir.join("go").exists() && !signals::pending() && Instant::now() < deadline {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !dir.join("go").exists() && !signals::pending() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -1,16 +1,20 @@
 //! Subcommand handlers. Status goes to stderr, data to stdout (PLAN 8.4).
 
+pub mod doctor;
 pub mod get;
+pub mod init;
 pub mod ls;
 pub mod rm;
 pub mod store;
+pub mod wire;
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use crate::backend::Backend;
 use crate::backend::sops::SopsBackend;
 use crate::config::{
-    BackendKind, Config, ConfigSource, ENV_CONFIG, StoreConfig, config_path, home,
+    BackendKind, Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home,
 };
 use crate::display::escape;
 use crate::error::Error;
@@ -21,6 +25,7 @@ use crate::tools::{self, ResolvedTool, ToolSource};
 pub struct Ctx {
     pub quiet: bool,
     pub store: StoreConfig,
+    pub nix: Option<NixConfig>,
     pub backend: Box<dyn Backend>,
 }
 
@@ -62,6 +67,7 @@ impl Ctx {
         Ok(Self {
             quiet,
             store,
+            nix: config.nix,
             backend,
         })
     }
@@ -90,6 +96,30 @@ fn warn_on_path_fallback(tool: &ResolvedTool, quiet: bool) {
     }
 }
 
+/// `s` as one shell word, for a command that secrit prints for the user to
+/// run. Control characters are escaped first, so the line cannot drive the
+/// terminal.
+#[must_use]
+pub fn shell_word(s: &str) -> String {
+    let s = escape(s);
+    // '#' starts a comment only at the start of a word.
+    let plain = !s.is_empty()
+        && !s.starts_with('#')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._+-=:@%,#".contains(c));
+    if plain {
+        s.into_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// [`shell_word`] for a path.
+#[must_use]
+pub fn shell_path(p: &Path) -> String {
+    shell_word(&p.to_string_lossy())
+}
+
 pub fn parse_name(s: &str) -> Result<Name, Error> {
     Ok(Name::parse(s)?)
 }
@@ -102,4 +132,21 @@ pub struct StoreArgs {
     pub multiline: bool,
     pub raw: bool,
     pub extra: Vec<OsString>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_words_are_quoted_when_needed() {
+        assert_eq!(shell_word("/etc/nixos"), "/etc/nixos");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        assert_eq!(shell_word(""), "''");
+        assert_eq!(shell_word("$(x)"), "'$(x)'");
+        assert_eq!(shell_word("/etc/nixos#myhost"), "/etc/nixos#myhost");
+        assert_eq!(shell_word("#x"), "'#x'");
+        assert_eq!(shell_word("a\u{1b}b"), "'a\\x1bb'");
+    }
 }

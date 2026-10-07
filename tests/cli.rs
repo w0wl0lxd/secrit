@@ -448,24 +448,20 @@ fn get_with_tty_refuses_stdout_and_fails_on_missing_names() {
     assert_absent(&out, "tty-canary-0b1d");
 }
 
-/// Commands not finished in v0.1 say so clearly, with exit 1.
+/// PF-1: v0.1 has no `run` (moved to v0.2), and no command says it is
+/// unfinished.
 #[test]
-fn unfinished_commands_say_not_implemented() {
+fn every_listed_command_exists() {
     let env = TestEnv::new();
-    for args in [
-        &["run", "--env", "V=n", "--", "true"][..],
-        &["init"],
-        &["doctor"],
-        &["wire", "n"],
-    ] {
-        let out = env.run(args, None);
-        assert_eq!(code(&out), 1, "args {args:?}");
-        assert!(
-            stderr(&out).contains("is not implemented yet"),
-            "args {args:?}: {}",
-            stderr(&out)
-        );
+    let out = env.run(["run", "--env", "V=n", "--", "true"], None);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    let help = env.run(["--help"], None);
+    let text = String::from_utf8_lossy(&help.stdout);
+    for cmd in ["store", "get", "ls", "rm", "init", "doctor", "wire"] {
+        assert!(text.contains(&format!("  {cmd} ")), "{cmd} missing: {text}");
     }
+    assert!(!text.contains("not implemented"), "{text}");
+    assert!(!text.contains("  run "), "{text}");
 }
 
 #[test]

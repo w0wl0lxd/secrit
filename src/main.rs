@@ -9,6 +9,7 @@ mod cmd;
 mod config;
 mod display;
 mod error;
+mod git;
 mod harden;
 mod lock;
 mod name;
@@ -40,7 +41,7 @@ fn main() -> ExitCode {
             eprintln!("secrit: warning: {warning}");
         }
     }
-    match dispatch(cli) {
+    match dispatch(cli, hardened) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("secrit: {e}");
@@ -49,7 +50,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: Cli) -> Result<(), Error> {
+fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
     let Cli {
         config,
         store,
@@ -91,22 +92,35 @@ fn dispatch(cli: Cli) -> Result<(), Error> {
             let name = parse_name(&name)?;
             cmd::rm::run(&ctx()?, &name, yes)
         }
-        Command::Run { .. } => Err(Error::NotImplemented {
-            command: "run",
-            milestone: "M3",
-        }),
-        Command::Init { .. } => Err(Error::NotImplemented {
-            command: "init",
-            milestone: "M4",
-        }),
-        Command::Doctor { .. } => Err(Error::NotImplemented {
-            command: "doctor",
-            milestone: "M1",
-        }),
-        Command::Wire { .. } => Err(Error::NotImplemented {
-            command: "wire",
-            milestone: "M4",
-        }),
+        Command::Init {
+            sops_file,
+            sops_config,
+            age_key,
+            write_sops_config,
+            dry_run,
+        } => cmd::init::run(
+            config.as_deref(),
+            store.as_deref(),
+            quiet,
+            &cmd::init::InitArgs {
+                sops_file,
+                sops_config,
+                age_key,
+                write_sops_config,
+                dry_run,
+            },
+        ),
+        Command::Doctor { json } => {
+            cmd::doctor::run(config.as_deref(), store.as_deref(), json, hardened)
+        }
+        Command::Wire {
+            name,
+            owner,
+            format,
+        } => {
+            let name = parse_name(&name)?;
+            cmd::wire::run(&ctx()?, &name, owner.as_deref(), format)
+        }
         Command::Completions { shell } => {
             clap_complete::generate(
                 clap_complete::Shell::from(shell),

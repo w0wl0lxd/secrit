@@ -37,7 +37,8 @@ The design rests on five decisions:
 - G1. Store a secret in one command with no value on argv: `secrit store NAME`.
 - G2. Write only through a crash-safe, lock-protected protocol. No lost updates under 40
   parallel writers.
-- G3. Hand secrets to programs without printing them: `secrit run --file VAR=NAME -- cmd`.
+- G3. Moved to v0.2 (Q12): hand secrets to programs without printing them:
+  `secrit run --file VAR=NAME -- cmd`.
 - G4. List names without decrypting anything: `secrit ls`.
 - G5. Set up a fresh machine: make an age key if none exists, make the sops file, write the
   config. Never overwrite an existing key or file.
@@ -114,8 +115,8 @@ concurrent change after 3 retries; `130` a signal cancelled the command before a
 effect. A name is checked before the config loads, so a bad name exits 3 even with no config
 (R6).
 
-Commands that are not implemented yet (`run`, `init`, `doctor`, `wire`) say so in `--help`
-and exit 1 (open question Q12).
+The v0.1 command set is `store`, `get`, `ls`, `rm`, `init`, `doctor`, `wire` and the hidden
+`completions`. `run` (4.5) moved to v0.2 (open question Q12), so v0.1 does not parse it.
 
 ### 4.1 `secrit store NAME`
 
@@ -191,7 +192,10 @@ secrit rm NAME [--yes]
    (section 8.1, step 11a).
 4. Print: `removed NAME. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked.`
 
-### 4.5 `secrit run`
+### 4.5 `secrit run` (v0.2)
+
+Moved to v0.2 (milestone M6, open question Q12). The memfd sealing and the output masking need
+their own design and tests. This section is the starting point for that design.
 
 ```text
 secrit run [--file VAR=NAME]... [--env VAR=NAME]... [--no-mask] -- CMD [ARGS...]
@@ -241,21 +245,32 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
    public recipient (the output is a public key). If the file is missing, secrit creates the
    parent directory with mode 0700 and runs `age-keygen -o PATH` (refuses an existing file,
    mode 0600; F11). secrit prints a warning: back up this key; without it the secrets are lost.
-3. **sops config.** Path: `--sops-config`, else the nearest `.sops.yaml` upward from the sops
-   file's directory (not from the current directory; F10). If one exists and a creation rule
-   matches the sops file path, accept it. If one exists and no rule matches, print a rule
-   snippet with the recipient and exit 1; secrit never edits an existing `.sops.yaml`. If none
-   exists, print the snippet; with `--write-sops-config`, create it with `O_EXCL`.
-4. **sops file.** Path: `--sops-file`, else config. If the file exists, check it parses and has
-   a `sops` block. If it is missing, create it: `sops --config <cfg> encrypt --input-type yaml
-   --output-type yaml --filename-override <path> /dev/stdin` with input `{}\n` (F9), write the
-   output to a temp file in the same directory, fsync it, and rename with `RENAME_NOREPLACE`.
-5. **Config.** If the config file is missing, write it (mode 0600, `O_EXCL`) with the resolved
-   paths. If it exists and differs, print a diff of the keys and do not change it.
-6. **Next steps.** Print the home-manager lines (section 10.3) and, for a file inside a git
-   repository, the reminder `git -C <repo> add <file>` (F14).
+3. **sops config.** Only a new sops file needs one: writes to an existing file keep its own
+   recipients (F3). Path: `--sops-config`, else config, else the nearest `.sops.yaml` upward
+   from the sops file's directory (not from the current directory; F10). If one exists, it
+   must pass the trust rule (section 5), and sops must find a creation rule for the sops file
+   (secrit asks sops to encrypt `{}` and drops the output). If no rule matches, print a rule
+   snippet with the recipient on stdout and exit 1; secrit never edits an existing
+   `.sops.yaml`. If none exists, print the snippet and exit 1; with `--write-sops-config`,
+   create it with `O_EXCL` at the root of the git repository that holds the sops file, else
+   in the sops file's directory. The snippet's `path_regex` is
+   `(^|/)<sops file path relative to the .sops.yaml directory>$`, with regex characters
+   escaped.
+4. **sops file.** Path: `--sops-file`, else config. If the file exists, run the store-file
+   checks of the write path and parse it (no decrypt). If it is missing, create its directory
+   (mode 0700) when needed, then: `sops --config <cfg> encrypt --input-type json --output-type
+   yaml --filename-override <path> /dev/stdin` with input `{}\n` (F9). secrit checks that the
+   output has recipients, writes it to a temp file in the same directory, fsyncs it, and
+   renames it with `RENAME_NOREPLACE`.
+5. **Config.** If the config file is missing, write it (mode 0600, `O_EXCL`): `default_store`,
+   and `backend` and `file` for the store, plus `sops_config` and `age_key_file` only when a
+   flag gave them. If it exists and differs, name the keys that differ and do not change it.
+6. **Next steps.** On stderr: the `.gitignore` line when the repository does not ignore temp
+   copies, `git -C <repo> add <file>` when the file is untracked (F14), the home-manager hint
+   (section 10.3), and `secrit store` then `secrit wire`.
 
-`--dry-run` prints the plan and changes nothing.
+`--dry-run` prints each step as `would: ...` and changes nothing. A signal between steps ends
+`init` with exit 130; each write step is a critical section (8.1, step 8).
 
 ### 4.7 `secrit doctor`
 
@@ -263,26 +278,34 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
 secrit doctor [--json]
 ```
 
-Read-only. One line per check with `ok`, `warn` or `fail`. Exit 1 if any check fails.
+Read-only: it creates, changes and decrypts nothing. One line per check,
+`<status>  <check>: <detail>`, with the status `ok`, `info`, `warn` or `fail`; control
+characters in paths and names are escaped. `--json` prints an array of
+`{check, status, detail}`. Exit 1 if any check fails. `doctor` works without a config (the
+config row fails with a pointer to `init`). It checks the store from `--store`, else every
+store in the config. v0.1 has no `doctor --fix`.
 
 | Check | Fail or warn when |
 |---|---|
-| sops binary | missing, not absolute, or older than 3.11 (fail); resolved through a mise shim or PATH (warn) |
-| age identity | no key file in the configured path or the sops default path (fail); mode not 0600 (fail) |
+| sops binary | missing, or a configured path fails the trust rule (fail); older than 3.11 (fail); resolved through a mise shim or PATH (warn) |
+| age-keygen | missing (warn: only `init` needs it); resolved through a mise shim or PATH (warn) |
+| age identity | no key file in the configured path or the sops default path (fail); a symlink or not a regular file, another owner, or any group or other mode bit (fail) |
 | age key exposure | `SOPS_AGE_KEY` or `SOPS_AGE_KEY_CMD` is set in secrit's environment (warn) |
-| `.sops.yaml` | none found, or no rule matches the store file (fail) |
-| store file | missing, not a regular file, a symlink, link count > 1, owned by another uid, or writable by group or others (fail) |
+| `.sops.yaml` | it fails the trust rule (fail); none found (warn: writes need none, F3, but `init` needs one to create a file); no creation rule covers the store file (warn) |
+| store file | missing, not a regular file, a symlink, link count > 1, owned by another uid, or writable by group or others; not a sops YAML file (fail) |
 | store directory | not owned by the uid, or writable by group or others and not sticky (fail) |
-| `.sops.yaml` and `sops` trust | owned by another user, or the file or its directory writable by group or others (fail) |
-| plaintext risk | `.sops.yaml` has `unencrypted_regex`, `unencrypted_suffix`, `encrypted_regex` or `encrypted_suffix` (warn); any top-level leaf outside `sops` that does not start with `ENC[` (fail) |
-| leftover temp files | `.*.secrit-*.yaml` older than 1 hour in the store directory (warn; `doctor --fix` removes them when the lock is free). A SIGKILL or a crash leaves one; SIGINT, SIGTERM, SIGHUP and SIGQUIT do not. |
-| backups | the backup directory (section 8.1, step 11a) is not mode 0700, or holds files another user owns (fail); the count and the oldest date (info) |
+| plaintext risk | the store file's sops metadata has `unencrypted_regex` or `encrypted_regex` (warn: secrit v0.1 does not write such a file); any top-level entry outside `sops` with a leaf that is not `ENC[...]` (fail; the row names the entry, never its value). The suffix rules are not a warning: sops writes `unencrypted_suffix` into every file, and the name check enforces both suffixes. |
+| leftover temp files | `.*.secrit-*.yaml` older than 1 hour in the store directory (warn); younger (info: a write may be running). A SIGKILL or a crash leaves one; SIGINT, SIGTERM, SIGHUP and SIGQUIT do not. Remove them by hand when no secrit runs. |
+| old backups | `*.secrit-bak.*` files in the store directory, left by a secrit before the SEC-2 fix (warn: one `git add` from history) |
+| backups | the backup directory (section 8.1, step 11a) is a symlink, not mode 0700 or not owned by the uid, or holds files another user owns (fail); otherwise the count and the oldest file name (ok) |
 | git ignore | the store repository does not ignore `.*.secrit-*.yaml` (warn) |
-| git | the store file is untracked in a flake repository (warn, F14) |
-| agent | agent variables set or no `/dev/tty` (info: `get` and `--no-mask` are off) |
-| core dumps | `RLIMIT_CORE` could not be set to 0 (warn) |
+| git | the store file is untracked in a flake repository (warn, F14); untracked elsewhere, no repository, or no git (info) |
+| agent | agent variables set or no `/dev/tty` (info: `get` is off) |
+| hardening | `RLIMIT_CORE` could not be set to 0, or `PR_SET_DUMPABLE` could not be cleared (warn) |
 
-`doctor` never prints secret values, key material, or hashes of values.
+`doctor` never prints secret values, key material, or hashes of values. git runs with a
+cleared environment (only `HOME`), `GIT_OPTIONAL_LOCKS=0` and `core.fsmonitor=false`, through
+the same bounded child runner as sops, and only for `check-ignore` and `ls-files`.
 
 ### 4.8 `secrit wire NAME`
 
@@ -300,9 +323,20 @@ sops.secrets."NAME" = {
 };
 ```
 
-Then print `git -C <repo> add <file>` when the file is untracked, and
-`sudo nixos-rebuild switch --flake <flake>#<host>` with `<flake>` and `<host>` from config.
-secrit does not run either command.
+`sopsFile` is `./<path>` relative to `[nix] flake` when the file is inside it, else
+relative to the nearest git repository that has a `flake.nix`; a comment says the path
+assumes the stanza sits at that root. Otherwise it is absolute, with a comment that pure
+flake evaluation needs a path inside the flake. A path that is not a valid Nix path literal
+becomes a quoted, escaped string. The owner must be a plain user name (`a-z`, `0-9`, `_`,
+`-`, at most 32 bytes); the default is `$USER`, then `$LOGNAME`.
+
+The stanza goes to stdout. On stderr, secrit then prints `git -C <repo> add <file>` when the
+file is untracked, and `sudo nixos-rebuild switch --flake <flake>#<host>` with `<flake>` and
+`<host>` from config, each shell-quoted. secrit does not run either command. A name that is
+not in the store yet gives a warning, not an error.
+
+`--format env` prints `NAME_FILE=/run/secrets/NAME` instead, with `NAME` upper-cased and
+every character outside `A-Z0-9` turned into `_`.
 
 ### 4.9 `secrit completions SHELL`
 
@@ -549,8 +583,8 @@ An agent is detected when any of these is true:
   `CLINE_ACTIVE`, `OPENCODE_CLIENT`;
 - `/dev/tty` cannot be opened.
 
-When an agent is detected: `get` is refused; `run --no-mask` is refused; `run` masks; `store`,
-`ls`, `rm --yes`, `doctor`, `wire` and `init` work. There is no override variable, because an
+When an agent is detected: `get` is refused (in v0.2, `run --no-mask` is refused and `run`
+masks); `store`, `ls`, `rm --yes`, `doctor`, `wire` and `init` work. There is no override variable, because an
 agent can set any variable (open question Q5). The list lives in one constant and the docs.
 Whether an agent may write the store file at all is open question Q13: with the Q1 default,
 `store` and `rm --yes` rewrite a file under `/etc/nixos`.
@@ -559,7 +593,7 @@ Whether an agent may write the store file at all is open question Q13: with the 
 
 - secrit prints status to stderr and data (`ls`, `doctor --json`) to stdout.
 - No value, value length, value hash or fingerprint in any message, log, error or panic.
-- `get` follows section 4.2. `run` follows section 4.5.
+- `get` follows section 4.2. `run` (v0.2) follows section 4.5.
 - Clipboard: none in v0.1. On myhost, clipd keeps clipboard history on disk with no
   sensitive-data handling, and the X11 bridge drops the sensitive hint (research report). A
   timed clear does not help. v0.2 may add `--clip` with `wl-copy --sensitive --paste-once` only
@@ -687,21 +721,23 @@ src/
   lock.rs        flock under XDG_RUNTIME_DIR
   tools.rs       binary resolution, the --version text
   trust.rs       owner and mode checks for .sops.yaml and a configured sops
-  signals.rs     deferred INT, TERM, HUP and QUIT
+  signals.rs     INT, TERM, HUP and QUIT: deferred inside critical sections only
   tty.rs         /dev/tty prompt and key reads through poll, termios guard
   display.rs     escaping of names and revealed values
   error.rs       error type and exit codes
+  child.rs       bounded child runs (process group, deadline, capped stdout, reaping)
+  git.rs         read-only git queries (check-ignore, ls-files)
   backend/mod.rs     Backend trait
-  backend/sops.rs    sops backend, write protocol, bounded child runs, sops version check
-  cmd/{mod,store,get,ls,rm}.rs
+  backend/sops.rs    sops backend, write protocol, store-file creation, sops version check
+  cmd/{mod,store,get,ls,rm,init,doctor,wire}.rs
 tests/
   common/mod.rs  TestEnv harness
-  cli.rs  safety.rs  tty.rs   integration and pty tests (std::process::Command)
+  cli.rs  safety.rs  setup.rs  tty.rs   integration and pty tests (std::process::Command)
 docs/PLAN.md  README.md  SECURITY.md  CHANGELOG.md  LICENSE-MIT  LICENSE-APACHE
 ```
 
-Planned and not yet present: `cmd/{run,init,doctor,wire}.rs` and `mask.rs` (the streaming
-redactor for `run`). `rustfmt.toml` and `clippy.toml` are not needed: the defaults and the
+Planned for v0.2 and not present: `cmd/run.rs` and `mask.rs` (the streaming redactor for
+`run`). `rustfmt.toml` and `clippy.toml` are not needed: the defaults and the
 `[lints]` table in `Cargo.toml` hold every setting.
 
 `clap` errors echo the offending argument text. `cli.rs` uses `try_parse` and, on an error,
@@ -761,8 +797,8 @@ A4 concurrent writers; A5 the stuck-process reaper and the OOM killer.
 | T1 | Value on argv, read from `/proc/<pid>/cmdline` (A1, A3) | No value argument or flag; values reach children on stdin only (7.1, 8.2) | Spawn `store` with a sops wrapper that records its own `/proc/self/cmdline`; assert the value is absent. Extra positional fails with the fixed message. |
 | T2 | clap error echoes a mistyped value (A2, A3) | Sanitised parse errors (11) | `store N --value=hunter2` and `store N hunter2`: `hunter2` absent from stdout and stderr |
 | T3 | Value in terminal scrollback (A3) | `get` uses the alternate screen; `--stdout` refused on a TTY (4.2) | PTY test under `script -q` (util-linux): outside the `ESC[?1049h`..`ESC[?1049l` span, the typescript holds no value |
-| T4 | Value in an agent transcript (A2) | Agent detection refuses `get` and `--no-mask`; `run` masks (8.3, 4.5) | `CLAUDECODE=1 secrit get N --stdout` exits 3; `run` with a child that prints the value shows `[secrit:N]` |
-| T5 | Value in a child environment (A2) | `--file` memfd preferred; `--env` documented (4.5) | `run --file V=N -- cat $V` reads the value; `/proc/<child>/environ` has only `/dev/fd/N` |
+| T4 | Value in an agent transcript (A2) | Agent detection refuses `get`; in v0.2 it refuses `--no-mask`, and `run` masks (8.3, 4.5) | `CLAUDECODE=1 secrit get N --stdout` exits 3; `run` with a child that prints the value shows `[secrit:N]` |
+| T5 | Value in a child environment (A2), v0.2 | `--file` memfd preferred; `--env` documented (4.5) | `run --file V=N -- cat $V` reads the value; `/proc/<child>/environ` has only `/dev/fd/N` |
 | T6 | Core dump or ptrace read (A2, A3) | `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, `panic=abort` (8.5) | Read `/proc/<secrit pid>/status` during a blocked prompt; `prctl` read-back in a unit test |
 | T7 | Value in swap (A3) | Small values and zeroized buffers (7.1). `mlock` and `MADV_DONTDUMP` are deferred (8.5, Q14) | Unit: buffer over 64 KiB refused |
 | T8 | Value in logs or errors (A3) | `SecretValue` has redacted `Debug`; child stderr redacted (6.1, 8.2) | Fake sops that echoes stdin to stderr and exits 1: value absent from output |
@@ -888,15 +924,16 @@ Q17 for the machine-specific text in this plan.
 | M0 | Scaffold: Cargo, flake (package, devShell, checks), CI, deny, licence, README stub, SECURITY.md | `nix flake check` and CI pass on an empty `main` |
 | M1 | Config, names, input, hardening, agent detection, sops backend read path, `ls`, `doctor` | `ls` and `doctor` pass integration tests |
 | M2 | Write protocol, `store`, `rm`, fault-injection tests, 40-writer test | T1, T2, T8-T17, T19, T20 tests pass |
-| M3 | `get` (reveal, `--stdout`), `run` (`--file`, `--env`, masking) | T3-T6 tests pass |
+| M3 | `get` (reveal, `--stdout`) | T3, T6 and the `get` part of T4 pass |
 | M4 | `init`, `wire`, home-manager module, completions | `init` round trip on an empty HOME; HM module evaluates in a `nix flake check` test |
-
-State on 2026-10-06: `store`, `ls`, `rm`, `get`, completions, the home-manager module and
-its check are done. `run` (M3), `doctor` (M1), `init` and `wire` (M4) are stubs that say "not
-implemented yet". Open question Q12 decides whether v0.1 ships without them.
 | M5 | Owner trial on myhost with a dedicated file; README with the limits from N1 and 8.x | Owner confirms `secrit store`, `wire`, rebuild, `/run/secrets/NAME` |
-| M6 (v0.2) | Secret Service backend, `generate`, `--binary`, optional `--clip`, optional NixOS manifest module | Separate plan |
+| M6 (v0.2) | `run` (`--file`, `--env`, masking; section 4.5, moved from M3 by Q12), Secret Service backend, `generate`, `--binary`, optional `--clip`, optional NixOS manifest module | Separate plan; T5 and the `run` part of T4 pass |
 | M7 (v0.3) | KeePassXC backend (opt-in) | Separate plan |
+
+State on 2026-10-06: M0 to M4 are done. `store`, `ls`, `rm`, `get`, `init`, `doctor`,
+`wire`, completions, the home-manager module and its check pass their tests (`tests/cli.rs`,
+`tests/setup.rs`, `tests/safety.rs`, `tests/tty.rs`, and the flake checks). M5 waits on the
+owner.
 
 ## 19. Settled conflicts between the research reports
 
@@ -925,7 +962,7 @@ Each question has the default this plan assumes and the reason.
 | Q9 | Should a later version be allowed to write `.nix` files (a `hosts/<host>/secrit.nix`) behind a flag? | No in v0.1; `wire` prints only. Revisit for v0.2. | `/etc/nixos` changes are owner-gated, and printed snippets keep the owner in review. |
 | Q10 | Should `secrit-egress-guard.sh` learn the patterns `secrit get` and `--stdout`? | Suggested only. It is an `/etc/nixos` change for the owner. | secrit cannot edit that file. |
 | Q11 | Agents may run `secrit rm NAME --yes`. Should `rm` be refused under agent detection? | No: agents act for the owner, and `rm` keeps a ciphertext backup. | A backup makes `rm` reversible. Refusing would block the owner's own automation. Q13 asks the wider question. |
-| Q12 | `run`, `init`, `doctor` and `wire` are stubs (PF-1). Does v0.1 ship with them, or without them? | Undecided; the owner decides. Until then the README "What works" table and `--help` mark them "not implemented yet", and G3, G5 and G6 stay open. | Shipping without them changes the v0.1 command set (section 4) and the milestones. Building them first delays the owner trial (M5). |
+| Q12 | Does v0.1 ship `run` (PF-1)? | No: `run` moves to v0.2 (M6), and v0.1 does not parse it. `init`, `doctor` and `wire` are built (G5 and G6 met); G3 moves to v0.2. The owner can still ask for `run` in v0.1. | `run` hands values to other programs through sealed memfds and masks their output; that needs its own design and tests (T4, T5). The owner trial (M5) needs `store`, `wire` and a rebuild, not `run`. Stubs that exit 1 were an open promise in `--help`. |
 | Q13 | Q9 calls `/etc/nixos` changes owner-gated, but 8.3 and Q11 let an agent run `store` and `rm --yes`, which rewrite `/etc/nixos/secrets/secrit.yaml` under the Q1 default (OQ-2). Which rule wins? | Undecided; the owner decides. The code lets agents write today. The two choices: (a) an agent may write the store file, and Q9 narrows to `.nix` files; (b) under agent detection, `store` and `rm` need a confirmation typed on `/dev/tty`. | (a) keeps agent automation; (b) keeps every `/etc/nixos` change in the owner's hands. A variable cannot be a gate, because an agent can set it. |
 | Q14 | May secrit have one audited `unsafe` block for `mlock` and `madvise(MADV_DONTDUMP)` on value buffers (PF-3, SEC-9, R7)? | No for v0.1. The crate keeps `unsafe_code = "forbid"`; values are small, zeroized, and core dumps are off. | rustix 1.1.5 has both calls only as `unsafe fn`. A `forbid` lint is easier to audit than one exception. |
 | Q15 | Where do backups go, and how many stay (UX-1, SEC-2)? | `$XDG_STATE_HOME/secrit/backups/<id>-<basename>/` (mode 0700), newest 10 per store. | Backups in the store directory sat one `git add` away from git history in `/etc/nixos`. A count cap bounds old values on disk. A config key for the place and the count can come later. |

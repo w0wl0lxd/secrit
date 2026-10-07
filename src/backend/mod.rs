@@ -98,6 +98,11 @@ pub enum BackendError {
         .0.as_millis()
     )]
     SopsTimeout(std::time::Duration),
+    #[error(
+        "no .sops.yaml for {}; sops needs a creation rule for it to create the file (pass --sops-config, or --write-sops-config to 'secrit init')",
+        .0.display()
+    )]
+    NoSopsConfig(PathBuf),
     #[error("sops printed more than secrit accepts; values are at most 64 KiB")]
     SopsOutputTooLarge,
     #[error(

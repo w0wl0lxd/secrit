@@ -42,5 +42,10 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
         ctx.store.name,
         ctx.store.file.display()
     ));
+    if ctx.store.wire_hint {
+        ctx.status(&format!(
+            "run 'secrit wire {name}' to expose it at /run/secrets/{name}"
+        ));
+    }
     Ok(())
 }

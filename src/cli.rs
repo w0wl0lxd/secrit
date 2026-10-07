@@ -82,22 +82,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// (not implemented yet) Run a command with secrets in memfd files or environment variables
-    Run {
-        /// VAR=NAME: put NAME in a sealed memfd and set VAR=/dev/fd/N
-        #[arg(long = "file", value_name = "VAR=NAME")]
-        files: Vec<String>,
-        /// VAR=NAME: set VAR to the value of NAME
-        #[arg(long = "env", value_name = "VAR=NAME")]
-        envs: Vec<String>,
-        /// Turn output masking off
-        #[arg(long)]
-        no_mask: bool,
-        /// The command and its arguments, after '--'
-        #[arg(last = true, required = true, value_name = "CMD")]
-        cmd: Vec<OsString>,
-    },
-    /// (not implemented yet) Set up a machine: age key, sops file, config (never overwrites)
+    /// Set up a machine: age key, sops file, config (never overwrites)
     Init {
         /// The sops file to create [default: the store file from the config]
         #[arg(long, value_name = "PATH")]
@@ -115,13 +100,13 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// (not implemented yet) Check the setup; read-only
+    /// Check the setup; read-only, decrypts nothing
     Doctor {
         /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
-    /// (not implemented yet) Print the sops-nix stanza for a secret; changes nothing
+    /// Print the sops-nix stanza for a secret; changes nothing
     Wire {
         /// The secret name
         name: String,
@@ -144,7 +129,7 @@ pub enum Command {
 pub enum WireFormat {
     /// A sops-nix `sops.secrets` stanza
     Nix,
-    /// Shell variable assignments
+    /// A shell assignment: `NAME_FILE=/run/secrets/NAME`
     Env,
 }
 

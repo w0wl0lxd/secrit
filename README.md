@@ -6,8 +6,8 @@ prompt or from stdin. The value never goes on the command line, never reaches th
 scrollback, and the write is crash-safe and lock-protected. The design is in
 [`docs/PLAN.md`](docs/PLAN.md).
 
-Status: v0.1 scaffold. `store`, `ls`, `rm` and `get` work. `run`, `init`, `doctor` and
-`wire` print "not implemented yet" (see [What works](#what-works)).
+Status: v0.1. Every v0.1 command works: `store`, `get`, `ls`, `rm`, `init`, `doctor` and
+`wire`. `run` moved to v0.2 (see [What works](#what-works)).
 
 ## What secrit does not protect against
 
@@ -106,9 +106,23 @@ at once with a clear message; sops cannot prompt.
 
 ## Set up a store
 
-Until `secrit init` lands, set up a store once by hand. The example uses
+`secrit init` sets up what is missing and never replaces a file that exists:
+
+```sh
+secrit init --sops-file /etc/nixos/secrets/secrit.yaml --dry-run   # print the plan only
+secrit init --sops-file /etc/nixos/secrets/secrit.yaml
+secrit doctor                                                     # check the result
+```
+
+It makes an age key if there is none (back it up: without it the secrets are lost), checks
+that a `.sops.yaml` creation rule covers the file, creates the empty sops file, writes the
+config, and prints the `.gitignore` and `git add` steps. It never edits an existing
+`.sops.yaml`: when no rule covers the file, it prints one and exits 1. With
+`--write-sops-config` it creates a `.sops.yaml` when there is none. The example uses
 `/etc/nixos/secrets/secrit.yaml`; any directory that you own and that group and others
 cannot write works.
+
+To set up the same store by hand:
 
 1. Make an age key, if you have none. `age-keygen` refuses to overwrite a file. Back the
    key up: without it the secrets are lost.
@@ -147,8 +161,10 @@ cannot write works.
    If the repository runs a spell checker such as `typos` in a pre-commit hook, exclude the
    file from it; ciphertext can fail the check.
 
-5. Store a value, then expose it through sops-nix in your NixOS config. Until
-   `secrit wire` lands, write the stanza by hand and rebuild:
+5. Store a value, then expose it through sops-nix in your NixOS config.
+   `secrit wire github-token` prints the stanza, the `git add` line when the file is
+   untracked, and the rebuild command (with `[nix]` in the config). secrit runs none of
+   them. The stanza looks like this:
 
    ```nix
    sops.secrets."github-token" = {
@@ -176,7 +192,16 @@ secrit get github-token                # shows it on the alternate screen; any k
 secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused on a terminal
 
 secrit rm github-token                 # asks on the terminal; --yes to skip
+
+secrit doctor                          # read-only checks; exit 1 when one fails
+secrit doctor --json
+secrit wire github-token               # sops-nix stanza on stdout; git and rebuild steps on stderr
+secrit wire github-token --owner svc --format env   # GITHUB_TOKEN_FILE=/run/secrets/github-token
 ```
+
+`doctor` checks the tools, the age key and its mode, the store file and directory, the
+`.sops.yaml` rule, cleartext entries, leftover temp copies and old backups, the backup
+directory, and the git state of the store file. It decrypts nothing and prints no value.
 
 `--store NAME` picks another store from the config. `-q` prints errors only.
 
@@ -228,15 +253,14 @@ not one that lands after it.
 
 ## What works
 
-| Command | v0.1 scaffold | Planned |
+| Command | v0.1 | Planned |
 |---|---|---|
 | `store`, `ls`, `rm` | Works | |
 | `get` (reveal, `--stdout`) | Works | |
+| `init`, `doctor`, `wire` | Works | |
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
-| `doctor` | Not implemented | M1 |
-| `run` (memfd, masking) | Not implemented | M3 |
-| `init`, `wire` | Not implemented | M4 |
+| `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
 
 ## Develop
 

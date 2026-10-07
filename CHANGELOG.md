@@ -16,8 +16,16 @@ All notable changes to this project are recorded here. The format follows
 - `secrit get NAME [--stdout]`: reveal on the alternate screen, or write the exact bytes to
   a pipe. Refused when an agent is detected, and `--stdout` is refused on a terminal.
 - Hidden `secrit completions bash|fish|zsh`.
-- `run`, `init`, `doctor` and `wire` parse their flags, say "not implemented yet" in
-  `--help`, and exit 1.
+- `secrit init`: makes a missing age key, checks or (with `--write-sops-config`) creates
+  the `.sops.yaml` rule, creates the empty store file with `RENAME_NOREPLACE`, and writes
+  the config with `O_EXCL`. It never replaces or edits a file that exists. `--dry-run`
+  prints the plan.
+- `secrit doctor [--json]`: read-only checks of the tools, the age key, the store file and
+  directory, the `.sops.yaml` rule, cleartext entries and regex rules, leftover temp copies,
+  old in-tree backups, the backup directory, and the git state. Exit 1 when a check fails.
+- `secrit wire NAME [--owner USER] [--format nix|env]`: prints the sops-nix stanza, and
+  on stderr the `git add` and `nixos-rebuild` commands. It runs neither.
+- `store` prints the `secrit wire NAME` hint when the store sets `wire_hint = true`.
 - Config loader with a fixed search order, `~` expansion, unknown-key errors and
   ownership and mode checks.
 - Process hardening: no core dumps, not dumpable, umask 077, a payload-free panic hook. A
@@ -99,4 +107,14 @@ from the first draft.
   `std::process::Command` instead of `assert_cmd`, `assert_fs` and `predicates`.
 - The flake builds `x86_64-linux` only, and `rust-toolchain.toml` pins 1.98.1.
 - The licence texts are in `LICENSE-MIT` and `LICENSE-APACHE`.
-- The `wire_hint` config key is accepted, but the hint prints only once `wire` lands.
+- `run` moved to v0.2 (milestone M6, open question Q12), so goal G3 moved too. v0.1 does
+  not parse `run`; the earlier stubs that exited 1 for `run`, `init`, `doctor` and `wire`
+  are gone (PF-1).
+- `doctor` has no `--fix` in v0.1. A missing `.sops.yaml`, or one with no rule for the
+  store file, is a warning, not a failure: writes keep the file's own recipients. Only the
+  regex rules (`unencrypted_regex`, `encrypted_regex`) warn; sops writes
+  `unencrypted_suffix` into every file, and the name check enforces the suffixes.
+- `init` encrypts `{}` with `--input-type json` and needs a `.sops.yaml` only for a new
+  store file. A new `.sops.yaml` goes to the git repository root, else the store directory.
+- External programs (sops, age-keygen, git) all run through one bounded child runner
+  (`src/child.rs`).

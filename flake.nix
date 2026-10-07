@@ -42,13 +42,15 @@
             SECRIT_TEST_SOPS = sopsBin;
             SECRIT_TEST_AGE_KEYGEN = ageKeygenBin;
             SECRIT_TEST_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
+            SECRIT_TEST_GIT = "${pkgs.git}/bin/git";
           };
-          # script, setsid and kill (util-linux), ssh-keygen, stty and cmp.
+          # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and git.
           testTools = [
             pkgs.util-linux
             pkgs.openssh
             pkgs.coreutils
             pkgs.diffutils
+            pkgs.git
           ];
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           secrit = craneLib.buildPackage (

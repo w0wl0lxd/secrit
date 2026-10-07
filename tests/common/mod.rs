@@ -52,6 +52,11 @@ pub struct TestEnv {
     pub ssh_keygen: PathBuf,
 }
 
+/// The git binary for the repository tests.
+pub fn git() -> PathBuf {
+    tool("SECRIT_TEST_GIT", "git")
+}
+
 /// The absolute path of a helper program for shell scripts that secrit or
 /// sops run with a cleared PATH.
 pub fn bin(name: &str) -> PathBuf {

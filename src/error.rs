@@ -44,13 +44,6 @@ pub enum Error {
     Failed(String),
     #[error("interrupted by a signal; nothing was changed")]
     Interrupted,
-    #[error(
-        "'secrit {command}' is not implemented yet (planned for milestone {milestone}; see the README, section 'What works')"
-    )]
-    NotImplemented {
-        command: &'static str,
-        milestone: &'static str,
-    },
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -73,11 +66,7 @@ impl Error {
             | Error::Config(ConfigError::Unsafe { .. })
             | Error::Tool(ToolError::Unsafe { .. }) => Exit::Refused,
             Error::Interrupted | Error::Input(InputError::Interrupted) => Exit::Interrupted,
-            Error::Failed(_)
-            | Error::NotImplemented { .. }
-            | Error::Config(_)
-            | Error::Input(_)
-            | Error::Tool(_) => Exit::Failed,
+            Error::Failed(_) | Error::Config(_) | Error::Input(_) | Error::Tool(_) => Exit::Failed,
             Error::Backend(e) => e.exit(),
         }
     }

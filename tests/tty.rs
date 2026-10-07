@@ -162,3 +162,43 @@ fn a_signal_during_reveal_restores_the_terminal() {
         "no exit from the alternate screen"
     );
 }
+
+/// REG-1: `get --stdout` blocked on a pipe that nobody reads ends at TERM.
+/// 1000 bytes in the pipe plus a 65000-byte value exceed any pipe buffer.
+/// A sops wrapper marks the end of the decrypt, so TERM lands in the write.
+#[test]
+fn term_ends_get_stdout_on_a_stalled_pipe() {
+    let env = TestEnv::new();
+    let value = vec![b'x'; 65_000];
+    let out = env.store_value("big", &value);
+    assert_eq!(code(&out), 0, "{}", common::stderr(&out));
+    let marker = env.root.path().join("decrypted");
+    let wrapper = env.script(
+        "sops-marker",
+        &format!(
+            "'{}' \"$@\"\nrc=$?\necho done >> '{}'\nexit $rc",
+            env.sops.display(),
+            marker.display()
+        ),
+    );
+    env.write_config_with(&wrapper, "");
+    let inner = format!(
+        "( printf '%01000d' 0; '{secrit}' get big --stdout & echo $! > pid; wait $!; echo $? > rc ) | '{sleep}' 60 &
+reader=$!
+i=0; while [ ! -s '{marker}' ] && [ $i -lt 600 ]; do '{sleep}' 0.05; i=$((i+1)); done
+'{sleep}' 0.5
+read p < pid
+kill -TERM $p
+i=0; while [ ! -s rc ] && [ $i -lt 200 ]; do '{sleep}' 0.05; i=$((i+1)); done
+if [ -s rc ]; then read r < rc; echo \"rc=$r\"; else echo STILL-RUNNING; kill -KILL $p; fi
+kill $reader",
+        secrit = common::BIN,
+        sleep = bin("sleep").display(),
+        marker = marker.display(),
+    );
+    let out = env.under_script(&inner);
+    let t = text(&out);
+    assert!(marker.exists(), "the decrypt never finished: {t}");
+    // 143 = 128 + SIGTERM: the default action, not the deferred exit 130.
+    assert!(t.contains("rc=143"), "{t}");
+}

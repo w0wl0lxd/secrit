@@ -399,3 +399,50 @@ fn the_binary_hardens_itself() {
     assert_eq!(code(&out), 130, "{}", stderr(&out));
     assert_eq!(env.ls(), Vec::<String>::new());
 }
+
+/// REG-1: outside a critical section a signal keeps its default action. `ls`
+/// blocked on a full pipe that nobody reads ends at TERM.
+#[test]
+fn term_ends_a_write_to_a_stalled_pipe() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"v")), 0);
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::NONBLOCK).unwrap();
+    let page = [0u8; 4096];
+    loop {
+        match writer.write(&page) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling the pipe: {e}"),
+        }
+    }
+    rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::empty()).unwrap();
+    let mut child = env
+        .cmd()
+        .arg("ls")
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // secrit is not dumpable, so /proc/<pid>/wchan reads "0". A full pipe
+    // is the only thing `ls` can still wait on after this long.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "ls did not block");
+    signal(&child, "TERM");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("TERM did not end secrit blocked on a stalled pipe");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(reader);
+    assert_eq!(status.signal(), Some(15), "{status:?}");
+}

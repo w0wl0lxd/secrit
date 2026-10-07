@@ -48,12 +48,15 @@ pub fn say(mut tty: &File, text: &str) -> io::Result<()> {
 pub struct ModeGuard<'a> {
     tty: &'a File,
     orig: Termios,
+    /// Dropped after the settings are restored.
+    _critical: signals::Critical,
 }
 
 impl<'a> ModeGuard<'a> {
     /// Line mode with no echo. The newline is still echoed (`ECHONL`), so the
     /// cursor moves on, but no typed character is shown.
     pub fn no_echo(tty: &'a File) -> io::Result<Self> {
+        let critical = signals::Critical::enter();
         let orig = tcgetattr(tty)?;
         let mut t = orig.clone();
         t.local_modes
@@ -61,16 +64,25 @@ impl<'a> ModeGuard<'a> {
         t.local_modes
             .insert(LocalModes::ICANON | LocalModes::ECHONL);
         tcsetattr(tty, OptionalActions::Now, &t)?;
-        Ok(Self { tty, orig })
+        Ok(Self {
+            tty,
+            orig,
+            _critical: critical,
+        })
     }
 
     /// Raw mode: one byte at a time, no echo, and Ctrl-C is a key press.
     pub fn raw(tty: &'a File) -> io::Result<Self> {
+        let critical = signals::Critical::enter();
         let orig = tcgetattr(tty)?;
         let mut t = orig.clone();
         t.make_raw();
         tcsetattr(tty, OptionalActions::Now, &t)?;
-        Ok(Self { tty, orig })
+        Ok(Self {
+            tty,
+            orig,
+            _critical: critical,
+        })
     }
 }
 
@@ -113,6 +125,7 @@ pub fn wait_readable(fd: impl AsFd) -> Result<(), ReadError> {
         tv_sec: 0,
         tv_nsec: POLL_NS,
     };
+    let _critical = signals::Critical::enter();
     loop {
         if signals::pending() {
             return Err(ReadError::Interrupted);

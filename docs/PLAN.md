@@ -579,9 +579,14 @@ At start, before reading any input:
    rustix 1.1.5 exposes both as `unsafe fn`, and the crate has `unsafe_code = "forbid"`.
    v0.1 relies on small values (64 KiB cap), zeroized buffers and `RLIMIT_CORE=0`.
 6. A step of 1 to 3 that fails prints one warning line (not with `-q`).
-7. SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred while secrit writes, waits for the lock,
-   reads the prompt or shows a value (section 8.1, step 0). SIGQUIT is in the set because its
-   default action would end secrit before the temp copy is removed (SEC-14).
+7. SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred only inside a critical section: the
+   write protocol from the lock wait to the rename (section 8.1, step 0), every child run,
+   every wait on the terminal or on piped stdin, a changed terminal mode, and the reveal
+   screen. SIGQUIT is in the set because its default action would end secrit before the
+   temp copy is removed (SEC-14). Outside these sections each signal keeps its default
+   action, so a write to a stalled pipe (`get --stdout`, `ls`) or a status line cannot hold
+   secrit (REG-1). No cleanup is due there: no temp copy, no child and no changed terminal
+   mode exists.
 
 Limits the docs state: a child (sops, CMD) is dumpable again after `execve`, and secrit cannot
 zeroize copies inside sops (Go).

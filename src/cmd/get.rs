@@ -22,6 +22,7 @@ use crate::display;
 use crate::error::Error;
 use crate::name::Name;
 use crate::secret::SecretValue;
+use crate::signals;
 use crate::tty::{self, ModeGuard, ReadError};
 
 const ALT_SCREEN_ON: &[u8] = b"\x1b[?1049h\x1b[2J\x1b[H";
@@ -139,6 +140,8 @@ fn reveal(name: &Name, value: &SecretValue) -> Result<(), Error> {
     let (shown_value, escaped) = display::render_secret(value.expose());
     let tty = tty::open().map_err(io)?;
     let mut w = &tty;
+    // Until the alternate screen is cleared, a signal only sets the flag.
+    let critical = signals::Critical::enter();
     w.write_all(ALT_SCREEN_ON).map_err(io)?;
     let shown = write_screen(&tty, name, &shown_value, escaped)
         .map_err(ReadError::Io)
@@ -148,6 +151,7 @@ fn reveal(name: &Name, value: &SecretValue) -> Result<(), Error> {
         });
     drop(shown_value);
     let cleared = w.write_all(ALT_SCREEN_OFF).and_then(|()| w.flush());
+    drop(critical);
     match shown {
         Ok(()) => cleared.map_err(io),
         Err(ReadError::Interrupted) => Err(Error::Interrupted),

@@ -327,6 +327,9 @@ impl SopsBackend {
             path: self.file.clone(),
             source: e,
         })?;
+        // Until the rename (or the cleanup) is done, a signal only sets the
+        // flag that the lock wait, the sops wait and the protocol poll.
+        let _critical = signals::Critical::enter();
         let _lock = lock::acquire(&lock_path, self.lock_timeout)?;
         for _ in 0..MAX_ATTEMPTS {
             if let Some(report) = self.attempt(&dir, name, op)? {
@@ -1018,6 +1021,8 @@ fn run_child(
     stdout_cap: usize,
     timeout: Duration,
 ) -> Result<ChildOutput, ChildError> {
+    // The child must be killed and reaped whatever arrives.
+    let _critical = signals::Critical::enter();
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }

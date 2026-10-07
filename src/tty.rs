@@ -133,6 +133,10 @@ pub fn wait_readable(fd: impl AsFd) -> Result<(), ReadError> {
         let mut fds = [PollFd::new(&fd, PollFlags::IN)];
         match poll(&mut fds, Some(&timeout)) {
             Ok(0) | Err(Errno::INTR) => {}
+            // poll reports a ready fd, not EINTR, when a signal and the
+            // input (or its end) arrive together; the handler has run by
+            // now, so the top of the loop sees the flag.
+            Ok(_) if signals::pending() => {}
             Ok(_) => return Ok(()),
             Err(e) => return Err(ReadError::Io(e.into())),
         }

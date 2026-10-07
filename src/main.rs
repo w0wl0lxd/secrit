@@ -1,0 +1,98 @@
+//! secrit: store secrets in a sops + age file, with no value on the command
+//! line. See `docs/PLAN.md` for the design and the threat model.
+
+mod agent;
+mod backend;
+mod cli;
+mod cmd;
+mod config;
+mod error;
+mod harden;
+mod lock;
+mod name;
+mod secret;
+mod signals;
+mod tools;
+
+use std::process::ExitCode;
+
+use clap::CommandFactory;
+
+use crate::cli::{Cli, Command};
+use crate::cmd::{Ctx, StoreArgs};
+use crate::error::Error;
+
+fn main() -> ExitCode {
+    // Before any input is read (PLAN 8.5).
+    let _ = harden::harden();
+    harden::install_panic_hook();
+
+    let cli = match cli::parse(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(outcome) => return ExitCode::from(outcome.exit_code()),
+    };
+    match dispatch(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("secrit: {e}");
+            ExitCode::from(e.exit().code())
+        }
+    }
+}
+
+fn dispatch(cli: Cli) -> Result<(), Error> {
+    let Cli {
+        config,
+        store,
+        quiet,
+        command,
+    } = cli;
+    let ctx = || Ctx::load(config.as_deref(), store.as_deref(), quiet);
+    match command {
+        Command::Store {
+            name,
+            replace,
+            multiline,
+            raw,
+            extra,
+        } => {
+            let args = StoreArgs {
+                name,
+                replace,
+                multiline,
+                raw,
+                extra,
+            };
+            cmd::store::check_argv(&args)?;
+            cmd::store::run(&ctx()?, &args)
+        }
+        Command::Get { name, stdout } => cmd::get::run(&ctx()?, &name, stdout),
+        Command::Ls { json } => cmd::ls::run(&ctx()?, json),
+        Command::Rm { name, yes } => cmd::rm::run(&ctx()?, &name, yes),
+        Command::Run { .. } => Err(Error::NotImplemented {
+            command: "run",
+            milestone: "M3",
+        }),
+        Command::Init { .. } => Err(Error::NotImplemented {
+            command: "init",
+            milestone: "M4",
+        }),
+        Command::Doctor { .. } => Err(Error::NotImplemented {
+            command: "doctor",
+            milestone: "M1",
+        }),
+        Command::Wire { .. } => Err(Error::NotImplemented {
+            command: "wire",
+            milestone: "M4",
+        }),
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut Cli::command(),
+                "secrit",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+    }
+}

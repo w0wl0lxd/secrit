@@ -915,3 +915,56 @@ fn doctor_fails_each_store_check() {
     env.write_config_with(&env.root.path().join("no-such-sops"), "");
     expect_fail(&env, "sops", "missing configured sops");
 }
+
+/// v0.2 plan S3: the sops module split moves the store rows out of the
+/// doctor command and changes no row. This pins every row of a full setup
+/// (a value, a backup, a git repository with a flake) in order. The
+/// hardening rows depend on the host, so the test drops them. The status of
+/// the agent and tool rows depends on the host and the build, so the test
+/// compares only their names.
+#[test]
+fn doctor_rows_keep_their_order() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("one", b"v1\n")), 0);
+    let out = env.run(["store", "--replace", "one"], Some(b"v2\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let repo = env.store_dir.parent().unwrap().to_path_buf();
+    git(&env, &repo, &["init", "-q"]);
+    std::fs::write(repo.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), ".*.secrit-*.yaml\n").unwrap();
+    git(&env, &repo, &["add", "secrets/main.yaml"]);
+    let out = run_cmd(with_git(&env), ["doctor", "--json"], None);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let host_dependent = ["agent", "sops", "age-keygen"];
+    let got: Vec<(String, String)> = rows(&out)
+        .into_iter()
+        .filter(|(c, _)| c != "hardening")
+        .map(|(c, s)| {
+            let s = if host_dependent.contains(&c.as_str()) {
+                "*".to_owned()
+            } else {
+                s
+            };
+            (c, s)
+        })
+        .collect();
+    let want = [
+        ("agent", "*"),
+        ("age key exposure", "ok"),
+        ("config", "ok"),
+        ("sops", "*"),
+        ("age-keygen", "*"),
+        ("sops version", "ok"),
+        ("store main: age key", "ok"),
+        ("store main: directory", "ok"),
+        ("store main: file", "ok"),
+        ("store main: plaintext", "ok"),
+        ("store main: .sops.yaml", "ok"),
+        ("store main: temp files", "ok"),
+        ("store main: backups", "ok"),
+        ("store main: git ignore", "ok"),
+        ("store main: git", "ok"),
+    ]
+    .map(|(c, s)| (c.to_owned(), s.to_owned()));
+    assert_eq!(got, want, "{}", stdout(&out));
+}

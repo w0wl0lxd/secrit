@@ -26,8 +26,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, openat, renameat,
-    renameat_with, unlinkat,
+    AtFlags, Dev, FileType, Mode, OFlags, RawMode, RenameFlags, fchmod, fstat, fsync, openat,
+    renameat, renameat_with, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -124,12 +124,13 @@ pub struct StoreFacts {
 }
 
 struct Snapshot {
-    dev: u64,
+    dev: Dev,
     ino: u64,
     size: u64,
-    /// Seconds and nanoseconds.
-    mtime: (i64, u64),
-    mode: u32,
+    /// Seconds and nanoseconds. `i128` holds the nanoseconds of every
+    /// platform (`u64` on Linux, `i64` on macOS).
+    mtime: (i64, i128),
+    mode: RawMode,
     hash: [u8; 32],
     bytes: Vec<u8>,
 }
@@ -538,7 +539,7 @@ impl SopsBackend {
             dev: st.st_dev,
             ino: st.st_ino,
             size: u64::try_from(st.st_size).unwrap_or(0),
-            mtime: (st.st_mtime, st.st_mtime_nsec),
+            mtime: (st.st_mtime, i128::from(st.st_mtime_nsec)),
             mode: st.st_mode & 0o7777,
             hash: Sha256::digest(&bytes).into(),
             bytes,

@@ -2,9 +2,9 @@
 //! secrit's own process lives here.
 
 use rustix::fs::Mode;
-use rustix::process::{
-    DumpableBehavior, Resource, Rlimit, set_dumpable_behavior, setrlimit, umask,
-};
+#[cfg(target_os = "linux")]
+use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+use rustix::process::{Resource, Rlimit, setrlimit, umask};
 
 /// What [`harden`] managed to do. `main` prints a warning for each failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,12 @@ pub fn harden() -> HardenReport {
         },
     )
     .is_ok();
+    // macOS has no `PR_SET_DUMPABLE`; the report then carries its warning
+    // (v0.2 plan 8.2).
+    #[cfg(target_os = "linux")]
     let not_dumpable = set_dumpable_behavior(DumpableBehavior::NotDumpable).is_ok();
+    #[cfg(not(target_os = "linux"))]
+    let not_dumpable = false;
     umask(Mode::from_raw_mode(0o077));
     HardenReport {
         no_core_dumps,
@@ -68,7 +73,9 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustix::process::{dumpable_behavior, getrlimit};
+    #[cfg(target_os = "linux")]
+    use rustix::process::dumpable_behavior;
+    use rustix::process::getrlimit;
 
     /// T6: the hardening calls take effect. This runs in the test process,
     /// which is fine: the settings only restrict it.
@@ -76,10 +83,13 @@ mod tests {
     fn harden_sets_limits() {
         let report = harden();
         assert!(report.no_core_dumps);
-        assert!(report.not_dumpable);
         assert_eq!(getrlimit(Resource::Core).current, Some(0));
-        assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
-        assert!(report.warnings().is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report.not_dumpable);
+            assert_eq!(dumpable_behavior().unwrap(), DumpableBehavior::NotDumpable);
+            assert!(report.warnings().is_empty());
+        }
         let failed = HardenReport {
             no_core_dumps: false,
             not_dumpable: false,

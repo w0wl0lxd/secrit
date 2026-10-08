@@ -52,6 +52,11 @@ All notable changes to this project are recorded here. The format follows
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
   store through one backend factory. The sops error variants are generic tool errors
   that print the v0.1 text for sops. The test hooks moved into one module.
+- The code type-checks for `aarch64-apple-darwin`; it is not built or run there yet. On
+  macOS, `harden` skips `PR_SET_DUMPABLE` and prints its existing warning. Linux behaviour
+  is unchanged.
+- CI: a `darwin-clippy` job runs clippy for `aarch64-apple-darwin` on Linux, to catch
+  macOS cfg errors without a Mac.
 
 ### Fixed
 

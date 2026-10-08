@@ -43,16 +43,22 @@ pub struct ChildOutput {
     pub stderr: Zeroizing<Vec<u8>>,
 }
 
-/// Why a child run did not finish on its own.
-#[derive(Debug)]
+/// Why a child run did not finish on its own. The messages hold no child
+/// output, so a caller can show them as they are (PLAN 14).
+#[derive(Debug, thiserror::Error)]
 pub enum ChildError {
+    #[error("could not run: {0}")]
     Io(io::Error),
     /// A deferred signal arrived.
+    #[error("interrupted by a signal")]
     Interrupted,
     /// The child stopped: it read the terminal from a background group.
+    #[error("stopped to read the terminal")]
     Stopped,
+    #[error("did not finish in time")]
     Timeout,
     /// stdout passed its cap.
+    #[error("printed too much")]
     Overflow,
 }
 
@@ -260,5 +266,33 @@ mod tests {
         assert_eq!(&out.stdout[..], b"abc");
         let r = run(sh("cat"), Some(b"abcd"), 3, Duration::from_secs(20));
         assert!(matches!(r, Err(ChildError::Overflow)), "{r:?}", r = r.err());
+    }
+
+    /// PLAN 14: the messages are fixed text, not the Debug form.
+    #[test]
+    fn errors_display_without_debug_text() {
+        let all = [
+            ChildError::Io(io::Error::from_raw_os_error(2)),
+            ChildError::Interrupted,
+            ChildError::Stopped,
+            ChildError::Timeout,
+            ChildError::Overflow,
+        ];
+        for e in all {
+            let text = e.to_string();
+            let debug = format!("{e:?}");
+            assert_ne!(text, debug);
+            for word in [
+                "Io(",
+                "Os {",
+                "Interrupted",
+                "Stopped",
+                "Timeout",
+                "Overflow",
+            ] {
+                assert!(!text.contains(word), "{text}");
+            }
+        }
+        assert_eq!(ChildError::Timeout.to_string(), "did not finish in time");
     }
 }

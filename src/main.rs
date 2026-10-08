@@ -111,7 +111,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             },
         ),
         Command::Doctor { json } => {
-            cmd::doctor::run(config.as_deref(), store.as_deref(), json, hardened)
+            cmd::doctor::run(config.as_deref(), store.as_deref(), json, quiet, hardened)
         }
         Command::Wire {
             name,

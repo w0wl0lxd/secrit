@@ -160,7 +160,114 @@ fn a_hung_sops_times_out() {
     cmd.env("SECRIT_TEST_CHILD_TIMEOUT_MS", "500");
     let out = common::run_cmd(cmd, ["store", "n"], Some(b"v"));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert!(stderr(&out).contains("did not finish within 500 ms"));
+    // PLAN 14: the error names the step, the name and the file.
+    assert!(
+        stderr(&out).contains(&format!(
+            "sops set for 'n' in {} did not finish within 500 ms",
+            env.store_file.display()
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
+}
+
+/// C-1 (PLAN 14): a failed sops run names the step, the name and the file.
+#[test]
+fn a_failed_sops_names_the_step_name_and_file() {
+    let env = TestEnv::new();
+    let fake = env.fake_sops(
+        "sops-fail-set",
+        &format!(
+            "if [ \"$3\" = set ]; then echo 'sops: it broke' >&2; exit 1; fi\nexec '{}' \"$@\"",
+            env.sops.display()
+        ),
+    );
+    env.write_config_with(&fake, "");
+    let before = env.store_bytes();
+    let out = env.store_value("tok", b"hunter2-value");
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!(
+            "sops set failed for 'tok' in {} (exit 1)",
+            env.store_file.display()
+        )),
+        "{err}"
+    );
+    assert!(err.contains("sops: it broke"), "{err}");
+    common::assert_absent(&out, "hunter2-value");
+    assert_eq!(env.store_bytes(), before);
+}
+
+/// Wait for `child` at most 20 s; kill it and fail when it takes longer.
+fn wait_bounded(mut child: Child) -> std::process::Output {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("secrit waited for a value it should have refused first");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// A-1 (PLAN 4.1, step 1): the file's own rules refuse a name before secrit
+/// reads the value. stdin stays open and empty, so a read would block.
+#[test]
+fn file_rules_refuse_before_the_value_is_read() {
+    for (rule, name, said) in [
+        ("unencrypted_regex: ^pub", "anything", "unencrypted_regex"),
+        ("unencrypted_suffix: _pub", "x_pub", "_pub"),
+    ] {
+        let env = TestEnv::new();
+        std::fs::write(
+            &env.sops_config,
+            format!(
+                "creation_rules:\n  - path_regex: secrets/.*\\.yaml$\n    {rule}\n    age: {}\n",
+                env.recipients.join(",")
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(&env.store_file).unwrap();
+        env.create_store(&env.store_file);
+        let before = env.store_bytes();
+        let mut child = spawn_store(&mut env.cmd(), name);
+        let held = child.stdin.take();
+        let out = wait_bounded(child);
+        drop(held);
+        assert_eq!(code(&out), 3, "{rule}: {}", stderr(&out));
+        assert!(stderr(&out).contains(said), "{rule}: {}", stderr(&out));
+        assert_eq!(env.store_bytes(), before);
+    }
+}
+
+/// A-5 (PLAN 8.1, step 4): the store directory is checked again after the
+/// lock is taken, so a chmod while secrit waited for the lock is seen.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_directory_made_shared_during_the_lock_wait_is_refused() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("a", b"v")), 0);
+    let before = env.store_bytes();
+    let mut cmd = env.cmd();
+    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause")
+        .env("SECRIT_TEST_HOOK_DIR", env.hook_dir());
+    let mut child = spawn_store(&mut cmd, "b");
+    child.stdin.take().unwrap().write_all(b"v").unwrap();
+    env.wait_for_hook(1);
+    chmod(&env.store_dir, 0o775);
+    std::fs::write(env.hook_dir().join("go"), b"").unwrap();
+    let out = child.wait_with_output().unwrap();
+    chmod(&env.store_dir, 0o755);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("writable by group or others"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(env.store_bytes(), before);
     assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
 }
 
@@ -197,15 +304,18 @@ fn lock_timeout_exits_4_and_a_signal_stops_the_wait() {
     assert_eq!(env.ls(), ["first"]);
 }
 
-/// R4 (2): exit 4 when the file changes under secrit on every attempt.
+/// R4 (2), A-4: exit 4 when the file changes under secrit on every attempt:
+/// the first try and 3 retries, so 4 `sops set` runs (PLAN 8.1, step 11).
 #[test]
 fn a_file_that_keeps_changing_exits_4() {
     let env = TestEnv::new();
     let real = env.sops.display().to_string();
+    let count = env.root.path().join("set-count");
     let fake = env.fake_sops(
         "sops-meddle",
         &format!(
-            "if [ \"$3\" = set ]; then printf '\"%s\"' $$ | '{real}' --config '{cfg}' set --value-stdin '{store}' '[\"raw\"]'; fi\nexec '{real}' \"$@\"",
+            "if [ \"$3\" = set ]; then echo x >> '{count}'; printf '\"%s\"' $$ | '{real}' --config '{cfg}' set --value-stdin '{store}' '[\"raw\"]'; fi\nexec '{real}' \"$@\"",
+            count = count.display(),
             cfg = env.sops_config.display(),
             store = env.store_file.display(),
         ),
@@ -214,6 +324,8 @@ fn a_file_that_keeps_changing_exits_4() {
     let out = env.store_value("n", b"v");
     assert_eq!(code(&out), 4, "{}", stderr(&out));
     assert!(stderr(&out).contains("changed while secrit was writing it"));
+    assert!(stderr(&out).contains("on 3 retries"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 4);
     assert_eq!(env.ls(), ["raw"]);
     assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
 }
@@ -283,6 +395,24 @@ fn config_source_is_shown_and_tools_are_checked() {
     )));
     let out = env.run(["ls", "-q"], None);
     assert!(!stderr(&out).contains("using config"));
+
+    // B-2: init and doctor name the file too, and -q hides it.
+    let line = format!(
+        "secrit: using config {} from SECRIT_CONFIG\n",
+        env.config_file.display()
+    );
+    for args in [&["init", "--dry-run"][..], &["doctor"][..]] {
+        let out = env.run(args, None);
+        assert_eq!(code(&out), 0, "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).starts_with(&line),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        let quiet = env.run(args.iter().chain(&["-q"]), None);
+        assert_eq!(code(&quiet), 0, "{args:?}: {}", stderr(&quiet));
+        assert!(!stderr(&quiet).contains("using config"), "{args:?}");
+    }
 
     let shared = env.fake_sops("sops-shared", "exit 1");
     chmod(&shared, 0o777);

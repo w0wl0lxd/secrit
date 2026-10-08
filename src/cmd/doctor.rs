@@ -69,10 +69,11 @@ pub fn run(
     config_flag: Option<&Path>,
     store_flag: Option<&str>,
     json: bool,
+    quiet: bool,
     hardened: HardenReport,
 ) -> Result<(), Error> {
     let env = |k: &str| std::env::var_os(k);
-    let report = collect(config_flag, store_flag, hardened, &env);
+    let report = collect(config_flag, store_flag, quiet, hardened, &env);
     // A signal during a sops or git child made that row a false failure.
     super::interrupted()?;
     let mut out = std::io::stdout().lock();
@@ -101,6 +102,7 @@ pub fn run(
 fn collect(
     config_flag: Option<&Path>,
     store_flag: Option<&str>,
+    quiet: bool,
     hardened: HardenReport,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Report {
@@ -110,6 +112,7 @@ fn collect(
         match config_path(config_flag, env)
             .map_err(Error::from)
             .and_then(|(path, source)| {
+                super::note_config_source(&path, source, quiet);
                 let config = Config::load(&path, &home(env)?)?;
                 Ok((config, source))
             }) {
@@ -579,12 +582,8 @@ fn git_checks(
             return;
         }
     };
-    let sample = backend.dir().join(format!(
-        ".{}.secrit-0000000000000000.yaml",
-        backend.base().to_string_lossy()
-    ));
     let root = repo.root.display();
-    match repo.is_ignored(&sample) {
+    match repo.is_ignored(&super::temp_sample(backend.file())) {
         Ok(true) => r.add(
             format!("store {store}: git ignore"),
             Status::Ok,
@@ -669,6 +668,55 @@ mod tests {
         let (s, detail) = age_key(Some(&empty));
         assert_eq!(s, Status::Fail);
         assert!(detail.contains("is empty"), "{detail}");
+    }
+
+    /// T18: a tool found on PATH, or a mise shim, is a warning; a configured
+    /// path is not. The Nix check bakes the sops path into the binary, so
+    /// only a unit test with no baked path reaches the PATH branch.
+    #[test]
+    fn tool_rows_warn_on_path_fallback_and_shims() {
+        let d = tempfile::tempdir().unwrap();
+        let tool = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            let p = dir.join("secrit-fake-tool");
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let program = tools::Program {
+            name: "secrit-fake-tool",
+            config_key: "sops",
+            baked: None,
+        };
+        let row = |setting: &crate::config::ToolSetting, path_dir: &Path| {
+            let mut r = Report::default();
+            let path_env = path_dir.as_os_str().to_owned();
+            let env = move |k: &str| (k == "PATH").then(|| path_env.clone());
+            assert!(tool_check(&mut r, program, setting, &env, true).is_some());
+            assert_eq!(r.0.len(), 1, "{:?}", r.0);
+            r.0.remove(0)
+        };
+        let auto = crate::config::ToolSetting::Auto;
+
+        let bin = d.path().join("bin");
+        tool(&bin);
+        let r = row(&auto, &bin);
+        assert_eq!(r.check, "secrit-fake-tool");
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("from PATH"), "{}", r.detail);
+
+        let shims = d.path().join("mise").join("shims");
+        tool(&shims);
+        let r = row(&auto, &shims);
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("is a mise shim"), "{}", r.detail);
+
+        let pinned = d.path().join("pinned");
+        std::fs::create_dir_all(&pinned).unwrap();
+        std::fs::set_permissions(&pinned, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let configured = crate::config::ToolSetting::Path(tool(&pinned));
+        let r = row(&configured, &bin);
+        assert_eq!(r.status, Status::Ok, "{}", r.detail);
     }
 
     /// The chmod hint is one shell word, as in init.

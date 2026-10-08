@@ -22,7 +22,15 @@
         pkgs:
         let
           craneLib = crane.mkLib pkgs;
-          src = craneLib.cleanCargoSource ./.;
+          # The cargo sources plus README.md, which a unit test reads to keep
+          # the agent variable list in sync (PLAN 8.3).
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./README.md
+            ];
+          };
           sopsBin = "${pkgs.sops}/bin/sops";
           ageKeygenBin = "${pkgs.age}/bin/age-keygen";
           commonArgs = {

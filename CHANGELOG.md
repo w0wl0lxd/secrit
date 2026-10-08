@@ -44,6 +44,11 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- Internal: the output masker for the coming `secrit run` (v0.2). No command uses it yet.
+  It replaces a value and its base64 (both alphabets, three byte offsets, with and without
+  padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
+  possible start of a match, so a prompt with no newline goes out at once. A value shorter
+  than 4 bytes is not masked, with a warning.
 
 ### Changed
 

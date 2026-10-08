@@ -12,6 +12,13 @@ mod error;
 mod git;
 mod harden;
 mod lock;
+// `run` (v0.2 plan S13) is the first reader; that slice removes the
+// `expect`. Under `cfg(test)` the unit tests read every item.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read by `run` from v0.2 plan S13")
+)]
+mod mask;
 mod name;
 mod secret;
 mod signals;

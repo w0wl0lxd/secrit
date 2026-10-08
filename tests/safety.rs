@@ -243,6 +243,67 @@ fn file_rules_refuse_before_the_value_is_read() {
     }
 }
 
+/// A sops file at `path` with the JSON `content`, written by the real sops
+/// in the `output` format. The `.sops.yaml` rule must cover `path`.
+fn sops_file(env: &TestEnv, path: &Path, output: &str, content: &[u8]) {
+    let mut child = env
+        .sops_cmd()
+        .args(["encrypt", "--input-type", "json", "--output-type", output])
+        .arg("--filename-override")
+        .arg(path)
+        .arg("/dev/stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(content).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "sops encrypt failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(path, &out.stdout).unwrap();
+    chmod(path, 0o600);
+}
+
+/// v0.2 V14: v0.1 writes YAML only, so `store` and `rm` on a store that is
+/// not YAML (by its content or by its name) exit 3 and leave the file
+/// byte-identical. `ls` still reads it.
+#[test]
+fn a_store_that_is_not_yaml_is_refused_and_unchanged() {
+    for (file, output, said) in [
+        ("main.json", "json", "a .json file"),
+        ("main.yaml", "json", "a sops JSON file"),
+        ("main.json", "yaml", "a .json file"),
+    ] {
+        let mut env = TestEnv::new();
+        std::fs::write(
+            &env.sops_config,
+            format!(
+                "creation_rules:\n  - path_regex: secrets/main\\.(yaml|json)$\n    age: {}\n",
+                env.recipients.join(",")
+            ),
+        )
+        .unwrap();
+        env.store_file = env.store_dir.join(file);
+        sops_file(&env, &env.store_file, output, br#"{"old": "v"}"#);
+        env.write_config("");
+        let before = env.store_bytes();
+        let case = format!("{file} as {output}");
+
+        let out = env.store_value("new", b"v");
+        assert_eq!(code(&out), 3, "{case}: {}", stderr(&out));
+        assert!(stderr(&out).contains(said), "{case}: {}", stderr(&out));
+        let out = env.run(["rm", "--yes", "old"], None);
+        assert_eq!(code(&out), 3, "{case}: {}", stderr(&out));
+        assert_eq!(env.store_bytes(), before, "{case}");
+        assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
+        assert_eq!(env.ls(), ["old"], "{case}");
+    }
+}
+
 /// A-5 (PLAN 8.1, step 4): the store directory is checked again after the
 /// lock is taken, so a chmod while secrit waited for the lock is seen.
 #[cfg(feature = "test-hooks")]

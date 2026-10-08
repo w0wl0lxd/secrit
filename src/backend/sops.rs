@@ -31,6 +31,7 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -326,6 +327,7 @@ impl SopsBackend {
     pub fn inspect(&self) -> Result<StoreFacts, BackendError> {
         let dir = self.open_dir()?;
         let snap = self.snapshot(&dir, true)?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         let doc = parse_doc(&snap.bytes, &self.file)?;
         let rules = REGEX_RULES
             .iter()
@@ -395,6 +397,7 @@ impl SopsBackend {
         let _critical = signals::Critical::enter();
         let dir = self.open_dir()?;
         self.check_dir(&dir)?;
+        refuse_non_yaml_name(&self.file)?;
         if self.sops_config.is_none() {
             return Err(BackendError::NoSopsConfig(self.file.clone()));
         }
@@ -565,6 +568,7 @@ impl SopsBackend {
         // changed owner or mode while secrit waited for the lock (step 4).
         self.check_dir(dir)?;
         let snap = self.snapshot(dir, true)?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         let doc = parse_doc(&snap.bytes, &self.file)?;
         let existed = doc.entries.contains_key(name.as_str());
         match op {
@@ -895,7 +899,8 @@ impl Backend for SopsBackend {
     }
 
     fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
-        let (_, doc) = self.read_doc()?;
+        let (snap, doc) = self.read_doc()?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         if mode == PutMode::CreateOnly && doc.entries.contains_key(name.as_str()) {
             return Err(self.exists_error(name));
         }
@@ -904,7 +909,8 @@ impl Backend for SopsBackend {
     }
 
     fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
-        let (_, doc) = self.read_doc()?;
+        let (snap, doc) = self.read_doc()?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         if !doc.entries.contains_key(name.as_str()) {
             return Err(self.missing_error(name));
         }
@@ -1121,6 +1127,48 @@ fn read_entry(
         return Err(unsafe_("larger than 16 MiB"));
     }
     Ok((OwnedFd::from(f), bytes))
+}
+
+/// The file name endings that sops reads as another format than YAML.
+const NON_YAML_ENDINGS: [&str; 3] = [".json", ".env", ".ini"];
+
+/// v0.1 runs `sops set` and `unset` with `--output-type yaml`, so a write
+/// turns a JSON store into YAML, which a consumer that reads it as JSON
+/// cannot parse (v0.2 plan, V14). The write path refuses such a file before
+/// it reads a value. A YAML file in flow style also parses as JSON; sops
+/// never writes one.
+fn refuse_non_yaml(bytes: &[u8], path: &Path) -> Result<(), BackendError> {
+    refuse_non_yaml_name(path)?;
+    let object = bytes.trim_ascii_start().first() == Some(&b'{')
+        && serde_json::from_slice::<IgnoredAny>(bytes).is_ok();
+    if object {
+        return Err(BackendError::Unsafe {
+            path: path.to_path_buf(),
+            reason: "it is a sops JSON file; secrit v0.1 writes YAML stores only, \
+                     and a write would rewrite it as YAML"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// sops picks the format from the file name, so a YAML store file must not
+/// have a name that sops reads as JSON, dotenv or INI.
+fn refuse_non_yaml_name(path: &Path) -> Result<(), BackendError> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match NON_YAML_ENDINGS.iter().find(|e| file_name.ends_with(*e)) {
+        Some(ending) => Err(BackendError::Unsafe {
+            path: path.to_path_buf(),
+            reason: format!(
+                "sops does not read a {ending} file as YAML; \
+                 secrit v0.1 writes YAML stores only"
+            ),
+        }),
+        None => Ok(()),
+    }
 }
 
 fn parse_doc(bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
@@ -1589,6 +1637,27 @@ mod tests {
         assert!(parse_doc(b"- a\n", Path::new("/t")).is_err());
         assert!(parse_doc(b"sops:\n  age: []\n", Path::new("/t")).is_err());
         assert_eq!(doc(BASE).entries.len(), 1);
+    }
+
+    #[test]
+    fn a_store_that_is_not_yaml_is_refused() {
+        let yaml = Path::new("/s/main.yaml");
+        assert!(refuse_non_yaml(BASE.as_bytes(), yaml).is_ok());
+        let json = br#"{"a": "ENC[x]", "sops": {"mac": "ENC[m]"}}"#;
+        for bytes in [&json[..], b"\n  {}\n"] {
+            let e = refuse_non_yaml(bytes, yaml).unwrap_err();
+            assert!(e.to_string().contains("sops JSON file"), "{e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        // Flow-style YAML that is not JSON stays allowed.
+        assert!(refuse_non_yaml(b"{a: b}\n", yaml).is_ok());
+        for name in ["main.json", "MAIN.JSON", ".env", "a.env", "a.ini"] {
+            let path = Path::new("/s").join(name);
+            let e = refuse_non_yaml(BASE.as_bytes(), &path).unwrap_err();
+            assert!(e.to_string().contains("YAML stores only"), "{name}: {e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        assert!(refuse_non_yaml_name(Path::new("/s/a.env.yaml")).is_ok());
     }
 
     #[test]

@@ -67,6 +67,10 @@ All notable changes to this project are recorded here. The format follows
   table. It printed a `default_store` line too, which broke the config when appended.
 - `init` and `doctor` announce a config picked by `SECRIT_CONFIG` on stderr, like the
   other commands; `-q` hides the line.
+- `store` and `rm` refuse a store file that is sops JSON, or whose name ends in `.json`,
+  `.env` or `.ini`, with exit 3, and leave it unchanged. Before, a write turned a JSON
+  store into YAML, which a reader that expects JSON cannot parse. `init` refuses such a
+  file too, and `doctor` shows it as a failed `file` row; `ls` and `get` still read it.
 
 ### Security
 

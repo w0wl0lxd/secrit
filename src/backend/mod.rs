@@ -1,0 +1,131 @@
+//! The backend trait (PLAN section 6.1).
+
+pub mod sops;
+
+use std::path::PathBuf;
+
+use crate::config::BackendKind;
+use crate::error::Exit;
+use crate::lock::LockError;
+use crate::name::{Name, NameError};
+use crate::secret::SecretValue;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutMode {
+    CreateOnly,
+    Replace,
+}
+
+/// What a write did besides the write itself.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WriteReport {
+    /// The ciphertext backup of the old file, when one was made.
+    pub backup: Option<PathBuf>,
+}
+
+pub trait Backend {
+    #[expect(dead_code, reason = "read by doctor and init (milestones M1 and M4)")]
+    fn kind(&self) -> BackendKind;
+    /// Top-level names, sorted, as the file holds them. Must not decrypt.
+    fn list(&self) -> Result<Vec<String>, BackendError>;
+    /// Must not decrypt.
+    fn exists(&self, name: &Name) -> Result<bool, BackendError>;
+    /// The string values of `names`, from one checked snapshot of the file.
+    /// The sops backend runs one `--extract` decrypt per name, so each value
+    /// lands in its own fixed buffer (SEC-8).
+    fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError>;
+    fn put(
+        &self,
+        name: &Name,
+        value: &SecretValue,
+        mode: PutMode,
+    ) -> Result<WriteReport, BackendError>;
+    fn remove(&self, name: &Name) -> Result<WriteReport, BackendError>;
+}
+
+/// Backend errors. No variant holds a value; child stderr is redacted first.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    #[error("'{0}' already exists; use --replace to overwrite it (a ciphertext backup is kept)")]
+    Exists(Name),
+    #[error("'{0}' does not exist")]
+    Missing(Name),
+    #[error("refusing {}: {reason}", path.display())]
+    Unsafe { path: PathBuf, reason: String },
+    #[error(transparent)]
+    Name(#[from] NameError),
+    #[error("refusing to write {}: {reason}", path.display())]
+    CleartextRule { path: PathBuf, reason: String },
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    #[error("{} changed while secrit was writing it, 3 times; nothing was written", .0.display())]
+    Changed(PathBuf),
+    #[error("{step} {}: {source}", path.display())]
+    Io {
+        step: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not parse {} as a sops YAML file: {what}", path.display())]
+    Parse { path: PathBuf, what: String },
+    #[error("sops {step} failed ({status}){stderr}")]
+    Sops {
+        step: &'static str,
+        status: String,
+        stderr: String,
+    },
+    #[error("check of the new file failed, the original is untouched: {0}")]
+    Validation(String),
+    #[error("'{name}' holds a {kind}, not a string; secrit handles string values only")]
+    NotString { name: String, kind: &'static str },
+    #[error("interrupted by a signal; the original file is untouched")]
+    Interrupted,
+    #[error(
+        "the store file {} does not exist; create it first (see the README, section 'Set up a store')",
+        .0.display()
+    )]
+    NoStoreFile(PathBuf),
+    #[error(
+        "neither XDG_STATE_HOME nor HOME is an absolute path; secrit needs one for the backup directory"
+    )]
+    NoBackupDir,
+    #[error(
+        "sops stopped to ask for input on the terminal (a passphrase-protected key?) and was ended. secrit v0.1 supports only an age key file without a passphrase: set age_key_file in the config"
+    )]
+    SopsPrompt,
+    #[error(
+        "sops did not finish within {} ms and was ended; the original file is untouched",
+        .0.as_millis()
+    )]
+    SopsTimeout(std::time::Duration),
+    #[error(
+        "no .sops.yaml for {}; sops needs a creation rule for it to create the file (pass --sops-config, or --write-sops-config to 'secrit init')",
+        .0.display()
+    )]
+    NoSopsConfig(PathBuf),
+    #[error("sops printed more than secrit accepts; values are at most 64 KiB")]
+    SopsOutputTooLarge,
+    #[error(
+        "{} is sops {found}; secrit needs sops 3.11 or newer (for 'set --value-stdin' and 'unset')",
+        path.display()
+    )]
+    SopsTooOld { found: String, path: PathBuf },
+}
+
+impl BackendError {
+    #[must_use]
+    pub fn exit(&self) -> Exit {
+        match self {
+            BackendError::Exists(_)
+            | BackendError::Unsafe { .. }
+            | BackendError::Name(_)
+            | BackendError::CleartextRule { .. }
+            | BackendError::Lock(LockError::UnsafeDir { .. }) => Exit::Refused,
+            BackendError::Lock(LockError::Timeout { .. }) | BackendError::Changed(_) => Exit::Busy,
+            BackendError::Interrupted | BackendError::Lock(LockError::Interrupted) => {
+                Exit::Interrupted
+            }
+            _ => Exit::Failed,
+        }
+    }
+}

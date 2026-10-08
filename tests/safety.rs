@@ -520,10 +520,16 @@ fn the_binary_hardens_itself() {
     assert_eq!(words[4..6], ["0", "0"], "{core}");
     // A process that is not dumpable has its /proc files owned by root. In a
     // user namespace (the Nix sandbox) root shows as the overflow uid, so the
-    // test checks only that the owner is not this user.
+    // test checks only that the owner is not this user. Run as root (a
+    // container CI job, act), the owner is root either way, so the check
+    // cannot tell and is skipped.
     let me = std::fs::metadata("/proc/self").unwrap().uid();
     let environ = std::fs::metadata(format!("{proc_dir}/environ")).unwrap();
-    assert_ne!(environ.uid(), me, "a dumpable process owns its environ");
+    if me == 0 {
+        eprintln!("running as root: the not-dumpable check cannot tell, skipped");
+    } else {
+        assert_ne!(environ.uid(), me, "a dumpable process owns its environ");
+    }
     signal(&child, "TERM");
     let out = child.wait_with_output().unwrap();
     assert_eq!(code(&out), 130, "{}", stderr(&out));

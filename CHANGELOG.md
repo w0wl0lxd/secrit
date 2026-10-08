@@ -45,6 +45,14 @@ All notable changes to this project are recorded here. The format follows
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
 
+### Changed
+
+- Internal refactor for v0.2 backends, with no change to the config format, the messages
+  or the exit codes. A `[stores.NAME]` table now parses to one settings type per
+  `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
+  store through one backend factory. The sops error variants are generic tool errors
+  that print the v0.1 text for sops. The test hooks moved into one module.
+
 ### Fixed
 
 - `store` checks the store file's own cleartext rules (`unencrypted_suffix`,

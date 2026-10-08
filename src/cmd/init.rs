@@ -14,10 +14,11 @@ use serde::Serialize;
 
 use super::{interrupted, shell_path};
 use crate::backend::BackendError;
-use crate::backend::sops::{MIN_SOPS, SopsBackend};
+use crate::backend::sops::{MIN_SOPS, NEED_SOPS, SopsBackend};
 use crate::child;
 use crate::config::{
-    BackendKind, Config, ConfigError, StoreConfig, ToolSetting, ToolsConfig, config_path, home,
+    BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
+    config_path, home,
 };
 use crate::display::escape;
 use crate::error::{Error, Exit};
@@ -96,6 +97,7 @@ fn steps(
         Err(e) => return Err(e.into()),
     };
     let store = store_config(args, store_flag, existing.as_ref())?;
+    let sops_store = sops_of(&store);
     let tools_config = existing.as_ref().map_or(
         ToolsConfig {
             sops: ToolSetting::Auto,
@@ -115,12 +117,14 @@ fn steps(
         &tools_config.age_keygen,
         path_env.as_deref(),
     )?;
-    let backend = SopsBackend::new(&store, sops.path.clone(), lock_timeout, &env)?;
+    let backend = SopsBackend::new(sops_store, sops.path.clone(), lock_timeout, &env)?;
     let (a, b, c) = backend.sops_version()?;
     if (a, b) < MIN_SOPS {
-        return Err(BackendError::SopsTooOld {
+        return Err(BackendError::ToolTooOld {
+            tool: "sops",
             found: format!("{a}.{b}.{c}"),
             path: sops.path,
+            need: NEED_SOPS,
         }
         .into());
     }
@@ -140,15 +144,23 @@ fn steps(
     interrupted()?;
 
     // 3 and 4. The store file, and the .sops.yaml it needs when it is new.
-    if store.file.exists() {
+    if sops_store.file.exists() {
         let facts = backend.inspect()?;
         out.note(&format!(
             "store file {} exists ({} names); unchanged",
-            escape(&store.file.to_string_lossy()),
+            escape(&sops_store.file.to_string_lossy()),
             facts.names
         ));
     } else {
-        let backend = sops_config(backend, &store, &env, args, &recipients, lock_timeout, &out)?;
+        let backend = sops_config(
+            backend,
+            sops_store,
+            &env,
+            args,
+            &recipients,
+            lock_timeout,
+            &out,
+        )?;
         interrupted()?;
         new_store_file(&backend, &out)?;
     }
@@ -159,8 +171,14 @@ fn steps(
     interrupted()?;
 
     // 6. Next steps.
-    next_steps(&store.file, &env, &out)?;
+    next_steps(&sops_store.file, &env, &out)?;
     interrupted()
+}
+
+/// The sops settings of a store. sops is the only backend that init sets up.
+fn sops_of(store: &StoreConfig) -> &SopsStore {
+    let BackendConfig::Sops(sops) = &store.backend;
+    sops
 }
 
 /// The store that this run sets up: the flags, else the config.
@@ -174,10 +192,11 @@ fn store_config(
         .unwrap_or(DEFAULT_STORE)
         .to_owned();
     let configured = existing.and_then(|c| c.stores.get(&name));
+    let configured_sops = configured.map(sops_of);
     let absolute = |p: &Path| {
         std::path::absolute(p).map_err(|e| Error::Usage(format!("{}: {e}", p.display())))
     };
-    let file = match (&args.sops_file, configured) {
+    let file = match (&args.sops_file, configured_sops) {
         (Some(f), _) => absolute(f)?,
         (None, Some(s)) => s.file.clone(),
         (None, None) => {
@@ -186,29 +205,30 @@ fn store_config(
             )));
         }
     };
-    let store = StoreConfig {
-        backend: BackendKind::Sops,
+    let sops = SopsStore {
         file,
         sops_config: match &args.sops_config {
             Some(p) => Some(absolute(p)?),
-            None => configured.and_then(|s| s.sops_config.clone()),
+            None => configured_sops.and_then(|s| s.sops_config.clone()),
         },
         age_key_file: match &args.age_key {
             Some(p) => Some(absolute(p)?),
-            None => configured.and_then(|s| s.age_key_file.clone()),
+            None => configured_sops.and_then(|s| s.age_key_file.clone()),
         },
+    };
+    if let Some(have) = configured_sops {
+        refuse_a_differing_flag(have, &sops, &name)?;
+    }
+    Ok(StoreConfig {
         wire_hint: configured.is_some_and(|s| s.wire_hint),
         name,
-    };
-    if let Some(have) = configured {
-        refuse_a_differing_flag(have, &store)?;
-    }
-    Ok(store)
+        backend: BackendConfig::Sops(sops),
+    })
 }
 
 /// init never edits the config, so a flag that names another file than the
 /// configured store would set up files that the config does not use.
-fn refuse_a_differing_flag(have: &StoreConfig, store: &StoreConfig) -> Result<(), Error> {
+fn refuse_a_differing_flag(have: &SopsStore, store: &SopsStore, name: &str) -> Result<(), Error> {
     let shown = |p: Option<&Path>| {
         p.map_or_else(
             || "(not set)".to_owned(),
@@ -239,7 +259,7 @@ fn refuse_a_differing_flag(have: &StoreConfig, store: &StoreConfig) -> Result<()
     }
     Err(Error::Usage(format!(
         "the config already names store '{}', and {} differs; init never edits the config. Drop the flag, pass --store with a new name, or edit the config first",
-        store.name,
+        name,
         differ.join(" and ")
     )))
 }
@@ -445,8 +465,8 @@ fn new_key(keygen: &Path, key: &Path) -> Result<(), Error> {
 /// create the file with.
 fn sops_config(
     backend: SopsBackend,
-    store: &StoreConfig,
-    env: &dyn Fn(&str) -> Option<OsString>,
+    store: &SopsStore,
+    env: &Env,
     args: &InitArgs,
     recipients: &[String],
     lock_timeout: Duration,
@@ -620,14 +640,15 @@ fn new_stores<'a>(
     store: &'a StoreConfig,
     args: &InitArgs,
 ) -> std::collections::BTreeMap<&'a str, NewStore<'a>> {
+    let sops = sops_of(store);
     let mut stores = std::collections::BTreeMap::new();
     stores.insert(
         store.name.as_str(),
         NewStore {
             backend: "sops",
-            file: &store.file,
-            sops_config: args.sops_config.as_ref().and(store.sops_config.as_deref()),
-            age_key_file: args.age_key.as_ref().and(store.age_key_file.as_deref()),
+            file: &sops.file,
+            sops_config: args.sops_config.as_ref().and(sops.sops_config.as_deref()),
+            age_key_file: args.age_key.as_ref().and(sops.age_key_file.as_deref()),
         },
     );
     stores

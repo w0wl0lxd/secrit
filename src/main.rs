@@ -15,6 +15,7 @@ mod lock;
 mod name;
 mod secret;
 mod signals;
+mod testhook;
 mod tools;
 mod trust;
 mod tty;

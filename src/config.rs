@@ -16,6 +16,9 @@ pub const ENV_CONFIG: &str = "SECRIT_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 30;
 
+/// The environment as a lookup function, so tests can pass their own.
+pub type Env = dyn Fn(&str) -> Option<OsString>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("HOME is not set to an absolute path")]
@@ -60,10 +63,17 @@ struct RawConfig {
     lock: RawLock,
 }
 
+/// One `[stores.NAME]` table. The `backend` key picks the variant (v0.2 plan
+/// 5.8); each variant refuses keys that it does not know.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+enum RawStore {
+    Sops(RawSops),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawStore {
-    backend: BackendKind,
+struct RawSops {
     file: String,
     sops_config: Option<String>,
     age_key_file: Option<String>,
@@ -99,20 +109,31 @@ impl Default for RawLock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Sops,
 }
 
+/// One store of the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub name: String,
-    pub backend: BackendKind,
+    pub wire_hint: bool,
+    pub backend: BackendConfig,
+}
+
+/// The backend of a store and its own settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendConfig {
+    Sops(SopsStore),
+}
+
+/// The settings of a sops store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SopsStore {
     pub file: PathBuf,
     pub sops_config: Option<PathBuf>,
     pub age_key_file: Option<PathBuf>,
-    pub wire_hint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,21 +236,24 @@ impl Config {
             return Err(ConfigError::ZeroTimeout);
         }
         let mut stores = BTreeMap::new();
-        for (name, s) in raw.stores {
+        for (name, raw_store) in raw.stores {
             let key = |k: &str| format!("stores.{name}.{k}");
-            let store = StoreConfig {
-                backend: s.backend,
-                file: expand(&s.file, home, &key("file"))?,
-                sops_config: s
-                    .sops_config
-                    .map(|v| expand(&v, home, &key("sops_config")))
-                    .transpose()?,
-                age_key_file: s
-                    .age_key_file
-                    .map(|v| expand(&v, home, &key("age_key_file")))
-                    .transpose()?,
-                wire_hint: s.wire_hint,
-                name: name.clone(),
+            let store = match raw_store {
+                RawStore::Sops(s) => StoreConfig {
+                    backend: BackendConfig::Sops(SopsStore {
+                        file: expand(&s.file, home, &key("file"))?,
+                        sops_config: s
+                            .sops_config
+                            .map(|v| expand(&v, home, &key("sops_config")))
+                            .transpose()?,
+                        age_key_file: s
+                            .age_key_file
+                            .map(|v| expand(&v, home, &key("age_key_file")))
+                            .transpose()?,
+                    }),
+                    wire_hint: s.wire_hint,
+                    name: name.clone(),
+                },
             };
             stores.insert(name, store);
         }
@@ -379,13 +403,18 @@ age_keygen = "/nix/store/x-age/bin/age-keygen"
 timeout_secs = 5
 "#;
 
+    fn sops_of(s: &StoreConfig) -> &SopsStore {
+        let BackendConfig::Sops(sops) = &s.backend;
+        sops
+    }
+
     #[test]
     fn parses_the_plan_example() {
         let c = parse(FULL).unwrap();
         let s = c.store(None).unwrap();
-        assert_eq!(s.file, Path::new("/etc/nixos/secrets/secrit.yaml"));
+        assert_eq!(sops_of(s).file, Path::new("/etc/nixos/secrets/secrit.yaml"));
         assert_eq!(
-            s.age_key_file.as_deref(),
+            sops_of(s).age_key_file.as_deref(),
             Some(Path::new("/home/u/.config/sops/age/keys.txt"))
         );
         assert!(s.wire_hint);
@@ -407,7 +436,7 @@ timeout_secs = 5
         );
         assert!(matches!(c.store(None), Err(ConfigError::NoDefaultStore)));
         assert_eq!(
-            c.store(Some("a")).unwrap().file,
+            sops_of(c.store(Some("a")).unwrap()).file,
             Path::new("/home/u/s.yaml")
         );
         assert!(matches!(
@@ -430,6 +459,65 @@ timeout_secs = 5
     fn unknown_backend_is_an_error() {
         let t = "[stores.a]\nbackend = \"keepassxc\"\nfile = \"/s.yaml\"\n";
         assert!(matches!(parse(t), Err(ConfigError::Parse { .. })));
+        let e = parse("[stores.a]\nfile = \"/s.yaml\"\n").unwrap_err();
+        assert!(e.to_string().contains("backend"), "{e}");
+    }
+
+    /// The config shapes that v0.1 and its test suite write parse to the
+    /// same settings as in v0.1 (v0.2 plan, S1a).
+    #[test]
+    fn v01_configs_parse_unchanged() {
+        let store = "[stores.main]\nbackend = \"sops\"\nfile = \"/r/secrets/main.yaml\"\nage_key_file = \"/r/keys/key1.txt\"\n";
+        let tail = "\n[tools]\nsops = \"/nix/store/x-sops/bin/sops\"\n\n[lock]\ntimeout_secs = 2\n";
+        let want = |wire_hint, sops_config: Option<&str>| StoreConfig {
+            name: "main".into(),
+            wire_hint,
+            backend: BackendConfig::Sops(SopsStore {
+                file: "/r/secrets/main.yaml".into(),
+                sops_config: sops_config.map(PathBuf::from),
+                age_key_file: Some("/r/keys/key1.txt".into()),
+            }),
+        };
+        for (extra, expected) in [
+            ("", want(false, None)),
+            ("wire_hint = true\n", want(true, None)),
+            ("wire_hint = false\n", want(false, None)),
+            (
+                "sops_config = \"/r/.sops.yaml\"\n",
+                want(false, Some("/r/.sops.yaml")),
+            ),
+        ] {
+            let text = format!("default_store = \"main\"\n\n{store}{extra}{tail}");
+            let c = parse(&text).unwrap();
+            assert_eq!(c.store(None).unwrap(), &expected, "{text}");
+            assert_eq!(c.lock_timeout, Duration::from_secs(2));
+        }
+        // The form that init writes for a new config.
+        let init = format!("default_store = \"main\"\n\n{store}");
+        assert_eq!(
+            parse(&init).unwrap().store(None).unwrap(),
+            &want(false, None)
+        );
+    }
+
+    /// serde has known gaps with `deny_unknown_fields` on a tagged enum, so
+    /// each variant is checked on its own (v0.2 plan 5.8).
+    #[test]
+    fn each_backend_refuses_unknown_keys() {
+        for (backend, keys) in [("sops", "file = \"/s.yaml\"\n")] {
+            let good = format!("[stores.a]\nbackend = \"{backend}\"\n{keys}");
+            assert!(parse(&good).is_ok(), "{good}");
+            for typo in [
+                "fiel = \"/x\"\n",
+                "wire-hint = true\n",
+                "format = \"yaml\"\n",
+            ] {
+                let bad = format!("{good}{typo}");
+                let e = parse(&bad).unwrap_err();
+                assert!(matches!(e, ConfigError::Parse { .. }), "{bad}");
+                assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
+            }
+        }
     }
 
     #[test]

@@ -10,9 +10,9 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 
 use crate::agent;
-use crate::backend::BackendError;
 use crate::backend::sops::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
-use crate::config::{Config, ConfigSource, ENV_CONFIG, StoreConfig, config_path, home};
+use crate::backend::{self, BackendError, DoctorCtx};
+use crate::config::{Config, ConfigSource, ENV_CONFIG, Env, StoreConfig, config_path, home};
 use crate::display::escape;
 use crate::error::Error;
 use crate::git::Repo;
@@ -52,16 +52,22 @@ pub struct Row {
     pub detail: String,
 }
 
+/// The rows of one `doctor` run, in order.
 #[derive(Debug, Default)]
-struct Report(Vec<Row>);
+pub struct Report(Vec<Row>);
 
 impl Report {
-    fn add(&mut self, check: impl Into<String>, status: Status, detail: impl Into<String>) {
+    pub fn add(&mut self, check: impl Into<String>, status: Status, detail: impl Into<String>) {
         self.0.push(Row {
             check: check.into(),
             status,
             detail: detail.into(),
         });
+    }
+
+    /// Whether a row for `check` exists already.
+    fn has(&self, check: &str) -> bool {
+        self.0.iter().any(|r| r.check == check)
     }
 }
 
@@ -104,7 +110,7 @@ fn collect(
     store_flag: Option<&str>,
     quiet: bool,
     hardened: HardenReport,
-    env: &dyn Fn(&str) -> Option<OsString>,
+    env: &Env,
 ) -> Report {
     let mut r = Report::default();
     process_checks(&mut r, hardened, env);
@@ -155,25 +161,38 @@ fn collect(
     if stores.is_empty() {
         r.add("stores", Status::Fail, "the config names no store");
     }
-    let mut version_checked = false;
+    // The tool rows above report a missing sops, so the store rows go on
+    // with a bare name that no check runs. The sops backend asks for sops
+    // only.
+    let sops_path = sops
+        .as_ref()
+        .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
+    let tool = |_: tools::Program, _: &crate::config::ToolSetting| Ok(sops_path.clone());
     for store in stores {
-        let sops_path = sops
-            .as_ref()
-            .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
-        let backend = match SopsBackend::new(store, sops_path, config.lock_timeout, env) {
+        let backend = match backend::open_with(store, &config, env, &tool) {
             Ok(b) => b,
             Err(e) => {
                 r.add(format!("store {}", store.name), Status::Fail, e.to_string());
                 continue;
             }
         };
-        if sops.is_some() && !version_checked {
-            version_checked = true;
-            version_check(&mut r, &backend);
-        }
-        store_checks(&mut r, &store.name, &backend, sops.is_some(), env);
+        let ctx = DoctorCtx {
+            store: &store.name,
+            tool_found: sops.is_some(),
+            env,
+        };
+        backend.doctor(&mut r, &ctx);
     }
     r
+}
+
+/// The rows of one sops store. The first store with a sops binary also
+/// checks the sops version, once per run.
+pub fn sops_rows(r: &mut Report, backend: &SopsBackend, ctx: &DoctorCtx<'_>) {
+    if ctx.tool_found && !r.has("sops version") {
+        version_check(r, backend);
+    }
+    store_checks(r, ctx.store, backend, ctx.tool_found, ctx.env);
 }
 
 fn process_checks(r: &mut Report, hardened: HardenReport, env: &dyn Fn(&str) -> Option<OsString>) {

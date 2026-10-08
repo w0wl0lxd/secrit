@@ -39,7 +39,7 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     ctx.status(&format!(
         "stored {name} in {} ({})",
         ctx.store.name,
-        ctx.store.file.display()
+        ctx.backend.location().raw()
     ));
     if ctx.store.wire_hint {
         ctx.status(&format!(

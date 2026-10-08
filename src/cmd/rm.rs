@@ -1,7 +1,6 @@
 //! `secrit rm NAME` (PLAN section 4.4).
 
 use super::Ctx;
-use crate::display::escape;
 use crate::error::Error;
 use crate::name::Name;
 use crate::tty::{self, LineEnd, ReadError};
@@ -9,10 +8,7 @@ use crate::tty::{self, LineEnd, ReadError};
 pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     ctx.backend.check_remove(name)?;
     if !yes {
-        let question = format!(
-            "remove {name} from {}? [y/N] ",
-            escape(&ctx.store.file.display().to_string())
-        );
+        let question = format!("remove {name} from {}? [y/N] ", ctx.backend.location());
         if !confirm(&question)? {
             return Err(Error::Failed("not removed".into()));
         }

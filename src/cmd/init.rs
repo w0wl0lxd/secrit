@@ -3,9 +3,7 @@
 //! config. It never replaces or edits a file that exists.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -13,8 +11,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{interrupted, shell_path};
-use crate::backend::BackendError;
 use crate::backend::sops::{MIN_SOPS, NEED_SOPS, SopsBackend};
+use crate::backend::{BackendError, atomic};
 use crate::child;
 use crate::config::{
     BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
@@ -439,26 +437,17 @@ fn new_key(keygen: &Path, key: &Path) -> Result<(), Error> {
     let fail = |step: &str, e: &dyn std::fmt::Display| {
         Error::Failed(format!("{step} the new age key {shown}: {e}"))
     };
-    std::fs::File::open(&made)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| fail("fsync", &e))?;
+    atomic::sync_path(&made).map_err(|e| fail("fsync", &e))?;
     interrupted()?;
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        &made,
-        rustix::fs::CWD,
-        key,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|e| match e {
-        rustix::io::Errno::EXIST => Error::Refused(format!(
-            "the age key {shown} appeared while init created it; nothing was replaced"
-        )),
-        e => fail("rename", &e),
-    })?;
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| fail("fsync the directory of", &e))
+    atomic::rename_noreplace(rustix::fs::CWD, &made, rustix::fs::CWD, key).map_err(
+        |e| match e {
+            rustix::io::Errno::EXIST => Error::Refused(format!(
+                "the age key {shown} appeared while init created it; nothing was replaced"
+            )),
+            e => fail("rename", &e),
+        },
+    )?;
+    atomic::sync_path(dir).map_err(|e| fail("fsync the directory of", &e))
 }
 
 /// The `.sops.yaml` that covers a new store file. Returns the backend to
@@ -563,20 +552,8 @@ fn regex_escape(s: &str) -> String {
 
 /// Create `path` with `O_EXCL` and `O_NOFOLLOW`, write `bytes` and fsync.
 fn create_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
-    let _critical = signals::Critical::enter();
-    let fail = |e: std::io::Error| Error::Failed(format!("create {}: {e}", path.display()));
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(path)
-        .map_err(fail)?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        let _ = std::fs::remove_file(path);
-        return Err(fail(e));
-    }
-    Ok(())
+    atomic::create_new_noreplace(path, bytes, mode)
+        .map_err(|e| Error::Failed(format!("create {}: {e}", path.display())))
 }
 
 #[derive(Serialize)]

@@ -57,6 +57,10 @@ All notable changes to this project are recorded here. The format follows
   is unchanged.
 - CI: a `darwin-clippy` job runs clippy for `aarch64-apple-darwin` on Linux, to catch
   macOS cfg errors without a Mac.
+- Internal refactor with no change in behaviour: the sops backend is split into one module
+  each for the sops runs, the file format, the edit and the `doctor` rows. The write
+  protocol, store-file creation, backups and the fsync helpers move into a module that is
+  not specific to sops, and the default age key path moves into one function.
 
 ### Fixed
 

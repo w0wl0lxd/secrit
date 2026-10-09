@@ -45,8 +45,9 @@ All notable changes to this project are recorded here. The format follows
   `format`, a file name that ends in `.json` means JSON and any other name means YAML; a
   `.env` or `.ini` name is refused with exit 3 until secrit supports that format. Every
   sops run passes the store's format as `--input-type` and `--output-type`, and temp
-  copies end in the format's extension. A JSON store must be strict JSON: one value, no
-  byte order mark and no key twice in one object.
+  copies end in the format's extension. `doctor` lists a leftover temp copy with the
+  extension of any format, so a copy from before a `format` change shows too. A JSON
+  store must be strict JSON: one value, no byte order mark and no key twice in one object.
 - `secrit init --format yaml|json` creates a store in that format and writes the
   `format` key into a new config. A flag that does not match the file name exits 3
   before init makes a file.

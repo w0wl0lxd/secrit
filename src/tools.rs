@@ -13,14 +13,21 @@ use crate::trust::{self, TrustError};
 pub const BAKED_SOPS: Option<&str> = option_env!("SECRIT_SOPS_BIN");
 pub const BAKED_AGE_KEYGEN: Option<&str> = option_env!("SECRIT_AGE_KEYGEN_BIN");
 
-/// The text of `secrit --version`: the version and the baked-in tool paths.
+/// The text of `secrit --version`: the version, the baked-in tool paths,
+/// and a `features: test-hooks` line when the test hooks are compiled in.
 /// It also keeps both store paths in the binary, so the Nix closure carries
 /// `age` as the README says (NIX-1).
 #[must_use]
 pub fn long_version() -> String {
     let show = |p: Option<&'static str>| p.unwrap_or("not baked in (resolved from config or PATH)");
+    // T54: the `release-features` flake check fails on this line.
+    let features = if crate::testhook::COMPILED_IN {
+        "\nfeatures: test-hooks"
+    } else {
+        ""
+    };
     format!(
-        "{}\nsops: {}\nage-keygen: {}",
+        "{}\nsops: {}\nage-keygen: {}{features}",
         env!("CARGO_PKG_VERSION"),
         show(BAKED_SOPS),
         show(BAKED_AGE_KEYGEN)

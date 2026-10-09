@@ -202,3 +202,157 @@ kill $reader",
     // 143 = 128 + SIGTERM: the default action, not the deferred exit 130.
     assert!(t.contains("rc=143"), "{t}");
 }
+
+// The write gate (PLAN-v0.2 section 4, T27, T27a, T28).
+
+const PROMPT: &[u8] = b"type the name: ";
+
+/// The gate command with an agent variable set on `script`, so `sh` and
+/// secrit inherit it.
+fn agent_cmd(env: &TestEnv) -> std::process::Command {
+    let mut c = env.gate_cmd();
+    c.env("CLAUDECODE", "1");
+    c
+}
+
+/// T27: under an agent, the name typed on the terminal confirms a store of a
+/// piped value.
+#[test]
+fn the_typed_name_confirms_a_store_under_an_agent() {
+    let env = TestEnv::new();
+    let inner = format!("printf gate-value | '{}' store n", common::BIN);
+    let out = env.under_script_answer(&agent_cmd(&env), &inner, PROMPT, b"n\n");
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    assert!(
+        t.contains("an agent runs secrit (CLAUDECODE is set)"),
+        "{t}"
+    );
+    assert!(t.contains("To store 'n' in "), "{t}");
+    env.assert_value("n", "gate-value");
+}
+
+/// T27: `y` is not the name; the store stays byte-identical (exit 3).
+#[test]
+fn y_does_not_confirm_a_store() {
+    let env = TestEnv::new();
+    let before = env.store_bytes();
+    let inner = format!("printf v | '{}' store n", common::BIN);
+    let out = env.under_script_answer(&agent_cmd(&env), &inner, PROMPT, b"y\n");
+    let t = text(&out);
+    assert_eq!(code(&out), 3, "{t}");
+    assert!(t.contains("not confirmed"), "{t}");
+    assert_eq!(env.store_bytes(), before);
+}
+
+/// T28: a name typed before the prompt is discarded. The hook holds secrit
+/// before the flush, so the early input is in the terminal queue by then.
+#[test]
+fn input_typed_before_the_gate_prompt_is_discarded() {
+    let env = TestEnv::new();
+    let hook = env.hook_dir();
+    let mut base = agent_cmd(&env);
+    base.env("SECRIT_TEST_HOOK", "gate-flush=pause")
+        .env("SECRIT_TEST_HOOK_DIR", &hook);
+    let before = env.store_bytes();
+    let inner = format!("printf v | '{}' store n", common::BIN);
+    let out = env.under_script_typing(
+        &base,
+        &inner,
+        |input| {
+            env.wait_for_hook(1);
+            std::io::Write::write_all(input, b"n\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::fs::write(hook.join("go"), "").unwrap();
+        },
+        PROMPT,
+        b"x\n",
+    );
+    let t = text(&out);
+    assert_eq!(code(&out), 3, "{t}");
+    assert!(t.contains("not confirmed"), "{t}");
+    assert_eq!(env.store_bytes(), before);
+}
+
+/// T27: `rm --yes` under an agent still asks for the name, and says so.
+#[test]
+fn rm_yes_still_asks_under_an_agent() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"v")), 0);
+    let inner = format!("'{}' rm n --yes", common::BIN);
+    let out = env.under_script_answer(&agent_cmd(&env), &inner, PROMPT, b"n\n");
+    let t = text(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    assert!(t.contains("--yes does not skip"), "{t}");
+    assert!(t.contains("To remove 'n' from "), "{t}");
+    assert_eq!(env.ls(), Vec::<String>::new());
+}
+
+/// T27a: an agent that unsets its variable for secrit is still found in
+/// the ancestors, and the question names that process.
+#[test]
+fn the_ancestor_walk_finds_an_unset_variable() {
+    let env = TestEnv::new();
+    let before = env.store_bytes();
+    let inner = format!(
+        "printf v | '{}' -u CLAUDECODE '{}' store n",
+        bin("env").display(),
+        common::BIN
+    );
+    let out = env.under_script_answer(&agent_cmd(&env), &inner, PROMPT, b"no\n");
+    let t = text(&out);
+    assert_eq!(code(&out), 3, "{t}");
+    assert!(t.contains("CLAUDECODE is set in ancestor process "), "{t}");
+    assert_eq!(env.store_bytes(), before);
+}
+
+/// T27a, the documented bypass (PLAN-v0.2 4.4): a command that leaves the
+/// agent's process tree and has no agent variable stores with no question.
+///
+/// The plan names `systemd-run --user --pty`, which reparents the command
+/// to the user service manager. The Nix build sandbox has no user service
+/// manager, so this test reparents the same way by hand: a helper loses
+/// its parent, waits until the parent is gone, and then runs secrit. secrit
+/// keeps the `script` terminal.
+#[test]
+fn a_reparented_command_without_the_variable_bypasses_the_gate() {
+    let env = TestEnv::new();
+    let value = env.root.path().join("value");
+    std::fs::write(&value, "bypass-value").unwrap();
+    let rc = env.root.path().join("rc");
+    let log = env.root.path().join("log");
+    let parents = env.root.path().join("parents");
+    let sh = "/bin/sh";
+    let sleep = bin("sleep").display().to_string();
+    let helper = env.script(
+        "orphan",
+        &format!(
+            "parent=$1\nwhile kill -0 \"$parent\" 2>/dev/null; do '{sleep}' 0.05; done\nread -r s < /proc/$$/stat; set -- $s; echo \"$parent $4\" > '{parents}'\n'{secrit}' store n < '{value}' > '{log}' 2>&1\necho $? > '{rc}'",
+            secrit = common::BIN,
+            value = value.display(),
+            log = log.display(),
+            rc = rc.display(),
+            parents = parents.display(),
+        ),
+    );
+    let inner = format!(
+        "'{sh}' -c '\"{env}\" -u CLAUDECODE \"{helper}\" $$ & exit 0'\ni=0; while [ ! -s '{rc}' ] && [ $i -lt 600 ]; do '{sleep}' 0.05; i=$((i+1)); done",
+        env = bin("env").display(),
+        helper = helper.display(),
+        rc = rc.display(),
+    );
+    let out = env.under_script_held_with(&agent_cmd(&env), &inner);
+    let log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        std::fs::read_to_string(&rc).unwrap_or_default().trim(),
+        "0",
+        "{log}{}",
+        text(&out)
+    );
+    assert!(!log.contains("type the name"), "{log}");
+    env.assert_value("n", "bypass-value");
+    // The helper ran secrit after it lost its first parent.
+    let parents = std::fs::read_to_string(&parents).unwrap();
+    let (first, now) = parents.trim().split_once(' ').unwrap();
+    assert_ne!(first, now, "the helper was not reparented");
+}

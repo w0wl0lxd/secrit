@@ -130,7 +130,31 @@ fn steps(
             "no age key path: pass --age-key, or set HOME or XDG_CONFIG_HOME".into(),
         ));
     };
-    let recipients = age_key(&keygen.path, &key, &out)?;
+    // An existing key is only read, so its recipients can go into the
+    // question of the write gate, which comes before the first write.
+    let key_exists = !matches!(
+        std::fs::symlink_metadata(&key),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let known = if key_exists {
+        Some(age_key(&keygen.path, &key, &out)?)
+    } else {
+        None
+    };
+    interrupted()?;
+    if !args.dry_run {
+        let plan = WritePlan {
+            key: (!key_exists).then_some(key.as_path()),
+            store_file: (!sops_store.file.exists()).then_some(sops_store.file.as_path()),
+            sops_config: args.write_sops_config,
+            config: existing.is_none().then_some(config_file.as_path()),
+        };
+        gate(&store.name, &plan, known.as_deref())?;
+    }
+    let recipients = match known {
+        Some(r) => r,
+        None => age_key(&keygen.path, &key, &out)?,
+    };
     interrupted()?;
 
     // 3 and 4. The store file, and the .sops.yaml it needs when it is new.
@@ -163,6 +187,65 @@ fn steps(
     // 6. Next steps.
     next_steps(&sops_store.file, &env, &out)?;
     interrupted()
+}
+
+/// The files that this run creates, for the write gate question.
+struct WritePlan<'a> {
+    key: Option<&'a Path>,
+    store_file: Option<&'a Path>,
+    /// `--write-sops-config`: a `.sops.yaml` when none covers the new file.
+    sops_config: bool,
+    config: Option<&'a Path>,
+}
+
+impl WritePlan<'_> {
+    fn creates(&self) -> Vec<String> {
+        let mut c = Vec::new();
+        if let Some(k) = self.key {
+            c.push(format!("the age key {}", escape_path(k)));
+        }
+        if let Some(f) = self.store_file {
+            c.push(format!("the store file {}", escape_path(f)));
+            if self.sops_config {
+                c.push("a .sops.yaml when none covers the store file".to_owned());
+            }
+        }
+        if let Some(p) = self.config {
+            c.push(format!("the config {}", escape_path(p)));
+        }
+        c
+    }
+}
+
+/// The write gate of `init` (PLAN-v0.2 4.1): once, before the first write,
+/// and only when the run writes a file. The question lists the files and
+/// the recipients, because `.sops.yaml` decides the recipients of a new
+/// store file (4.2, step 3). The answer is the store name.
+fn gate(store: &str, plan: &WritePlan<'_>, recipients: Option<&[String]>) -> Result<(), Error> {
+    let creates = plan.creates();
+    if creates.is_empty() {
+        return Ok(());
+    }
+    let mut keys = match recipients {
+        Some(r) => format!("the age key has the recipients {}", r.join(", ")),
+        None => "a new age key becomes the recipient".to_owned(),
+    };
+    if plan.store_file.is_some() {
+        keys.push_str(
+            "; the creation rule in .sops.yaml decides the recipients of the new store file",
+        );
+    }
+    super::write_gate(
+        |agent| {
+            format!(
+                "an agent runs secrit ({agent}). init will create {}. Recipients: {keys}. To set up store '{}', type the store name: ",
+                creates.join(", "),
+                escape(store)
+            )
+        },
+        store,
+    )
+    .map(|_| ())
 }
 
 /// The store that this run sets up: the flags, else the config.

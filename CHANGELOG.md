@@ -44,8 +44,33 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- The write gate (owner ruling Q13(b), PLAN-v0.2 section 4). Under agent detection,
+  `store` (also `--replace`), `rm` (also `--yes`) and `init` (once, before its first write)
+  ask on `/dev/tty` for the name: `an agent runs secrit (CLAUDECODE is set). To store
+  'NAME' in FILE, type the name:`. `init` asks for the store name and lists the files it
+  creates and the recipients. Only the exact name confirms; anything else exits 3 with
+  `not confirmed`. secrit discards input typed before the question. `store` asks after its
+  checks and before it reads the value.
+- With no terminal, `store`, `rm` and `init` exit 3 with `refused: no terminal to confirm
+  on. CI or a remote job: use 'secrit seal'. A scheduled job: run it as its own system
+  service. Over ssh: use ssh -t.` (owner ruling Q19). No variable, config key or flag
+  turns this off. So a write from cron, a systemd unit or CI is refused.
+- `secrit --version` prints `features: test-hooks`, and `doctor` shows a `warn` row
+  `build: test hooks are compiled in`, when the test hooks are compiled in. The flake check
+  `release-features` fails when the package's `--version` names `test-hooks`.
+- README "What secrit does not protect against" lists the ways around the write gate.
 
 ### Changed
+
+- Agent detection adds `OPENCODE` and `COPILOT_CLI`, and reads the environment of the
+  ancestor processes through `/proc` (at most 64 levels). A variable that an agent removes
+  only for secrit (`env -u CLAUDECODE secrit ...`) is still found in its shell; the
+  question then names that process. `get` uses the same detection.
+- `rm` with no terminal and no `--yes` prints the Q19 text above instead of `pass --yes to
+  remove without asking`.
+- The `doctor` agent row says what the gate does: `get` and `run --env` are off; every
+  decrypt of a gated store is off; `store`, `rm`, `generate` and `init` need the typed
+  name, or are off with no terminal; `seal` works.
 
 - Internal refactor for v0.2 backends, with no change to the config format or the exit
   codes. Messages change only as the entries below say (config parse errors, escaped

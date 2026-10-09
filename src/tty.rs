@@ -9,6 +9,9 @@
 //! - every wait polls the deferred-signal flag, so INT, TERM, HUP and QUIT
 //!   restore the terminal and exit 130 (SEC-13).
 //!
+//! The write gate question ([`confirm_typed`], PLAN-v0.2 4.2) and the `rm`
+//! question ([`confirm_yes`]) live here too.
+//!
 //! A [`ModeGuard`] restores the original terminal settings when it drops.
 
 use std::fs::File;
@@ -17,8 +20,11 @@ use std::os::fd::AsFd;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
-use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
+use rustix::termios::{
+    LocalModes, OptionalActions, QueueSelector, Termios, tcflush, tcgetattr, tcsetattr,
+};
 
+use crate::error::Error;
 use crate::signals;
 
 /// How often a blocked wait checks the signal flag.
@@ -63,6 +69,21 @@ impl<'a> ModeGuard<'a> {
             .remove(LocalModes::ECHO | LocalModes::ECHOE | LocalModes::ECHOK);
         t.local_modes
             .insert(LocalModes::ICANON | LocalModes::ECHONL);
+        tcsetattr(tty, OptionalActions::Now, &t)?;
+        Ok(Self {
+            tty,
+            orig,
+            _critical: critical,
+        })
+    }
+
+    /// Line mode with echo, for an answer that is not secret.
+    pub fn line_echo(tty: &'a File) -> io::Result<Self> {
+        let critical = signals::Critical::enter();
+        let orig = tcgetattr(tty)?;
+        let mut t = orig.clone();
+        t.local_modes
+            .insert(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHOE | LocalModes::ECHOK);
         tcsetattr(tty, OptionalActions::Now, &t)?;
         Ok(Self {
             tty,
@@ -179,6 +200,102 @@ pub fn wait_key(tty: &File) -> Result<(), ReadError> {
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(ReadError::Io(e)),
+        }
+    }
+}
+
+/// The longest typed name that the write gate reads (PLAN-v0.2 4.2).
+pub const TYPED_NAME_MAX: usize = 255;
+
+/// The write gate question (PLAN-v0.2 4.2): discard input typed ahead, ask
+/// `question` on `/dev/tty`, and read one line with echo on. `Ok(true)`
+/// only when the line equals `expected` byte for byte. A signal restores
+/// the terminal and returns [`Error::Interrupted`] (exit 130).
+pub fn confirm_typed(question: &str, expected: &str) -> Result<bool, Error> {
+    let Ok(tty) = open() else {
+        return Err(Error::Refused(crate::agent::NO_TTY_REFUSAL.into()));
+    };
+    let io = |e: io::Error| Error::Failed(format!("could not ask on the terminal: {e}"));
+    let _mode = ModeGuard::line_echo(&tty).map_err(io)?;
+    crate::testhook::hook("gate-flush");
+    tcflush(&tty, QueueSelector::IFlush).map_err(|e| io(e.into()))?;
+    say(&tty, question).map_err(io)?;
+    let mut buf = [0u8; TYPED_NAME_MAX + 1];
+    let mut len = 0;
+    match read_line(&tty, &mut buf, &mut len) {
+        Ok(LineEnd::Newline | LineEnd::Eof) => Ok(typed_matches(&buf[..len], expected)),
+        Err(ReadError::BufferFull | ReadError::LineTooLong) => {
+            // The rest of the long line must not reach the next reader.
+            let _ = tcflush(&tty, QueueSelector::IFlush);
+            Ok(false)
+        }
+        Err(ReadError::Interrupted) => Err(Error::Interrupted),
+        Err(ReadError::Io(e)) => Err(io(e)),
+    }
+}
+
+/// The comparison of [`confirm_typed`]: byte for byte, with no trimming and
+/// no case folding. A name is not secret, so it needs no constant time.
+#[must_use]
+pub fn typed_matches(line: &[u8], expected: &str) -> bool {
+    line == expected.as_bytes()
+}
+
+/// Ask a `[y/N]` question on `/dev/tty`. With no terminal, refuse with the
+/// Q19 text. The read polls the signal flag, so INT or TERM exits 130.
+pub fn confirm_yes(question: &str) -> Result<bool, Error> {
+    let Ok(tty) = open() else {
+        return Err(Error::Refused(crate::agent::NO_TTY_REFUSAL.into()));
+    };
+    let io = |e: io::Error| Error::Failed(format!("could not ask on the terminal: {e}"));
+    say(&tty, question).map_err(io)?;
+    let mut buf = [0u8; 64];
+    let mut len = 0;
+    match read_line(&tty, &mut buf, &mut len) {
+        Ok(LineEnd::Newline | LineEnd::Eof) => Ok(is_yes(&buf[..len])),
+        // A long answer is not "y" or "yes".
+        Err(ReadError::BufferFull | ReadError::LineTooLong) => Ok(false),
+        Err(ReadError::Interrupted) => Err(Error::Interrupted),
+        Err(ReadError::Io(e)) => Err(io(e)),
+    }
+}
+
+#[must_use]
+pub fn is_yes(answer: &[u8]) -> bool {
+    let a = answer.trim_ascii();
+    a.eq_ignore_ascii_case(b"y") || a.eq_ignore_ascii_case(b"yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_yes, typed_matches};
+
+    #[test]
+    fn only_y_and_yes_confirm() {
+        for a in [&b"y"[..], b"Y", b"yes", b" YES ", b"yes\r"] {
+            assert!(is_yes(a), "{a:?}");
+        }
+        for a in [&b""[..], b"n", b"no", b"yess", b"y y"] {
+            assert!(!is_yes(a), "{a:?}");
+        }
+    }
+
+    /// PLAN-v0.2 4.2 step 5: the line must equal the name byte for byte.
+    #[test]
+    fn only_the_exact_name_confirms() {
+        assert!(typed_matches(b"github-token", "github-token"));
+        for line in [
+            &b""[..],
+            b"y",
+            b"yes",
+            b"github-token ",
+            b" github-token",
+            b"GITHUB-TOKEN",
+            b"github-token\r",
+            b"github",
+            b"github-token-2",
+        ] {
+            assert!(!typed_matches(line, "github-token"), "{line:?}");
         }
     }
 }

@@ -11,16 +11,23 @@ mod edit;
 mod format;
 mod runner;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
 
 use self::edit::{Op, SopsEdit};
-use self::format::{REGEX_RULES, has_plaintext, has_recipients, non_string_kind};
+use self::format::{
+    REGEX_RULES, Slot, has_plaintext, has_recipients, leaf_names, leaves, lookup, non_string_kind,
+    path_text,
+};
 use self::runner::{MAX_NEW_FILE_BYTES, Runner};
 use super::atomic::{self, FileStore};
-use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WireSource, WriteReport};
+use super::{
+    Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, Target, WireSource,
+    WriteReport,
+};
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::name::Name;
 use crate::paths;
@@ -45,9 +52,9 @@ pub struct SopsBackend {
 /// What `inspect` found in the store file. Holds names only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreFacts {
-    /// Top-level entries outside `sops`.
+    /// The names that `ls` lists: the leaves outside `sops`.
     pub names: usize,
-    /// Top-level names that hold a leaf that is not `ENC[...]`.
+    /// The names of the leaves that are not `ENC[...]`.
     pub plaintext: Vec<String>,
     /// The regex rules in the file's sops metadata.
     pub rules: Vec<&'static str>,
@@ -157,14 +164,14 @@ impl SopsBackend {
                     .is_some_and(|s| !s.is_empty())
             })
             .collect();
-        let plaintext = doc
-            .entries
+        let leaves = leaves(&doc.entries);
+        let plaintext = leaves
             .iter()
             .filter(|(_, v)| has_plaintext(v))
-            .map(|(k, _)| k.clone())
+            .map(|(p, _)| path_text(p))
             .collect();
         Ok(StoreFacts {
-            names: doc.entries.len(),
+            names: leaves.len(),
             plaintext,
             rules,
         })
@@ -263,6 +270,7 @@ impl SopsBackend {
             backend: self,
             name,
             op,
+            prune: Cell::new(None),
         })
     }
 }
@@ -272,25 +280,31 @@ impl Backend for SopsBackend {
         BackendKind::Sops
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities { nested_names: true }
+    }
+
     fn location(&self) -> &Location {
         &self.location
     }
 
+    /// Every leaf, as its key path (v0.2 plan 5.4). A file that another
+    /// tool wrote with a nested map lists the leaves, not the map.
     fn list(&self) -> Result<Vec<String>, BackendError> {
         let (_, doc) = self.read_doc()?;
-        let mut names: Vec<String> = doc.entries.keys().cloned().collect();
-        names.sort();
-        Ok(names)
+        Ok(leaf_names(&doc.entries))
     }
 
     fn exists(&self, name: &Name) -> Result<bool, BackendError> {
         let (_, doc) = self.read_doc()?;
-        Ok(doc.entries.contains_key(name.as_str()))
+        let path: Vec<&str> = name.segments().collect();
+        Ok(matches!(lookup(&doc.entries, &path), Slot::Value(_)))
     }
 
     fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
         let doc = self.read_doc_to_write()?;
-        if mode == PutMode::CreateOnly && doc.entries.contains_key(name.as_str()) {
+        let existed = self.check_path(name, &doc.entries, true)?;
+        if mode == PutMode::CreateOnly && existed {
             return Err(self.exists_error(name));
         }
         self.check_cleartext_rules(name, &doc.meta)?;
@@ -299,7 +313,7 @@ impl Backend for SopsBackend {
 
     fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
         let doc = self.read_doc_to_write()?;
-        if !doc.entries.contains_key(name.as_str()) {
+        if !self.check_path(name, &doc.entries, false)? {
             return Err(self.missing_error(name));
         }
         self.check_plaintext(name, &doc.entries)
@@ -308,10 +322,10 @@ impl Backend for SopsBackend {
     fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError> {
         let (bytes, doc) = self.read_doc()?;
         for n in names {
-            let entry = doc
-                .entries
-                .get(n.as_str())
-                .ok_or_else(|| self.missing_error(n))?;
+            let path: Vec<&str> = n.segments().collect();
+            let Slot::Value(entry) = lookup(&doc.entries, &path) else {
+                return Err(self.missing_error(n));
+            };
             if let Some(kind) = non_string_kind(entry) {
                 return Err(BackendError::NotString {
                     name: n.to_string(),
@@ -354,10 +368,13 @@ impl Backend for SopsBackend {
         doctor::rows(report, self, ctx);
     }
 
-    fn wire_source(&self, _name: &Name) -> Option<WireSource> {
+    /// sops-nix reads a nested key from the `key` option, with the
+    /// segments joined by `/` (v0.2 plan 5.7).
+    fn wire_source(&self, name: &Name) -> Option<WireSource> {
         Some(WireSource::SopsFile {
             file: self.file().to_path_buf(),
             format: self.format,
+            key: name.is_nested().then(|| name.clone()),
         })
     }
 }
@@ -404,6 +421,7 @@ mod tests {
     use super::format::validate;
     use super::*;
     use crate::error::Exit;
+    use crate::name::NameError;
 
     #[test]
     fn a_cleartext_entry_is_refused_before_the_value() {
@@ -544,10 +562,11 @@ mod tests {
         ] {
             let b = open(name, explicit).unwrap();
             assert_eq!(b.format, want, "{name}");
-            let Some(WireSource::SopsFile { file, format }) = b.wire_source(&n) else {
+            let Some(WireSource::SopsFile { file, format, key }) = b.wire_source(&n) else {
                 panic!("{name}: no sops file");
             };
             assert_eq!((file.as_path(), format), (b.file(), want), "{name}");
+            assert_eq!(key, None, "{name}");
         }
         for name in ["s.env", "s.ini"] {
             let e = open(name, None).unwrap_err();
@@ -568,6 +587,105 @@ mod tests {
             None
         })
         .unwrap()
+    }
+
+    const ENC: &str = "ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]";
+
+    fn name(s: &str) -> Name {
+        Name::parse(s).unwrap()
+    }
+
+    /// v0.2 plan 5.4: the reserved `sops` key is the first segment only,
+    /// and the suffix rules apply to every segment, as sops applies them
+    /// (S5 lab). All refusals exit 3 with no sops run.
+    #[test]
+    fn the_sops_name_rules_apply_to_each_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), BASE);
+        for ok in ["app/sops", "x/y/z", "sops.x", "q/sops"] {
+            assert!(b.check_put(&name(ok), PutMode::CreateOnly).is_ok(), "{ok}");
+        }
+        for bad in ["sops", "sops/x"] {
+            let e = b.check_put(&name(bad), PutMode::CreateOnly).unwrap_err();
+            assert!(
+                matches!(e, BackendError::Name(NameError::Reserved)),
+                "{bad}: {e}"
+            );
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        for bad in ["x_unencrypted", "p_unencrypted/k", "a/b_unencrypted/c"] {
+            let e = b.check_put(&name(bad), PutMode::CreateOnly).unwrap_err();
+            assert!(
+                matches!(e, BackendError::Name(NameError::UnencryptedSuffix { .. })),
+                "{bad}: {e}"
+            );
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+
+        let suffix = BASE.replace("  version:", "  unencrypted_suffix: _pub\n  version:");
+        let b = backend_for(tmp.path(), &suffix);
+        let e = b
+            .check_put(&name("x_pub/k"), PutMode::CreateOnly)
+            .unwrap_err();
+        assert!(e.to_string().contains("_pub"), "{e}");
+        assert!(b.check_put(&name("x/k"), PutMode::CreateOnly).is_ok());
+
+        // sops encrypts a leaf when any key on its path ends with the
+        // encrypted_suffix.
+        let enc = BASE.replace("  version:", "  encrypted_suffix: _enc\n  version:");
+        let b = backend_for(tmp.path(), &enc);
+        for ok in ["g_enc/k", "g/k_enc", "x_enc"] {
+            assert!(b.check_put(&name(ok), PutMode::CreateOnly).is_ok(), "{ok}");
+        }
+        let e = b.check_put(&name("g/k"), PutMode::CreateOnly).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                BackendError::Name(NameError::MissingEncryptedSuffix { .. })
+            ),
+            "{e}"
+        );
+    }
+
+    /// T49: a path through a value that is not a map is refused before any
+    /// input, and so is a write or a remove of a name that holds others.
+    #[test]
+    fn a_key_path_never_turns_a_value_into_a_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), &format!("{BASE}m:\n  n: {ENC}\n"));
+        for (bad, mode) in [
+            ("a/b", PutMode::CreateOnly),
+            ("a/b/c", PutMode::Replace),
+            ("m/n/o", PutMode::CreateOnly),
+        ] {
+            let e = b.check_put(&name(bad), mode).unwrap_err();
+            assert!(matches!(e, BackendError::KeyPath { .. }), "{bad}: {e}");
+            assert!(e.to_string().contains("not a map"), "{bad}: {e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        for mode in [PutMode::CreateOnly, PutMode::Replace] {
+            let e = b.check_put(&name("m"), mode).unwrap_err();
+            assert!(
+                e.to_string().contains("holds other names under 'm/'"),
+                "{e}"
+            );
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        let e = b.check_remove(&name("m")).unwrap_err();
+        assert!(matches!(e, BackendError::KeyPath { .. }), "{e}");
+        assert_eq!(e.exit(), Exit::Refused);
+
+        // A nested name that exists, and one that does not.
+        let e = b.check_put(&name("m/n"), PutMode::CreateOnly).unwrap_err();
+        assert!(matches!(e, BackendError::Exists { .. }), "{e}");
+        assert!(b.check_put(&name("m/n"), PutMode::Replace).is_ok());
+        assert!(b.check_put(&name("m/x"), PutMode::CreateOnly).is_ok());
+        assert!(b.check_remove(&name("m/n")).is_ok());
+        assert!(b.exists(&name("m/n")).unwrap());
+        // Under a string, a name does not exist for `rm`.
+        let e = b.check_remove(&name("a/b")).unwrap_err();
+        assert!(matches!(e, BackendError::Missing { .. }), "{e}");
+        assert_eq!(b.list().unwrap(), ["a", "m/n"]);
     }
 
     /// PLAN 4.1 step 1: `check_put` refuses before any value is read, with

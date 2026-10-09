@@ -194,7 +194,9 @@ To set up the same store by hand:
    ```
 
    The value then appears at `/run/secrets/github-token`. For a JSON store, `wire` prints
-   `format = "json";`.
+   `format = "json";`. For a nested name such as `app/db/pass`, the stanza also has
+   `key = "app/db/pass";`, which sops-nix reads as the nested key, and the value appears
+   at `/run/secrets/app/db/pass`.
 
 ## Use
 
@@ -204,6 +206,7 @@ gh auth token | secrit store gh-token  # piped; one trailing newline is stripped
 secrit store tls-key --multiline < key.pem
 secrit store blob --raw < file         # keep the exact bytes
 secrit store github-token --replace    # overwrite; keeps a ciphertext backup
+secrit store app/db/pass               # a nested key: app -> db -> pass
 
 secrit ls                              # names only; decrypts nothing
 secrit ls --json
@@ -244,10 +247,21 @@ keeps the files of the steps it finished; run it again to finish the setup.
 
 - **No value on the command line.** `secrit store NAME VALUE` fails with exit 2 and a
   fixed message that does not repeat the value. Parse errors never echo argument text.
-- **Names** match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. `sops` is reserved. A name that
-  sops would store in cleartext (the `_unencrypted` suffix, the file's
-  `unencrypted_suffix` or `encrypted_suffix`) is refused. secrit v0.1 does not write a
-  file whose sops metadata has `unencrypted_regex` or `encrypted_regex`.
+- **Names** are key paths: one or more segments joined by `/`, at most 8 segments and
+  255 bytes. Each segment matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`, so a one-segment
+  name is a v0.1 name. `sops` is reserved as the first segment only (`app/sops` is a
+  name). A name that sops would store in cleartext is refused: a segment that ends with
+  `_unencrypted` or with the file's `unencrypted_suffix`, or, when the file sets
+  `encrypted_suffix`, a name with no segment that ends with it. sops tests each key on
+  the path, and secrit does the same. secrit does not write a file whose sops metadata
+  has `unencrypted_regex` or `encrypted_regex`.
+- **Nested names** (YAML and JSON stores). `secrit store a/b/c` writes the key `c` in the
+  map `b` in the map `a`, and creates the maps that are missing. `store` refuses (exit 3,
+  before it reads a value) a path through a value that is not a map, such as `a/b` when
+  `a` holds a string: sops would replace that value with a map. `store` and `rm` refuse a
+  name that holds other names, such as `a` when `a/b` exists, because the write would
+  replace or drop them all. `rm a/b/c` also removes each map that it leaves empty. `ls`
+  lists every leaf by its path (`a/b/c`), and an empty map by its own name.
 - **Values** are UTF-8 text up to 64 KiB, with no control characters except tab (and
   newline with `--multiline` or `--raw`). They are always stored as strings.
 - **Agents.** When a coding-agent variable is set and not empty (`CLAUDECODE`,

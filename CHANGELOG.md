@@ -51,12 +51,33 @@ All notable changes to this project are recorded here. The format follows
   `format` key into a new config. A flag that does not match the file name exits 3
   before init makes a file.
 - `secrit wire` prints the store's format in the sops-nix stanza (`format = "json";`).
+- Nested names for sops YAML and JSON stores (v0.2 plan S5). A name is a key path:
+  segments joined by `/`, at most 8 segments and 255 bytes, each segment in the v0.1
+  name grammar. `secrit store a/b/c` writes a nested key and creates the missing maps;
+  `get`, `rm` and `ls` take the same path. `rm` removes each map that it leaves empty.
+  `store` refuses (exit 3, before the value) a path through a value that is not a map
+  (T49), and `store` and `rm` refuse a name that holds other names. The copy validation
+  compares the whole tree: only the target changes, and only missing parent maps are new.
+- `secrit wire a/b/c` prints `key = "a/b/c";` in the sops-nix stanza, so sops-nix reads
+  the nested key; the value appears at `/run/secrets/a/b/c`.
+- A store whose backend cannot hold a nested name refuses one with exit 3 (the
+  `nested_names` capability). Both sops formats hold nested names.
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
 
 ### Changed
 
+- `secrit ls` lists the leaves of a nested map by their key paths, not the map's name.
+  A v0.1 store file in which another tool wrote a nested map (`app: {db: ..., key: ...}`)
+  listed `app` before; it now lists `app/db` and `app/key`. `ls --json` changes the same
+  way, and the `doctor` name count and cleartext rows count and name leaves. A file with
+  only top-level names lists the same names as before.
+- The sops name rules (`sops` reserved, the suffix rules) run when `store` checks the
+  store file, after the config loads, not when the name is parsed. `store sops` and
+  `store x_unencrypted` still exit 3 before a value is read. `get` and `rm` no longer
+  refuse such a name by its form: `get sops` and `rm sops` say that it does not exist,
+  and `rm x_unencrypted` removes a cleartext entry of that name.
 - The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
   `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML
   store, so `doctor` passes it there; for a JSON store, `doctor` warns and names the new

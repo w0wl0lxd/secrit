@@ -2,6 +2,7 @@
 //! the format of a sops file, parses it, and checks the copy that sops
 //! wrote.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
@@ -362,47 +363,231 @@ fn stable_meta(meta: &Map<String, Value>) -> Map<String, Value> {
     m
 }
 
-/// PLAN section 8.1, step 9 (the structural part; the readback is separate).
-/// The error is the reason; the caller adds the file and the name.
-pub fn validate(orig: &SopsDoc, copy: &SopsDoc, name: &Name, op: Op<'_>) -> Result<(), String> {
-    let fail = |m: String| Err(m);
-    if !has_recipients(&copy.meta) {
-        return fail("the new file has no recipients".into());
-    }
-    if stable_meta(&orig.meta) != stable_meta(&copy.meta) {
-        return fail("the recipients or the sops settings changed".into());
-    }
-    for (k, v) in &orig.entries {
-        if k != name.as_str() && copy.entries.get(k) != Some(v) {
-            return fail(format!("entry '{}' changed or vanished", escape(k)));
+/// What a key path addresses in the entries of a store file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Slot<'a> {
+    /// The path holds this value.
+    Value(&'a Value),
+    /// The path is not in the file. Every ancestor that is present is a map.
+    Missing,
+    /// The ancestor of the first `depth` segments holds a value that is not
+    /// a map, so the path cannot exist under it.
+    Blocked { depth: usize, kind: &'static str },
+}
+
+/// The value at `path` in `entries`.
+pub fn lookup<'a>(entries: &'a Map<String, Value>, path: &[&str]) -> Slot<'a> {
+    let mut map = entries;
+    for (i, segment) in path.iter().enumerate() {
+        let Some(v) = map.get(*segment) else {
+            return Slot::Missing;
+        };
+        if i + 1 == path.len() {
+            return Slot::Value(v);
+        }
+        match v {
+            Value::Object(m) => map = m,
+            other => {
+                return Slot::Blocked {
+                    depth: i + 1,
+                    kind: kind_of(other),
+                };
+            }
         }
     }
-    if let Some(k) = copy
-        .entries
-        .keys()
-        .find(|k| k.as_str() != name.as_str() && !orig.entries.contains_key(*k))
+    Slot::Missing
+}
+
+/// The kind of a value in messages.
+pub fn kind_of(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        Value::Null => "null",
+        Value::Array(_) => "list",
+        Value::Object(_) => "map",
+    }
+}
+
+/// Whether `v` is a map that holds at least one key: a path with names
+/// under it, not a value.
+pub fn is_branch(v: &Value) -> bool {
+    v.as_object().is_some_and(|m| !m.is_empty())
+}
+
+/// Every leaf of `entries` with its key path, in key order. A leaf is a
+/// value that is not a map, or a map with no keys.
+pub fn leaves(entries: &Map<String, Value>) -> Vec<(Vec<&str>, &Value)> {
+    fn walk<'a>(
+        map: &'a Map<String, Value>,
+        path: &mut Vec<&'a str>,
+        out: &mut Vec<(Vec<&'a str>, &'a Value)>,
+    ) {
+        for (k, v) in map {
+            path.push(k);
+            match v {
+                Value::Object(m) if !m.is_empty() => walk(m, path, out),
+                _ => out.push((path.clone(), v)),
+            }
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(entries, &mut Vec::new(), &mut out);
+    out
+}
+
+/// A key path as a name in messages and in `ls`: its keys joined by `/`.
+pub fn path_text(path: &[&str]) -> String {
+    path.join("/")
+}
+
+/// The names that `ls` prints: the path of every leaf (v0.2 plan 5.4).
+pub fn leaf_names(entries: &Map<String, Value>) -> Vec<String> {
+    let mut names: Vec<String> = leaves(entries).iter().map(|(p, _)| path_text(p)).collect();
+    names.sort();
+    names
+}
+
+/// Put `value` at `path`, and create each missing ancestor as a map.
+/// `Err(depth)` when the ancestor of the first `depth` segments is not a
+/// map; `entries` may then hold new empty maps.
+fn put_at(entries: &mut Map<String, Value>, path: &[&str], value: Value) -> Result<(), usize> {
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(());
+    };
+    let mut map = entries;
+    for (i, segment) in parents.iter().enumerate() {
+        let next = map
+            .entry((*segment).to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        match next {
+            Value::Object(m) => map = m,
+            _ => return Err(i + 1),
+        }
+    }
+    map.insert((*last).to_owned(), value);
+    Ok(())
+}
+
+/// Remove the value at `path`, and every ancestor map that the removal
+/// left empty. `false` when there was no value at `path`.
+fn remove_at(entries: &mut Map<String, Value>, path: &[&str]) -> bool {
+    match path {
+        [] => false,
+        [last] => entries.remove(*last).is_some(),
+        [first, rest @ ..] => {
+            let Some(Value::Object(child)) = entries.get_mut(*first) else {
+                return false;
+            };
+            let removed = remove_at(child, rest);
+            if removed && child.is_empty() {
+                entries.remove(*first);
+            }
+            removed
+        }
+    }
+}
+
+/// The ancestor that a remove of `path` leaves empty and prunes, as its
+/// number of segments: the shallowest one whose maps hold only the path
+/// down to the target (v0.2 plan 6.1.2). `None` when the parent keeps
+/// another key, or for a top-level name.
+pub fn prune_depth(entries: &Map<String, Value>, path: &[&str]) -> Option<usize> {
+    let mut root = None;
+    // From the parent up: an ancestor is left empty when it holds one key,
+    // and that key is the target or an ancestor that is left empty.
+    for depth in (1..path.len()).rev() {
+        match lookup(entries, &path[..depth]) {
+            Slot::Value(Value::Object(m)) if m.len() == 1 => root = Some(depth),
+            _ => break,
+        }
+    }
+    root
+}
+
+/// The first difference of `copy` from `want`, as the reason of a failed
+/// check. Every leaf is compared as parsed: the raw `ENC[...]` strings.
+fn first_difference(want: &Map<String, Value>, copy: &Map<String, Value>) -> Option<String> {
+    let copy_leaves: BTreeMap<Vec<&str>, &Value> = leaves(copy).into_iter().collect();
+    let want_leaves: BTreeMap<Vec<&str>, &Value> = leaves(want).into_iter().collect();
+    let text = |p: &[&str]| escape(&path_text(p)).into_owned();
+    if let Some((p, _)) = want_leaves
+        .iter()
+        .find(|(p, v)| copy_leaves.get(*p) != Some(*v))
     {
-        return fail(format!("an unexpected entry '{}' appeared", escape(k)));
+        return Some(format!("entry '{}' changed or vanished", text(p)));
+    }
+    copy_leaves
+        .keys()
+        .find(|p| !want_leaves.contains_key(*p))
+        .map(|p| format!("an unexpected entry '{}' appeared", text(p)))
+}
+
+/// Whether `v` is the ciphertext of a string that sops wrote.
+fn is_encrypted_string(v: &Value) -> bool {
+    matches!(v, Value::String(s) if s.starts_with("ENC[AES256_GCM,") && s.ends_with(",type:str]"))
+}
+
+/// PLAN section 8.1, step 9, on the tree of v0.2 plan 6.1.2 (the
+/// structural part; the readback is separate). The copy must equal the
+/// original with only the target changed: for a put, the target is an
+/// encrypted string and only its missing ancestors are new maps; for a
+/// remove, the target is gone with the ancestors that it left empty.
+/// Every other leaf is byte-equal. The error is the reason; the caller
+/// adds the file and the name.
+pub fn validate(orig: &SopsDoc, copy: &SopsDoc, name: &Name, op: Op<'_>) -> Result<(), String> {
+    let path: Vec<&str> = name.segments().collect();
+    if !has_recipients(&copy.meta) {
+        return Err("the new file has no recipients".into());
+    }
+    if stable_meta(&orig.meta) != stable_meta(&copy.meta) {
+        return Err("the recipients or the sops settings changed".into());
+    }
+    let ancestor = |depth: usize| escape(&path_text(&path[..depth])).into_owned();
+    let mut want = orig.entries.clone();
+    match op {
+        Op::Put(..) => {
+            if let Slot::Value(v) = lookup(&orig.entries, &path)
+                && is_branch(v)
+            {
+                return Err(format!("'{name}' holds other names in the original file"));
+            }
+            let target = match lookup(&copy.entries, &path) {
+                Slot::Value(v) if is_encrypted_string(v) => v.clone(),
+                _ => return Err(format!("'{name}' is not stored as an encrypted string")),
+            };
+            put_at(&mut want, &path, target).map_err(|depth| {
+                format!("'{}' in the original file is not a map", ancestor(depth))
+            })?;
+        }
+        Op::Remove => {
+            match lookup(&orig.entries, &path) {
+                Slot::Value(v) if !is_branch(v) => {}
+                _ => return Err(format!("'{name}' is not a value in the original file")),
+            }
+            if let Slot::Value(_) = lookup(&copy.entries, &path) {
+                return Err(format!("'{name}' is still present"));
+            }
+            remove_at(&mut want, &path);
+        }
+    }
+    if let Some(reason) = first_difference(&want, &copy.entries) {
+        return Err(reason);
     }
     // No leaf of the new file is cleartext, not even an entry that was
     // cleartext before: secrit never writes such a file (PLAN 8.1, step 9).
-    if let Some((k, _)) = copy.entries.iter().find(|(_, v)| has_plaintext(v)) {
-        return fail(format!("entry '{}' is not encrypted", escape(k)));
+    if let Some((p, _)) = leaves(&copy.entries)
+        .into_iter()
+        .find(|(_, v)| has_plaintext(v))
+    {
+        return Err(format!(
+            "entry '{}' is not encrypted",
+            escape(&path_text(&p))
+        ));
     }
-    match op {
-        Op::Put(..) => match copy.entries.get(name.as_str()) {
-            Some(Value::String(s))
-                if s.starts_with("ENC[AES256_GCM,") && s.ends_with(",type:str]") =>
-            {
-                Ok(())
-            }
-            _ => fail(format!("'{name}' is not stored as an encrypted string")),
-        },
-        Op::Remove if copy.entries.contains_key(name.as_str()) => {
-            fail(format!("'{name}' is still present"))
-        }
-        Op::Remove => Ok(()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -645,6 +830,171 @@ pub(super) mod tests {
         let nested_removed =
             doc(&nested_yaml.replace("a: ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n", ""));
         let reason = validate(&nested, &nested_removed, &a, Op::Remove).unwrap_err();
-        assert!(reason.contains("'x' is not encrypted"), "{reason}");
+        // The reason names the leaf by its key path (v0.2 plan 5.4).
+        assert!(reason.contains("'x/k' is not encrypted"), "{reason}");
+    }
+
+    const ENC: &str = "ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]";
+
+    fn name(s: &str) -> Name {
+        Name::parse(s).unwrap()
+    }
+
+    /// A YAML doc with the entries `body` (indented YAML) on top of the
+    /// metadata of [`BASE`] and no top-level `a`.
+    fn tree(body: &str) -> SopsDoc {
+        let meta = BASE.replace("a: ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n", "");
+        doc(&format!("{body}{meta}"))
+    }
+
+    /// `ls` lists every leaf by its key path, and an empty map too.
+    #[test]
+    fn leaves_are_listed_by_key_path() {
+        let d = tree(&format!(
+            "z: {ENC}\na:\n  b:\n    c: {ENC}\n  d: {ENC}\ne: {{}}\nl: [1]\n"
+        ));
+        assert_eq!(leaf_names(&d.entries), ["a/b/c", "a/d", "e", "l", "z"]);
+    }
+
+    #[test]
+    fn lookup_follows_maps_only() {
+        let d = tree(&format!("a:\n  b: {ENC}\ns: {ENC}\n"));
+        let at = |p: &[&str]| lookup(&d.entries, p);
+        assert!(matches!(at(&["a", "b"]), Slot::Value(Value::String(_))));
+        assert!(matches!(at(&["a"]), Slot::Value(Value::Object(_))));
+        assert_eq!(at(&["a", "x"]), Slot::Missing);
+        assert_eq!(at(&["q", "r"]), Slot::Missing);
+        assert_eq!(
+            at(&["s", "x", "y"]),
+            Slot::Blocked {
+                depth: 1,
+                kind: "string"
+            }
+        );
+        assert_eq!(
+            at(&["a", "b", "c"]),
+            Slot::Blocked {
+                depth: 2,
+                kind: "string"
+            }
+        );
+    }
+
+    /// `rm` prunes the ancestors that it leaves empty, and no other map.
+    #[test]
+    fn the_prune_depth_is_the_shallowest_ancestor_left_empty() {
+        let d = tree(&format!(
+            "a:\n  b:\n    c: {ENC}\nk:\n  l:\n    m: {ENC}\n  n: {ENC}\ntop: {ENC}\n"
+        ));
+        let depth = |p: &[&str]| prune_depth(&d.entries, p);
+        assert_eq!(depth(&["a", "b", "c"]), Some(1));
+        assert_eq!(depth(&["k", "l", "m"]), Some(2));
+        assert_eq!(depth(&["k", "n"]), None);
+        assert_eq!(depth(&["top"]), None);
+    }
+
+    /// v0.2 plan 6.1.2: a nested put may create only the missing ancestors,
+    /// every other leaf stays byte-equal, and a leaf never becomes a map.
+    #[test]
+    fn validate_checks_the_tree_of_a_nested_put() {
+        let v = SecretValue::new(b"v".to_vec());
+        let put = Op::Put(&v, PutMode::CreateOnly);
+        let abc = name("a/b/c");
+        let orig = tree(&format!("z: {ENC}\n"));
+        let good = tree(&format!("z: {ENC}\na:\n  b:\n    c: {ENC}\n"));
+        assert!(validate(&orig, &good, &abc, put).is_ok());
+
+        // Into a map that exists, beside a sibling.
+        let orig_a = tree(&format!("a:\n  d: {ENC}\n"));
+        let good_a = tree(&format!("a:\n  d: {ENC}\n  b:\n    c: {ENC}\n"));
+        assert!(validate(&orig_a, &good_a, &abc, put).is_ok());
+
+        for (copy, want) in [
+            // The sibling changed.
+            (
+                tree(&format!(
+                    "a:\n  d: ENC[AES256_GCM,data:Y,type:str]\n  b:\n    c: {ENC}\n"
+                )),
+                "entry 'a/d' changed or vanished",
+            ),
+            // The sibling vanished.
+            (
+                tree(&format!("a:\n  b:\n    c: {ENC}\n")),
+                "entry 'a/d' changed or vanished",
+            ),
+            // A map appeared beside the target.
+            (
+                tree(&format!(
+                    "a:\n  d: {ENC}\n  b:\n    c: {ENC}\n    x: {{}}\n"
+                )),
+                "an unexpected entry 'a/b/x' appeared",
+            ),
+            // The target is not an encrypted string.
+            (
+                tree(&format!("a:\n  d: {ENC}\n  b:\n    c: plain\n")),
+                "'a/b/c' is not stored as an encrypted string",
+            ),
+            (
+                tree(&format!("a:\n  d: {ENC}\n  b:\n    c:\n      x: {ENC}\n")),
+                "'a/b/c' is not stored as an encrypted string",
+            ),
+        ] {
+            let reason = validate(&orig_a, &copy, &abc, put).unwrap_err();
+            assert!(reason.contains(want), "{want}: {reason}");
+        }
+
+        // T49: sops turns the string `a` into a map; the copy fails.
+        let ab = name("a/b");
+        let orig_s = tree(&format!("a: {ENC}\n"));
+        let turned = tree(&format!("a:\n  b: {ENC}\n"));
+        let reason = validate(&orig_s, &turned, &ab, put).unwrap_err();
+        assert!(
+            reason.contains("'a' in the original file is not a map"),
+            "{reason}"
+        );
+
+        // A put over a name that holds other names fails too.
+        let a = name("a");
+        let flat = tree(&format!("a: {ENC}\n"));
+        let reason = validate(&orig_a, &flat, &a, put).unwrap_err();
+        assert!(reason.contains("holds other names"), "{reason}");
+    }
+
+    /// v0.2 plan 6.1.2: a nested remove drops the target and the ancestors
+    /// that it left empty, and nothing else.
+    #[test]
+    fn validate_checks_the_tree_of_a_nested_remove() {
+        let abc = name("a/b/c");
+        let orig = tree(&format!("a:\n  b:\n    c: {ENC}\nz: {ENC}\n"));
+        let pruned = tree(&format!("z: {ENC}\n"));
+        assert!(validate(&orig, &pruned, &abc, Op::Remove).is_ok());
+        let unpruned = tree(&format!("a:\n  b: {{}}\nz: {ENC}\n"));
+        let reason = validate(&orig, &unpruned, &abc, Op::Remove).unwrap_err();
+        assert!(reason.contains("unexpected entry 'a/b'"), "{reason}");
+        let still = validate(&orig, &orig, &abc, Op::Remove).unwrap_err();
+        assert!(still.contains("'a/b/c' is still present"), "{still}");
+
+        // A sibling keeps its parent.
+        let orig_d = tree(&format!("a:\n  b:\n    c: {ENC}\n  d: {ENC}\n"));
+        let kept = tree(&format!("a:\n  d: {ENC}\n"));
+        assert!(validate(&orig_d, &kept, &abc, Op::Remove).is_ok());
+        let too_much = tree("x: ''\n");
+        let reason = validate(&orig_d, &too_much, &abc, Op::Remove).unwrap_err();
+        assert!(
+            reason.contains("entry 'a/d' changed or vanished"),
+            "{reason}"
+        );
+
+        // An empty map that was there before stays.
+        let orig_e = tree(&format!("a:\n  b:\n    c: {ENC}\n  e: {{}}\n"));
+        let kept_e = tree("a:\n  e: {}\n");
+        assert!(validate(&orig_e, &kept_e, &abc, Op::Remove).is_ok());
+        let lost_e = tree("z: ''\n");
+        assert!(validate(&orig_e, &lost_e, &abc, Op::Remove).is_err());
+
+        // A remove of a name that holds other names fails.
+        let a = name("a");
+        let reason = validate(&orig, &pruned, &a, Op::Remove).unwrap_err();
+        assert!(reason.contains("is not a value"), "{reason}");
     }
 }

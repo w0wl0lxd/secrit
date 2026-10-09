@@ -218,3 +218,232 @@ fn init_format_json_creates_a_json_store() {
     assert!(stderr(&out).contains(".yaml"), "{}", stderr(&out));
     assert!(!file.exists() && !config.exists() && !key.exists());
 }
+
+/// The value at the key path `path` of the decrypted store, or `None`.
+fn nested(env: &TestEnv, path: &[&str]) -> Option<Value> {
+    let mut v = Value::Object(env.decrypt());
+    for key in path {
+        v = v.as_object()?.get(*key)?.clone();
+    }
+    Some(v)
+}
+
+/// `sops decrypt --extract` of the key path `expr` in the test process,
+/// with the store's own input type: what sops-nix does for a nested key
+/// (v0.2 plan S5 acceptance). Never printed.
+fn sops_extract(env: &TestEnv, expr: &str) -> Vec<u8> {
+    let out = env
+        .sops_cmd()
+        .args(["decrypt", "--input-type", env.format, "--extract", expr])
+        .arg(&env.store_file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "sops --extract {expr} failed");
+    out.stdout
+}
+
+/// `get NAME --stdout` into a private file under `script`, so agent
+/// detection sees a terminal. The name and the paths reach the shell as
+/// variables.
+fn get_stdout(env: &TestEnv, name: &str) -> (std::process::Output, Vec<u8>) {
+    let dest = env.root.path().join("get.out");
+    let _ = std::fs::remove_file(&dest);
+    let bin = std::ffi::OsStr::new(common::BIN);
+    let envs = [
+        ("GET_BIN", bin),
+        ("GET_NAME", std::ffi::OsStr::new(name)),
+        ("GET_OUT", dest.as_os_str()),
+    ];
+    let inner = "umask 077; exec \"$GET_BIN\" get \"$GET_NAME\" --stdout > \"$GET_OUT\"";
+    let out = env.under_script_env(inner, &envs);
+    (out, std::fs::read(&dest).unwrap_or_default())
+}
+
+/// v0.2 plan S5 on one format: `store a/b/c` writes a nested key that
+/// `ls` lists as `a/b/c`, `get` reads back, and sops `--extract` with
+/// `["a"]["b"]["c"]` decrypts, as sops-nix does.
+fn nested_names_round_trip_on(env: &TestEnv) {
+    for (name, value) in [("a/b/c", "v-abc"), ("a/d", "v-ad"), ("top", "v-top")] {
+        let out = env.store_value(name, value.as_bytes());
+        assert_eq!(code(&out), 0, "{name}: {}", stderr(&out));
+        assert!(stderr(&out).contains(&format!("stored {name} in main")));
+    }
+    assert_eq!(env.ls(), ["a/b/c", "a/d", "top"]);
+    let json = env.run(["ls", "--json"], None);
+    assert_eq!(
+        String::from_utf8(json.stdout).unwrap().trim(),
+        r#"["a/b/c","a/d","top"]"#
+    );
+    assert!(
+        nested(env, &["a", "b", "c"]) == Some(Value::String("v-abc".into())),
+        "a/b/c is not a nested string"
+    );
+    assert_eq!(sops_extract(env, r#"["a"]["b"]["c"]"#), b"v-abc");
+    assert_eq!(sops_extract(env, r#"["a"]["d"]"#), b"v-ad");
+
+    let (out, got) = get_stdout(env, "a/b/c");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(got == b"v-abc", "get --stdout bytes differ");
+
+    // Create-only and replace work on a nested name.
+    let out = env.store_value("a/b/c", b"other");
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("'a/b/c' already exists"),
+        "{}",
+        stderr(&out)
+    );
+    let out = env.run(["store", "a/b/c", "--replace"], Some(b"v-abc2"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(sops_extract(env, r#"["a"]["b"]["c"]"#), b"v-abc2");
+    assert_eq!(sops_extract(env, r#"["a"]["d"]"#), b"v-ad");
+}
+
+#[test]
+fn nested_names_round_trip() {
+    nested_names_round_trip_on(SopsFixture::new().env());
+}
+
+/// The same on a JSON store, which stays strict JSON.
+#[test]
+fn nested_names_round_trip_json() {
+    let f = SopsJsonFixture::new();
+    nested_names_round_trip_on(f.env());
+    json_object(&f.env().store_file);
+}
+
+/// T49 (v0.2 plan 6.1.2): `store a/b` when `a` holds a string exits 3
+/// before it reads a value, and the file is unchanged. sops itself would
+/// turn `a` into a map (S5 lab). A name that holds other names is refused
+/// for `store --replace` and `rm` too.
+#[test]
+fn a_nested_store_never_turns_a_value_into_a_map() {
+    let yaml = SopsFixture::new();
+    let json = SopsJsonFixture::new();
+    for env in [yaml.env(), json.env()] {
+        assert_eq!(code(&env.store_value("a", b"leaf")), 0);
+        assert_eq!(code(&env.store_value("m/n", b"inner")), 0);
+        let before = env.store_bytes();
+        for args in [
+            &["store", "a/b"][..],
+            &["store", "a/b/c", "--replace"],
+            &["store", "m", "--replace"],
+            &["store", "m"],
+            &["rm", "m", "--yes"],
+        ] {
+            let out = env.run(args, Some(b"canary-49"));
+            assert_eq!(code(&out), 3, "{args:?}: {}", stderr(&out));
+            common::assert_absent(&out, "canary-49");
+            assert_eq!(env.store_bytes(), before, "{args:?} changed the file");
+        }
+        let out = env.store_value("a/b", b"v");
+        assert!(
+            stderr(&out).contains("'a' holds a string, not a map"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(env.ls(), ["a", "m/n"]);
+        env.assert_value("a", "leaf");
+        assert_eq!(env.backups(), Vec::<std::path::PathBuf>::new());
+    }
+}
+
+/// v0.2 plan 6.1.2: `rm a/b/c` removes the key and prunes the maps that
+/// it left empty, with a second `unset` on the same copy; a map that
+/// keeps another key stays.
+#[test]
+fn rm_of_a_nested_name_prunes_empty_maps() {
+    let yaml = SopsFixture::new();
+    let json = SopsJsonFixture::new();
+    for env in [yaml.env(), json.env()] {
+        for (name, value) in [("a/b/c", "1"), ("x/y/z", "2"), ("x/w", "3")] {
+            assert_eq!(code(&env.store_value(name, value.as_bytes())), 0, "{name}");
+        }
+        let out = env.run(["rm", "a/b/c", "--yes"], None);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert!(stderr(&out).contains("removed a/b/c"));
+        assert_eq!(nested(env, &["a"]), None, "the empty maps a and a/b stay");
+        let out = env.run(["rm", "x/y/z", "--yes"], None);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(nested(env, &["x", "y"]), None, "the empty map x/y stays");
+        assert_eq!(nested(env, &["x", "w"]), Some(Value::String("3".into())));
+        assert_eq!(env.ls(), ["x/w"]);
+        let out = env.run(["rm", "x/w", "--yes"], None);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert_eq!(env.ls(), Vec::<String>::new());
+        assert_eq!(env.decrypt().len(), 0, "a map stayed in the file");
+        assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
+        if env.format == "json" {
+            json_object(&env.store_file);
+        }
+    }
+}
+
+/// `wire a/b/c` names the key path in the sops-nix stanza, and `--format
+/// env` maps `/` to `_`.
+#[test]
+fn wire_prints_the_key_of_a_nested_name() {
+    let f = SopsFixture::new();
+    let env = f.env();
+    assert_eq!(code(&env.store_value("a/b/c", b"v")), 0);
+    let out = env.run(["wire", "a/b/c", "--owner", "u"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(text.starts_with("sops.secrets.\"a/b/c\" = {\n"), "{text}");
+    assert!(text.contains("  key = \"a/b/c\";\n"), "{text}");
+    assert!(
+        !stderr(&out).contains("not in the store yet"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = env.run(["wire", "a/b/c", "--format", "env"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "A_B_C_FILE=/run/secrets/a/b/c\n"
+    );
+    let out = env.run(["wire", "top", "--owner", "u"], None);
+    assert!(!String::from_utf8(out.stdout).unwrap().contains("key ="));
+}
+
+/// v0.2 plan S5 risk: a v0.1 file that another tool wrote with a nested
+/// map now lists its leaves, not the map's name. A leaf is a name that
+/// `get` reads and `rm` removes.
+#[test]
+fn ls_lists_the_leaves_of_a_nested_map() {
+    let f = SopsFixture::new();
+    let env = f.env();
+    env.create_store_with(
+        &env.store_file,
+        &[],
+        br#"{"svc": {"db": {"pass": "p1"}, "key": "k1"}, "flat": "f1"}"#,
+    );
+    assert_eq!(env.ls(), ["flat", "svc/db/pass", "svc/key"]);
+    let (out, got) = get_stdout(env, "svc/db/pass");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(got == b"p1", "get --stdout bytes differ");
+    let (out, got) = get_stdout(env, "svc");
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("holds a map"));
+    assert!(got.is_empty());
+    let out = env.run(["rm", "svc/db/pass", "--yes"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(env.ls(), ["flat", "svc/key"]);
+}
+
+/// The name grammar of v0.2 plan 5.4 at the command line: each segment
+/// follows the v0.1 grammar, and the refusal comes before any input.
+#[test]
+fn bad_key_paths_are_refused() {
+    let f = SopsFixture::new();
+    let env = f.env();
+    let nine = ["s"; 9].join("/");
+    for name in ["a//b", "/a", "a/", "a/.b", "a/b c", nine.as_str(), "sops/x"] {
+        let out = env.store_value(name, b"canary-54");
+        assert_eq!(code(&out), 3, "{name}: {}", stderr(&out));
+        common::assert_absent(&out, "canary-54");
+    }
+    assert_eq!(code(&env.store_value("app/sops", b"v")), 0);
+    assert_eq!(env.ls(), ["app/sops"]);
+}

@@ -505,15 +505,24 @@ pub enum PutMode { CreateOnly, Replace }
 
 ### 7.3 Names
 
-- Regex: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. This keeps quotes and brackets out of the sops
-  path expression `["NAME"]`, so a name cannot address a nested key.
-- Refuse `sops` (reserved by the file format).
-- Refuse names that end with `_unencrypted`. The file rules come from the store file's own
-  sops metadata, which `sops set` applies, not from `.sops.yaml`: refuse a name that ends
-  with its `unencrypted_suffix`, or that does not end with its `encrypted_suffix` when one is
-  set. sops would store such a value in cleartext. secrit v0.1 does not write a file whose
-  metadata sets `unencrypted_regex` or `encrypted_regex`. `store` checks these rules before
-  it reads the value, and the write protocol checks them again under the lock.
+v0.2 changes this section: a name is a key path (v0.2 plan 5.4, slice S5).
+
+- A name is one or more segments joined by `/`, at most 8 segments and 255 bytes. Each
+  segment matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. This keeps quotes and brackets out
+  of the sops path expression `["a"]["b"]`, so a segment cannot address another key. A
+  one-segment name is a v0.1 name.
+- The store format's own rules run in the backend's `check_put`, after the config loads.
+  For sops: refuse `sops` as the first segment (the reserved metadata key); `app/sops` is
+  a name.
+- Refuse a name with a segment that ends with `_unencrypted`. The file rules come from the
+  store file's own sops metadata, which `sops set` applies, not from `.sops.yaml`: refuse
+  a name with a segment that ends with its `unencrypted_suffix`, or with no segment that
+  ends with its `encrypted_suffix` when one is set. sops tests each key on the path
+  (sops 3.13.3), and would store such a value in cleartext. secrit does not write a file
+  whose metadata sets `unencrypted_regex` or `encrypted_regex`. `store` checks these rules
+  before it reads the value, and the write protocol checks them again under the lock.
+- A path through a value that is not a map, and a name that holds other names, are
+  refused before the value (v0.2 plan T49).
 
 ## 8. Write, read and output rules
 

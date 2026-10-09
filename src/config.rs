@@ -50,6 +50,12 @@ pub enum ConfigError {
     ZeroTimeout,
     #[error("store {0} does not use the sops backend")]
     NotSops(String),
+    #[error("config key {key} is required for backend {backend}")]
+    MissingKey { key: String, backend: &'static str },
+    #[error("config key {key} does not apply to backend {backend}")]
+    KeyNotForBackend { key: String, backend: &'static str },
+    #[error("config key {key} must not be empty")]
+    Empty { key: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,9 +82,11 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawStore {
     backend: BackendKind,
-    file: String,
+    file: Option<String>,
     sops_config: Option<String>,
     age_key_file: Option<String>,
+    collection: Option<String>,
+    unlock: Option<Unlock>,
     #[serde(default)]
     wire_hint: bool,
 }
@@ -115,7 +123,36 @@ impl Default for RawLock {
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Sops,
+    SecretService,
 }
+
+impl BackendKind {
+    /// The name that the config and `init --backend` use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Sops => "sops",
+            BackendKind::SecretService => "secret-service",
+        }
+    }
+}
+
+/// What a Secret Service store does with a locked collection (v0.2 plan
+/// 6.3, Q30).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unlock {
+    /// Refuse with "locked" (the default): a GUI prompt from a CLI is a
+    /// surprise, and it can hang a headless session.
+    #[default]
+    Refuse,
+    /// Ask the daemon to unlock, which may open a GUI prompt. Only when no
+    /// agent is detected.
+    Prompt,
+}
+
+/// The collection of a Secret Service store when the config names none.
+pub const DEFAULT_COLLECTION: &str = "default";
 
 /// One store of the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,13 +165,10 @@ pub struct StoreConfig {
 impl StoreConfig {
     /// The sops settings, or `None` for a store of another backend.
     #[must_use]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "None once a second backend exists (v0.2 plan 5.1)"
-    )]
     pub fn sops(&self) -> Option<&SopsStore> {
         match &self.backend {
             BackendConfig::Sops(sops) => Some(sops),
+            BackendConfig::SecretService(_) => None,
         }
     }
 
@@ -149,6 +183,25 @@ impl StoreConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
     Sops(SopsStore),
+    SecretService(SecretServiceStore),
+}
+
+impl BackendConfig {
+    #[must_use]
+    pub fn kind(&self) -> BackendKind {
+        match self {
+            BackendConfig::Sops(_) => BackendKind::Sops,
+            BackendConfig::SecretService(_) => BackendKind::SecretService,
+        }
+    }
+}
+
+/// The settings of a Secret Service store (v0.2 plan 5.8, 6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretServiceStore {
+    /// An alias such as "default", or an object path that starts with '/'.
+    pub collection: String,
+    pub unlock: Unlock,
 }
 
 /// The settings of a sops store.
@@ -260,20 +313,7 @@ impl Config {
         }
         let mut stores = BTreeMap::new();
         for (name, s) in raw.stores {
-            let key = |k: &str| format!("stores.{name}.{k}");
-            let backend = match s.backend {
-                BackendKind::Sops => BackendConfig::Sops(SopsStore {
-                    file: expand(&s.file, home, &key("file"))?,
-                    sops_config: s
-                        .sops_config
-                        .map(|v| expand(&v, home, &key("sops_config")))
-                        .transpose()?,
-                    age_key_file: s
-                        .age_key_file
-                        .map(|v| expand(&v, home, &key("age_key_file")))
-                        .transpose()?,
-                }),
-            };
+            let backend = store_backend(&name, &s, home)?;
             let store = StoreConfig {
                 name: name.clone(),
                 wire_hint: s.wire_hint,
@@ -320,6 +360,64 @@ impl Config {
         self.stores
             .get(name)
             .ok_or_else(|| ConfigError::UnknownStore(name.to_owned()))
+    }
+}
+
+/// Turn one store table into its backend's settings. A key that only
+/// another backend takes is an error, as an unknown key is.
+fn store_backend(name: &str, s: &RawStore, home: &Path) -> Result<BackendConfig, ConfigError> {
+    let key = |k: &str| format!("stores.{name}.{k}");
+    let backend = s.backend.as_str();
+    let refuse = |k: &str, present: bool| {
+        if present {
+            Err(ConfigError::KeyNotForBackend {
+                key: key(k),
+                backend,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    match s.backend {
+        BackendKind::Sops => {
+            refuse("collection", s.collection.is_some())?;
+            refuse("unlock", s.unlock.is_some())?;
+            let file = s.file.as_deref().ok_or_else(|| ConfigError::MissingKey {
+                key: key("file"),
+                backend,
+            })?;
+            Ok(BackendConfig::Sops(SopsStore {
+                file: expand(file, home, &key("file"))?,
+                sops_config: s
+                    .sops_config
+                    .as_deref()
+                    .map(|v| expand(v, home, &key("sops_config")))
+                    .transpose()?,
+                age_key_file: s
+                    .age_key_file
+                    .as_deref()
+                    .map(|v| expand(v, home, &key("age_key_file")))
+                    .transpose()?,
+            }))
+        }
+        BackendKind::SecretService => {
+            refuse("file", s.file.is_some())?;
+            refuse("sops_config", s.sops_config.is_some())?;
+            refuse("age_key_file", s.age_key_file.is_some())?;
+            let collection = s
+                .collection
+                .clone()
+                .unwrap_or_else(|| DEFAULT_COLLECTION.to_owned());
+            if collection.is_empty() {
+                return Err(ConfigError::Empty {
+                    key: key("collection"),
+                });
+            }
+            Ok(BackendConfig::SecretService(SecretServiceStore {
+                collection,
+                unlock: s.unlock.unwrap_or_default(),
+            }))
+        }
     }
 }
 
@@ -564,7 +662,7 @@ timeout_secs = 5
         let e = parse(&format!("{head}file = \"/s.yaml\"\nfiel = \"/x\"\n")).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `wire_hint`"
+            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `collection`, `unlock`, `wire_hint`"
         );
         let e = parse(&format!("{head}file = 5\n")).unwrap_err();
         assert_eq!(
@@ -581,7 +679,10 @@ timeout_secs = 5
     /// Each backend refuses the keys that it does not take (v0.2 plan 5.8).
     #[test]
     fn each_backend_refuses_unknown_keys() {
-        for (backend, keys) in [("sops", "file = \"/s.yaml\"\n")] {
+        for (backend, keys) in [
+            ("sops", "file = \"/s.yaml\"\n"),
+            ("secret-service", "collection = \"default\"\n"),
+        ] {
             let good = format!("[stores.a]\nbackend = \"{backend}\"\n{keys}");
             assert!(parse(&good).is_ok(), "{good}");
             for typo in [
@@ -595,6 +696,70 @@ timeout_secs = 5
                 assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
             }
         }
+    }
+
+    /// v0.2 plan 5.8: a Secret Service store takes `collection` and
+    /// `unlock`, with the defaults "default" and "refuse".
+    #[test]
+    fn a_secret_service_store_parses_with_defaults() {
+        let c = parse("[stores.desk]\nbackend = \"secret-service\"\n").unwrap();
+        let s = c.store(Some("desk")).unwrap();
+        assert_eq!(
+            s.backend,
+            BackendConfig::SecretService(SecretServiceStore {
+                collection: "default".into(),
+                unlock: Unlock::Refuse,
+            })
+        );
+        assert_eq!(s.backend.kind(), BackendKind::SecretService);
+        assert!(s.sops().is_none());
+        assert!(matches!(s.require_sops(), Err(ConfigError::NotSops(_))));
+
+        let t = "[stores.desk]\nbackend = \"secret-service\"\ncollection = \"/org/freedesktop/secrets/collection/x\"\nunlock = \"prompt\"\nwire_hint = true\n";
+        let c = parse(t).unwrap();
+        let s = c.store(Some("desk")).unwrap();
+        assert!(s.wire_hint);
+        assert_eq!(
+            s.backend,
+            BackendConfig::SecretService(SecretServiceStore {
+                collection: "/org/freedesktop/secrets/collection/x".into(),
+                unlock: Unlock::Prompt,
+            })
+        );
+        let bad = "[stores.desk]\nbackend = \"secret-service\"\nunlock = \"ask\"\n";
+        assert!(matches!(parse(bad), Err(ConfigError::Parse { .. })));
+        let empty = "[stores.desk]\nbackend = \"secret-service\"\ncollection = \"\"\n";
+        assert_eq!(
+            parse(empty).unwrap_err().to_string(),
+            "config key stores.desk.collection must not be empty"
+        );
+    }
+
+    /// A key that only another backend takes is an error, and sops needs
+    /// its file.
+    #[test]
+    fn a_key_of_another_backend_is_an_error() {
+        let ss = "[stores.a]\nbackend = \"secret-service\"\n";
+        for key in ["file", "sops_config", "age_key_file"] {
+            let e = parse(&format!("{ss}{key} = \"/x\"\n")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("config key stores.a.{key} does not apply to backend secret-service")
+            );
+        }
+        let sops = "[stores.a]\nbackend = \"sops\"\nfile = \"/s.yaml\"\n";
+        for line in ["collection = \"default\"", "unlock = \"prompt\""] {
+            let e = parse(&format!("{sops}{line}\n")).unwrap_err();
+            assert!(
+                e.to_string().ends_with("does not apply to backend sops"),
+                "{e}"
+            );
+        }
+        let e = parse("[stores.a]\nbackend = \"sops\"\n").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "config key stores.a.file is required for backend sops"
+        );
     }
 
     #[test]

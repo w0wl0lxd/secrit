@@ -6,11 +6,28 @@ use crate::error::Error;
 use crate::name::Name;
 use crate::tty::{self, LineEnd, ReadError};
 
+/// What `store --replace` and `rm` print when the backend keeps no backup
+/// (v0.2 plan 5.2, T55).
+pub const NO_BACKUP: &str = "no backup; the old value is gone";
+
 pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     ctx.backend.check_remove(name)?;
-    if !yes {
-        let question = format!("remove {name} from {}? [y/N] ", ctx.backend.location());
-        if !confirm(&question)? {
+    let backups = ctx.backend.capabilities().backups;
+    let note = if backups {
+        String::new()
+    } else {
+        format!(" {NO_BACKUP}.")
+    };
+    if yes {
+        if !backups {
+            ctx.status(NO_BACKUP);
+        }
+    } else {
+        let question = format!(
+            "remove {name} from {}?{note} [y/N] ",
+            ctx.backend.location()
+        );
+        if !confirm(&question, "remove")? {
             return Err(Error::Failed("not removed".into()));
         }
     }
@@ -18,19 +35,26 @@ pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     if let Some(b) = &report.backup {
         ctx.status(&format!("backup of the old file: {}", escape_path(b)));
     }
-    ctx.status(&format!(
-        "removed {name}. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked."
-    ));
+    if backups {
+        ctx.status(&format!(
+            "removed {name}. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked."
+        ));
+    } else {
+        ctx.status(&format!(
+            "removed {name}. secrit kept no backup, but the daemon may keep the old value in its own files; rotate it at its source if it leaked."
+        ));
+    }
     Ok(())
 }
 
 /// Ask on `/dev/tty`. With no terminal, refuse: `--yes` is the only way.
-/// The read polls the signal flag, so INT or TERM exits 130 (R13).
-fn confirm(question: &str) -> Result<bool, Error> {
+/// `verb` names the action in that refusal. The read polls the signal flag,
+/// so INT or TERM exits 130 (R13).
+pub fn confirm(question: &str, verb: &str) -> Result<bool, Error> {
     let Ok(tty) = tty::open() else {
-        return Err(Error::Refused(
-            "no terminal to confirm on; pass --yes to remove without asking".into(),
-        ));
+        return Err(Error::Refused(format!(
+            "no terminal to confirm on; pass --yes to {verb} without asking"
+        )));
     };
     let io = |e: std::io::Error| Error::Failed(format!("could not ask on the terminal: {e}"));
     tty::say(&tty, question).map_err(io)?;

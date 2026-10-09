@@ -70,6 +70,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
         Command::Store {
             name,
             replace,
+            yes,
             multiline,
             raw,
             extra,
@@ -77,6 +78,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             let args = StoreArgs {
                 name,
                 replace,
+                yes,
                 multiline,
                 raw,
                 extra,
@@ -96,6 +98,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             cmd::rm::run(&ctx()?, &name, yes)
         }
         Command::Init {
+            backend,
             sops_file,
             sops_config,
             age_key,
@@ -106,6 +109,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             store.as_deref(),
             quiet,
             &cmd::init::InitArgs {
+                backend,
                 sops_file,
                 sops_config,
                 age_key,

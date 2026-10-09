@@ -150,10 +150,16 @@ pub fn parse_name(s: &str) -> Result<Name, Error> {
 }
 
 /// The arguments to `store`, after clap.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent flag of the command line"
+)]
 #[derive(Debug)]
 pub struct StoreArgs {
     pub name: String,
     pub replace: bool,
+    /// Skip the no-backup confirmation of `--replace` (T55).
+    pub yes: bool,
     pub multiline: bool,
     pub raw: bool,
     pub extra: Vec<OsString>,

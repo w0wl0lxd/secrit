@@ -262,7 +262,8 @@ impl Dirs {
 pub struct TestEnv {
     dirs: Dirs,
     /// The sops format of the store file: `yaml` (`main.yaml`), `json`
-    /// (`main.json`) or `dotenv` (`main.env`). The config names no
+    /// (`main.json`), `dotenv` (`main.env`) or `ini` (`main.ini`). The
+    /// config names no
     /// `format`, so secrit takes it from the file name.
     pub format: &'static str,
     pub store_dir: PathBuf,
@@ -305,8 +306,8 @@ impl TestEnv {
         Self::with_format("yaml")
     }
 
-    /// A [`TestEnv`] whose store file is sops `format` (`yaml`, `json` or
-    /// `dotenv`).
+    /// A [`TestEnv`] whose store file is sops `format` (`yaml`, `json`,
+    /// `dotenv` or `ini`).
     pub fn with_format(format: &'static str) -> Self {
         let sops = tool("SECRIT_TEST_SOPS", "sops");
         let age_keygen = tool("SECRIT_TEST_AGE_KEYGEN", "age-keygen");
@@ -469,6 +470,44 @@ impl TestEnv {
         }
     }
 
+    /// The decrypted value at the name `name`, where each `/` goes one
+    /// map down; `None` when the store has no such key path.
+    pub fn decrypt_at(&self, name: &str) -> Option<Value> {
+        let mut v = Value::Object(self.decrypt());
+        for key in name.split('/') {
+            v = v.as_object_mut()?.remove(key)?;
+        }
+        Some(v)
+    }
+
+    /// The names of the decrypted store, sorted: one for each value that
+    /// is not a map, with `/` between the keys of its path, and one for
+    /// each empty map. sops shows a `DEFAULT` section for every INI file;
+    /// an empty one is not listed.
+    pub fn decrypt_names(&self) -> Vec<String> {
+        fn walk(prefix: &str, map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+            for (k, v) in map {
+                let name = format!("{prefix}{k}");
+                match v {
+                    Value::Object(m) if !m.is_empty() => walk(&format!("{name}/"), m, out),
+                    _ => out.push(name),
+                }
+            }
+        }
+        let mut all = self.decrypt();
+        if all
+            .get("DEFAULT")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            all.remove("DEFAULT");
+        }
+        let mut names = Vec::new();
+        walk("", &all, &mut names);
+        names.sort();
+        names
+    }
+
     /// Assert that `name` decrypts to the string `want`, without printing it.
     pub fn assert_value(&self, name: &str, want: &str) {
         let all = self.decrypt();
@@ -590,7 +629,7 @@ pub fn format_ext(format: &str) -> &str {
 
 pub fn write_sops_config(path: &Path, recipients: &[String]) {
     let text = format!(
-        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json|env)$\n    age: {}\n",
+        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json|env|ini)$\n    age: {}\n",
         recipients.join(",")
     );
     std::fs::write(path, text).unwrap();

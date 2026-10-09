@@ -42,13 +42,7 @@ impl std::ops::Deref for PassFixture {
 
 impl Drop for PassFixture {
     fn drop(&mut self) {
-        let _ = Command::new(self.gpgconf())
-            .env_clear()
-            .env("GNUPGHOME", &self.gnupg_home)
-            .args(["--kill", "all"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = self.stop_daemons();
     }
 }
 
@@ -206,6 +200,19 @@ impl PassFixture {
         )
         .unwrap();
         self.kill_agent();
+    }
+
+    /// Stop every gpg daemon of the fixture's `GNUPGHOME` (gpg-agent,
+    /// keyboxd, dirmngr). Returns whether `gpgconf --kill all` worked.
+    pub fn stop_daemons(&self) -> bool {
+        Command::new(self.gpgconf())
+            .env_clear()
+            .env("GNUPGHOME", &self.gnupg_home)
+            .args(["--kill", "all"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success())
     }
 
     pub fn kill_agent(&self) {

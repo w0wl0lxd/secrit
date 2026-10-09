@@ -493,6 +493,65 @@ fn a_gpg_id_change_during_the_prompt_is_resolved_again() {
     assert_eq!(f.packet_ids(&f.entry("n")), b.enc_ids);
 }
 
+/// The live processes whose command line names `path`.
+#[cfg(target_os = "linux")]
+fn processes_naming(path: &Path) -> Vec<String> {
+    let want = path.as_os_str().as_encoded_bytes();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|c| c.is_ascii_digit())
+        })
+        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+        .filter(|cmd| cmd.split(|c| *c == 0).any(|arg| arg == want))
+        .map(|cmd| String::from_utf8_lossy(&cmd).replace('\0', " "))
+        .collect()
+}
+
+/// Wait at most 10 s until no process names `path`.
+#[cfg(target_os = "linux")]
+fn wait_no_process_naming(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = processes_naming(path);
+        if left.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "daemons still run: {left:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The fixture stops every gpg daemon of its `GNUPGHOME` (gpg-agent,
+/// keyboxd, dirmngr) when it is dropped, so the suite leaves none running.
+/// The stop is checked while `GNUPGHOME` still exists, because gpg-agent
+/// also stops by itself when its directory is removed.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_fixture_stops_its_gpg_daemons() {
+    let f = PassFixture::new();
+    assert_eq!(code(&f.store_value("n", b"v")), 0);
+    assert!(get(&f, "n") == b"v", "value differs");
+    let home = f.gnupg_home.clone();
+    assert!(
+        !processes_naming(&home).is_empty(),
+        "no gpg daemon ran, so this test checks nothing"
+    );
+    assert!(f.stop_daemons(), "gpgconf --kill all failed");
+    wait_no_process_naming(&home);
+    assert!(home.is_dir());
+
+    // A daemon that starts again stops when the fixture is dropped.
+    assert!(get(&f, "n") == b"v", "value differs");
+    assert!(!processes_naming(&home).is_empty(), "no gpg daemon ran");
+    drop(f);
+    wait_no_process_naming(&home);
+}
+
 /// gpg runs with a cleared environment: `GNUPGHOME` only, no `HOME` and
 /// no `GPG_TTY`.
 #[test]

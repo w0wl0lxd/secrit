@@ -563,3 +563,55 @@ fn concurrent_raw_change_is_retried() {
     assert_eq!(env.ls(), ["raw", "slow"]);
     assert_eq!(env.wait_for_hook(2), ["after-sops", "after-sops"]);
 }
+
+/// The Q19 refusal text (PLAN-v0.2 4.1).
+const NO_TTY_REFUSAL: &str = "refused: no terminal to confirm on. CI or a remote job: use 'secrit seal'. A scheduled job: run it as its own system service. Over ssh: use ssh -t.";
+
+/// T27, Q19: with no terminal, `store` and `rm --yes` are refused with or
+/// without an agent variable, and the store is byte-identical.
+#[test]
+fn writes_are_refused_without_a_terminal() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"v")), 0);
+    let before = env.store_bytes();
+    for agent in [false, true] {
+        let mut base = env.gate_cmd();
+        if agent {
+            base.env("CLAUDECODE", "1");
+        }
+        let out = run_cmd(common::no_tty(&base), ["store", "m"], Some(b"v"));
+        assert_eq!(code(&out), 3, "{}", stderr(&out));
+        assert!(stderr(&out).contains(NO_TTY_REFUSAL), "{}", stderr(&out));
+        let out = run_cmd(common::no_tty(&base), ["rm", "n", "--yes"], None);
+        assert_eq!(code(&out), 3, "{}", stderr(&out));
+        assert!(stderr(&out).contains(NO_TTY_REFUSAL), "{}", stderr(&out));
+        assert_eq!(env.store_bytes(), before);
+    }
+}
+
+/// The twin of `rm_of_a_missing_name_fails_and_needs_yes_without_tty` with
+/// the gate in force: the Q19 text replaces the `--yes` hint.
+#[test]
+fn rm_without_tty_is_refused_with_the_q19_message() {
+    let env = TestEnv::new();
+    assert_eq!(code(&env.store_value("n", b"v")), 0);
+    let out = run_cmd(common::no_tty(&env.gate_cmd()), ["rm", "n"], None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains(NO_TTY_REFUSAL), "{}", stderr(&out));
+    assert!(!stderr(&out).contains("pass --yes"), "{}", stderr(&out));
+    assert_eq!(env.ls(), ["n"]);
+}
+
+/// T54: `--version` names the `test-hooks` feature when it is compiled in.
+#[test]
+fn version_names_the_test_hooks_feature() {
+    let env = TestEnv::new();
+    let out = env.run(["--version"], None);
+    assert_eq!(code(&out), 0);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        text.contains("test-hooks"),
+        cfg!(feature = "test-hooks"),
+        "{text}"
+    );
+}

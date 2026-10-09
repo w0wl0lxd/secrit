@@ -78,7 +78,7 @@ pub enum Command {
     Rm {
         /// The secret name
         name: String,
-        /// Do not ask for confirmation
+        /// Do not ask y/N; under an agent the name must still be typed on the terminal
         #[arg(long)]
         yes: bool,
     },

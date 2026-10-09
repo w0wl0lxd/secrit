@@ -5,6 +5,9 @@
 //! - `SECRIT_TEST_HOOK=step=action[,step=action]`: see [`hook`].
 //! - `SECRIT_TEST_CHILD_TIMEOUT_MS`: a shorter child timeout, see
 //!   [`child_timeout`].
+//! - `SECRIT_TEST_GATE=allow`: open the write gate, see [`gate_open`].
+//! - `SECRIT_TEST_ANCESTOR_STOP=PID`: end the ancestor walk, see
+//!   [`ancestor_stop`].
 
 use std::time::Duration;
 
@@ -80,3 +83,40 @@ pub fn child_timeout() -> Option<Duration> {
 pub fn child_timeout() -> Option<Duration> {
     None
 }
+
+/// Whether `SECRIT_TEST_GATE=allow` opens the write gate (PLAN-v0.2 4.3).
+/// Most integration tests run `store` and `rm` with no terminal; the gate
+/// tests remove the variable. It is separate from `SECRIT_TEST_HOOK`, so a
+/// test that sets its own hooks keeps the bypass.
+#[cfg(feature = "test-hooks")]
+#[must_use]
+pub fn gate_open() -> bool {
+    std::env::var_os("SECRIT_TEST_GATE").is_some_and(|v| v == "allow")
+}
+
+#[cfg(not(feature = "test-hooks"))]
+#[must_use]
+pub fn gate_open() -> bool {
+    false
+}
+
+/// The pid at which the ancestor walk stops (`SECRIT_TEST_ANCESTOR_STOP`).
+/// The integration tests set it to their own pid, so an agent variable in
+/// the environment of the test runner does not count. The walk reads
+/// `/proc`, so only Linux has this function.
+#[cfg(all(feature = "test-hooks", target_os = "linux"))]
+#[must_use]
+pub fn ancestor_stop() -> Option<u32> {
+    std::env::var("SECRIT_TEST_ANCESTOR_STOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+#[cfg(all(not(feature = "test-hooks"), target_os = "linux"))]
+#[must_use]
+pub fn ancestor_stop() -> Option<u32> {
+    None
+}
+
+/// Whether the hooks are compiled in, for `--version` and `doctor` (T54).
+pub const COMPILED_IN: bool = cfg!(feature = "test-hooks");

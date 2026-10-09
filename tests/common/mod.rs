@@ -256,8 +256,22 @@ impl TestEnv {
             .env("XDG_RUNTIME_DIR", &self.runtime)
             .env("SECRIT_CONFIG", &self.config_file)
             .env("PATH", path)
+            // The write gate (PLAN-v0.2 4.3): most tests run `store` and `rm`
+            // with no terminal, which the gate refuses. The `test-hooks`
+            // build opens the gate for them; the gate tests use `gate_cmd`.
+            .env("SECRIT_TEST_GATE", "allow")
+            // The ancestor walk stops at this test process, so an agent
+            // variable in the environment of the test runner does not count.
+            .env("SECRIT_TEST_ANCESTOR_STOP", std::process::id().to_string())
             .current_dir(self.root.path())
             .stdin(Stdio::null());
+        c
+    }
+
+    /// [`Self::cmd`] with the write gate in force.
+    pub fn gate_cmd(&self) -> Command {
+        let mut c = self.cmd();
+        c.env_remove("SECRIT_TEST_GATE");
         c
     }
 
@@ -371,6 +385,108 @@ impl TestEnv {
         }
     }
 
+    /// `script` running `inner` through `/bin/sh`, with the environment of
+    /// `base`.
+    pub fn script_cmd(&self, base: &Command, inner: &str) -> Command {
+        let mut s = Command::new(bin("script"));
+        s.env_clear();
+        for (k, v) in base.get_envs() {
+            if let Some(v) = v {
+                s.env(k, v);
+            }
+        }
+        s.env("SHELL", "/bin/sh")
+            .current_dir(self.root.path())
+            .args(["-q", "-e", "-c", inner, "/dev/null"]);
+        s
+    }
+
+    /// Run `inner` under `script` with the environment of `base`. Wait until
+    /// the terminal output holds `prompt`, then type `answer` and end the
+    /// input. The write gate discards input typed before its prompt (T28).
+    pub fn under_script_answer(
+        &self,
+        base: &Command,
+        inner: &str,
+        prompt: &[u8],
+        answer: &[u8],
+    ) -> Output {
+        self.under_script_typing(base, inner, |_| {}, prompt, answer)
+    }
+
+    /// [`Self::under_script_answer`], with `before` run on the terminal
+    /// input first, before the wait for the prompt.
+    pub fn under_script_typing(
+        &self,
+        base: &Command,
+        inner: &str,
+        before: impl FnOnce(&mut std::process::ChildStdin),
+        prompt: &[u8],
+        answer: &[u8],
+    ) -> Output {
+        use std::sync::{Arc, Mutex};
+        let mut s = self.script_cmd(base, inner);
+        s.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = s.spawn().expect("spawn script");
+        let mut input = child.stdin.take().unwrap();
+        before(&mut input);
+        let mut out_pipe = child.stdout.take().unwrap();
+        let mut err_pipe = child.stderr.take().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let reader = {
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut out_pipe, &mut b) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.lock().unwrap().extend_from_slice(&b[..n]),
+                    }
+                }
+            })
+        };
+        let err = std::thread::spawn(move || {
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut err_pipe, &mut b).unwrap();
+            b
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let found = loop {
+            if seen
+                .lock()
+                .unwrap()
+                .windows(prompt.len())
+                .any(|w| w == prompt)
+            {
+                break true;
+            }
+            if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if found {
+            // script may have ended already.
+            let _ = input.write_all(answer);
+        }
+        drop(input);
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        let stdout = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(
+            found,
+            "the prompt never appeared: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        Output {
+            status,
+            stdout,
+            stderr: err.join().unwrap(),
+        }
+    }
+
     /// Run `inner` through `/bin/sh` under util-linux `script`, which gives
     /// it a controlling terminal, with `input` typed into that terminal.
     /// Panics when `script` is missing, so a pty test never passes unrun.
@@ -395,17 +511,13 @@ impl TestEnv {
     /// [`Self::under_script`], with `script`'s stdin held open until it
     /// exits, so no end-of-input reaches the terminal.
     pub fn under_script_held(&self, inner: &str) -> Output {
-        let mut s = Command::new(bin("script"));
-        s.env_clear();
-        for (k, v) in self.cmd().get_envs() {
-            if let Some(v) = v {
-                s.env(k, v);
-            }
-        }
-        s.env("SHELL", "/bin/sh")
-            .current_dir(self.root.path())
-            .args(["-q", "-e", "-c", inner, "/dev/null"])
-            .stdin(Stdio::piped())
+        self.under_script_held_with(&self.cmd(), inner)
+    }
+
+    /// [`Self::under_script_held`] with the environment of `base`.
+    pub fn under_script_held_with(&self, base: &Command, inner: &str) -> Output {
+        let mut s = self.script_cmd(base, inner);
+        s.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = s.spawn().expect("spawn script");

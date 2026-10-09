@@ -16,6 +16,14 @@ Read this first.
 - **A hostile process of your own user.** Such a process can run `sops decrypt` with your
   key, read `/run/secrets/*`, or read your terminal. secrit's agent and terminal rules
   prevent accidents. They are not a security boundary.
+- **An agent that works around the write gate.** The typed-name question stops accidents,
+  not an agent that wants to write. An agent can allocate a terminal, unset its variable
+  and start secrit outside its own process tree (for example with
+  `systemd-run --user --pty`), so detection finds no agent. An agent that drives a
+  terminal (a pty mode, `tmux send-keys`, terminal remote control) sees the question and
+  can type the name. A writer can type the answer after secrit discards the input typed
+  ahead. A direct `sops set`, `sops edit` or `git` change to the store file never meets
+  the gate. Some agents set no variable at all.
 - **Secret names are not secret.** sops keeps key names in cleartext, in the file and in
   git history. `secrit ls` prints them without a key.
 - **Copies outside secrit.** sops (a Go program) holds the value in memory that secrit
@@ -198,7 +206,7 @@ secrit get github-token                # shows it on the alternate screen; any k
                                        # (a screen reader or recorder can see it too)
 secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused on a terminal
 
-secrit rm github-token                 # asks on the terminal; --yes to skip
+secrit rm github-token                 # asks on the terminal; --yes to skip (not under an agent)
 
 secrit doctor                          # read-only checks; exit 1 when one fails
 secrit doctor --json
@@ -209,6 +217,8 @@ secrit wire github-token --owner svc --format env   # GITHUB_TOKEN_FILE=/run/sec
 `doctor` checks the tools, the age key and its mode, the store file and directory, the
 `.sops.yaml` rule, cleartext entries, leftover temp copies and old backups, the backup
 directory, and the git state of the store file. It decrypts nothing and prints no value.
+It says what the write gate does when it detects an agent, and it warns when the binary
+was built with the `test-hooks` feature, which only the test suite uses.
 
 `--store NAME` picks another store from the config. `-q` prints errors only.
 
@@ -236,11 +246,25 @@ keeps the files of the steps it finished; run it again to finish the setup.
   file whose sops metadata has `unencrypted_regex` or `encrypted_regex`.
 - **Values** are UTF-8 text up to 64 KiB, with no control characters except tab (and
   newline with `--multiline` or `--raw`). They are always stored as strings.
-- **Agents.** When a coding-agent variable is set and not empty (`CLAUDECODE`,
-  `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`,
-  `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE` or `OPENCODE_CLIENT`), `get` is refused. There is no override: an agent can set any
-  variable. With no terminal at all (`/dev/tty` cannot be opened, as in cron or
-  `ssh -T`), `get` is also refused. `store`, `ls` and `rm --yes` work.
+- **Agents.** secrit detects an agent when a coding-agent variable is set and not empty
+  (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX` (macOS
+  only), `CODEX_THREAD_ID`, `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE`, `OPENCODE`,
+  `OPENCODE_CLIENT` or `COPILOT_CLI`), in its own environment or in the environment of a
+  parent process (at most 64 levels up), or when there is no terminal at all (`/dev/tty`
+  cannot be opened, as in cron or `ssh -T`). There is no override: an agent can set any
+  variable. Under an agent, `get` is refused. The walk reads the environment that each
+  parent process had when it started. So a long-lived process that started in an agent
+  session (for example a terminal multiplexer server) makes every shell under it an agent.
+  The question and the `doctor` agent row name the pid and the name of that process. Start
+  that process again outside the agent session.
+- **The write gate.** Under an agent, `store`, `rm` and `init` ask on the terminal for the
+  secret name (the store name for `init`) and go on only when it is typed exactly. A `y`
+  does not confirm, and `rm --yes` still asks. secrit discards input that was typed before
+  the question. With no terminal they are refused with exit 3: CI or a remote job uses
+  `secrit seal`, a scheduled job runs as its own system service, and ssh uses `ssh -t`.
+  No variable, config key or flag turns the gate off. It stops accidents, not an agent
+  that works around it (see [What secrit does not protect
+  against](#what-secrit-does-not-protect-against)). `ls`, `doctor` and `wire` work.
 - **Terminal output.** `get` never writes a control character from the value to the
   terminal: it shows `\xNN` in reverse video instead. `ls` escapes names the same way.
 - **The write protocol.** secrit takes a lock in `$XDG_RUNTIME_DIR/secrit/`, copies the

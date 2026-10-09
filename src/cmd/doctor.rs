@@ -170,12 +170,15 @@ fn process_checks(r: &mut Report, hardened: HardenReport, env: &dyn Fn(&str) -> 
     for w in warnings {
         r.add("hardening", Status::Warn, w);
     }
+    if crate::testhook::COMPILED_IN {
+        r.add(
+            "build",
+            Status::Warn,
+            "test hooks are compiled in; SECRIT_TEST_GATE=allow opens the write gate. Do not use this build for secrets",
+        );
+    }
     match agent::detect() {
-        Some(a) => r.add(
-            "agent",
-            Status::Info,
-            format!("agent detected ({a}): 'get' is off"),
-        ),
+        Some(a) => r.add("agent", Status::Info, agent_row(&a)),
         None => r.add("agent", Status::Ok, "no agent detected"),
     }
     let exposed: Vec<&str> = ["SOPS_AGE_KEY", "SOPS_AGE_KEY_CMD"]
@@ -198,6 +201,13 @@ fn process_checks(r: &mut Report, hardened: HardenReport, env: &dyn Fn(&str) -> 
             ),
         );
     }
+}
+
+/// The `agent` row when an agent is detected (PLAN-v0.2 S1b).
+fn agent_row(agent: &agent::Agent) -> String {
+    format!(
+        "agent detected ({agent}): 'get' and 'run --env' are off; every decrypt of a gated store is off, with no typed-name path; 'store', 'rm', 'generate' and 'init' need the name typed on the terminal, or are off with no terminal; 'seal' works"
+    )
 }
 
 fn tool_check(

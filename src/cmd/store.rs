@@ -27,6 +27,17 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     // encrypt it), so nobody types a value that will be refused. The write
     // protocol checks again under the lock.
     ctx.backend.check_put(name, put_mode)?;
+    // The write gate comes after the checks and before the value (PLAN-v0.2
+    // 4.2, step 1), so nobody types a value that the gate then refuses.
+    super::write_gate(
+        |agent| {
+            format!(
+                "an agent runs secrit ({agent}). To store '{name}' in {}, type the name: ",
+                ctx.backend.location()
+            )
+        },
+        name.as_str(),
+    )?;
     let mode = InputMode {
         multiline: args.multiline || args.raw,
         raw: args.raw,

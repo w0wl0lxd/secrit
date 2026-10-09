@@ -11,6 +11,7 @@ pub mod wire;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::agent;
 use crate::backend::sops::TEMP_IGNORE;
 use crate::backend::{self, Backend};
 use crate::config::{Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home};
@@ -148,6 +149,40 @@ fn git_interrupted<T>(r: &Result<T, crate::git::GitError>) -> Result<(), Error> 
     match r {
         Err(crate::git::GitError::Interrupted(_)) => Err(Error::Interrupted),
         _ => Ok(()),
+    }
+}
+
+/// How the write gate let a command through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gated {
+    /// No agent and a terminal: the command runs as in v0.1.
+    Open,
+    /// The person typed the name on the terminal.
+    Confirmed,
+}
+
+/// The write gate of `store`, `rm` and `init` (PLAN-v0.2 4.1, 4.2).
+/// `question` gets the agent and returns the text to ask; the answer must
+/// equal `expected`. A wrong answer exits 3 with `not confirmed`; no
+/// terminal exits 3 with the Q19 text.
+pub fn write_gate(
+    question: impl FnOnce(&agent::Agent) -> String,
+    expected: &str,
+) -> Result<Gated, Error> {
+    if crate::testhook::gate_open() {
+        return Ok(Gated::Open);
+    }
+    let tty_opens = agent::tty_opens();
+    match agent::write_gate(agent::detect_tty(tty_opens), tty_opens) {
+        agent::WriteGate::Allow => Ok(Gated::Open),
+        agent::WriteGate::Refuse => Err(Error::Refused(agent::NO_TTY_REFUSAL.into())),
+        agent::WriteGate::ConfirmOnTty(a) => {
+            if crate::tty::confirm_typed(&question(&a), expected)? {
+                Ok(Gated::Confirmed)
+            } else {
+                Err(Error::Refused("not confirmed".into()))
+            }
+        }
     }
 }
 

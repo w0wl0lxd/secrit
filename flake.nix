@@ -210,6 +210,19 @@
             cargoDenyChecks = "bans licenses sources";
           };
 
+          # T54: the package that ships has no test hooks. A `test-hooks`
+          # build names the feature in `--version` (PLAN-v0.2 4.3).
+          release-features = pkgs.runCommand "secrit-release-features" { } ''
+            ${p.secrit}/bin/secrit --version > version
+            cat version
+            grep -q '^secrit ' version
+            if grep -q test-hooks version; then
+              echo "the package has the test-hooks feature" >&2
+              exit 1
+            fi
+            touch $out
+          '';
+
           # PF-2: the module installs the package and writes a config that
           # secrit accepts. secrit parses the generated file (unknown keys are
           # an error) and stops at the missing store file.

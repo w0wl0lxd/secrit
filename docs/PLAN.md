@@ -195,7 +195,9 @@ secrit rm NAME [--yes]
 
 1. Fail with exit 1 if NAME does not exist.
 2. Without `--yes`, ask `remove NAME from <file>? [y/N]` on `/dev/tty`. With no TTY and no
-   `--yes`, exit 3.
+   `--yes`, exit 3. In v0.2 the write gate (PLAN-v0.2 section 4) comes first: under agent
+   detection the name typed on `/dev/tty` replaces this question, also with `--yes`, and
+   with no `/dev/tty` `rm` exits 3, also with `--yes`.
 3. Run the write protocol with `sops unset`. It copies the old file to the backup directory
    (section 8.1, step 11a).
 4. Print: `removed NAME. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked.`
@@ -615,15 +617,19 @@ rename, but not one that lands after it.
 An agent is detected when any of these is true:
 
 - one of these variables is set and not empty: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
-  `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`, `CURSOR_AGENT`, `GEMINI_CLI`,
-  `CLINE_ACTIVE`, `OPENCODE_CLIENT`;
+  `AI_AGENT`, `AGENT`, `CODEX_SANDBOX` (macOS only), `CODEX_THREAD_ID`, `CURSOR_AGENT`,
+  `GEMINI_CLI`, `CLINE_ACTIVE`, `OPENCODE`, `OPENCODE_CLIENT`, `COPILOT_CLI`;
+- one of these variables is set and not empty in the environment of an ancestor process
+  (`/proc/<pid>/stat` for the parent, `/proc/<pid>/environ` for the variables; at most 64
+  levels; v0.2, PLAN-v0.2 4.1);
 - `/dev/tty` cannot be opened.
 
 When an agent is detected: `get` is refused (in v0.2, `run --no-mask` is refused and `run`
-masks); `store`, `ls`, `rm --yes`, `doctor`, `wire` and `init` work. There is no override variable, because an
-agent can set any variable (open question Q5). The list lives in one constant and the docs.
-Whether an agent may write the store file at all is open question Q13: with the Q1 default,
-`store` and `rm --yes` rewrite a file under `/etc/nixos`.
+masks); `ls`, `doctor` and `wire` work. There is no override variable, because an agent can
+set any variable (open question Q5). The list lives in one constant and the docs. Q13 is
+ruled (b): under agent detection, `store`, `rm` (also `--yes`), `generate` and the write
+steps of `init` need the name typed on `/dev/tty`, and with no `/dev/tty` they are refused
+(PLAN-v0.2 section 4).
 
 ### 8.4 Output
 
@@ -1004,9 +1010,9 @@ Q32 (its section 14).
 | Q8 | Repository name and place: `~/dev/secrit`, private `w0wl0lxd/secrit` on GitHub? | Yes, as the request says. | Stated in the request. |
 | Q9 | Should a later version be allowed to write `.nix` files (a `hosts/<host>/secrit.nix`) behind a flag? | No in v0.1; `wire` prints only. Revisit for v0.2. | `/etc/nixos` changes are owner-gated, and printed snippets keep the owner in review. |
 | Q10 | Should `secrit-egress-guard.sh` learn the patterns `secrit get` and `--stdout`? | Suggested only. It is an `/etc/nixos` change for the owner. | secrit cannot edit that file. |
-| Q11 | Agents may run `secrit rm NAME --yes`. Should `rm` be refused under agent detection? | No: agents act for the owner, and `rm` keeps a ciphertext backup. | A backup makes `rm` reversible. Refusing would block the owner's own automation. Q13 asks the wider question. |
+| Q11 | Agents may run `secrit rm NAME --yes`. Should `rm` be refused under agent detection? | No: agents act for the owner, and `rm` keeps a ciphertext backup. Replaced in v0.2 by the Q13 ruling: under agent detection, `rm` (also `--yes`) needs the name typed on `/dev/tty`, and with no `/dev/tty` it is refused. | A backup makes `rm` reversible. Refusing would block the owner's own automation. Q13 asks the wider question. |
 | Q12 | Does v0.1 ship `run` (PF-1)? | No: `run` moves to v0.2 (M6), and v0.1 does not parse it. `init`, `doctor` and `wire` are built (G5 and G6 met); G3 moves to v0.2. The owner can still ask for `run` in v0.1. | `run` hands values to other programs through sealed memfds and masks their output; that needs its own design and tests (T4, T5). The owner trial (M5) needs `store`, `wire` and a rebuild, not `run`. Stubs that exit 1 were an open promise in `--help`. |
-| Q13 | Q9 calls `/etc/nixos` changes owner-gated, but 8.3 and Q11 let an agent run `store` and `rm --yes`, which rewrite `/etc/nixos/secrets/secrit.yaml` under the Q1 default (OQ-2). Which rule wins? | OWNER RULING 2026-10-08: (b) [ruled-by: w0wl0lxd; recorded-by: v0.2 design agent; source: the v0.2 workflow task text of 2026-10-08, not the owner's own words; the owner confirms it with PLAN-v0.2 Q19]. Under agent detection, `store` and `rm` need a confirmation typed on `/dev/tty`. With no `/dev/tty` they are refused. PLAN-v0.2 section 4 holds the rule; slice S1 builds it. The rejected choice was (a): an agent may write the store file, and Q9 narrows to `.nix` files. | (a) keeps agent automation; (b) keeps every `/etc/nixos` change in the owner's hands. A variable cannot be a gate, because an agent can set it. |
+| Q13 | Q9 calls `/etc/nixos` changes owner-gated, but 8.3 and Q11 let an agent run `store` and `rm --yes`, which rewrite `/etc/nixos/secrets/secrit.yaml` under the Q1 default (OQ-2). Which rule wins? | OWNER RULING 2026-10-08: (b) [ruled-by: w0wl0lxd; recorded-by: v0.2 design agent; source: the v0.2 workflow task text of 2026-10-08, not the owner's own words; the owner confirms it with PLAN-v0.2 Q19]. Under agent detection, `store` and `rm` need a confirmation typed on `/dev/tty`. With no `/dev/tty` they are refused. PLAN-v0.2 section 4 holds the rule; slice S1b builds it. The rejected choice was (a): an agent may write the store file, and Q9 narrows to `.nix` files. | (a) keeps agent automation; (b) keeps every `/etc/nixos` change in the owner's hands. A variable cannot be a gate, because an agent can set it. |
 | Q14 | May secrit have one audited `unsafe` block for `mlock` and `madvise(MADV_DONTDUMP)` on value buffers (PF-3, SEC-9, R7)? | No for v0.1. The crate keeps `unsafe_code = "forbid"`; values are small, zeroized, and core dumps are off. | rustix 1.1.5 has both calls only as `unsafe fn`. A `forbid` lint is easier to audit than one exception. |
 | Q15 | Where do backups go, and how many stay (UX-1, SEC-2)? | `$XDG_STATE_HOME/secrit/backups/<id>-<basename>/` (mode 0700), newest 10 per store. | Backups in the store directory sat one `git add` away from git history in `/etc/nixos`. A count cap bounds old values on disk. A config key for the place and the count can come later. |
 | Q16 | How does myhost consume the private flake (OQ-3)? `github:w0wl0lxd/secrit` does not exist yet, and a private `github:` input needs a token, which root fetches during `nixos-rebuild`. | `path:/home/alice/dev/secrit` for personal use, or a `git+ssh://` input once the repository exists; home-manager over `nix profile`. The README installs with `nix profile add path:.` until then. | A `path:` or `git+ssh://` input needs no GitHub token in the Nix config. |

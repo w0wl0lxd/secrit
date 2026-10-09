@@ -52,8 +52,10 @@ All notable changes to this project are recorded here. The format follows
   agent is detected, the output is masked; otherwise, and with `--no-mask`, secrit
   replaces itself with CMD. Under agent detection `--env` and `--no-mask` exit 3, and
   `--file` runs with masking. Ctrl-C and Ctrl-Z reach CMD; when CMD stops, secrit stops
-  too, and `fg` resumes both. TERM and HUP are forwarded. secrit exits with CMD's exit
-  code, or ends by the signal that ended CMD. CMD gets the umask that secrit started with.
+  too, and `fg` resumes both. TERM and HUP are forwarded. A signal that the caller ignores
+  (`nohup`, `trap '' HUP`) stays ignored in secrit and in CMD and is not forwarded
+  (Linux). secrit exits with CMD's exit code, or ends by the signal that ended CMD. CMD
+  gets the umask that secrit started with.
   Held output goes out after 100 ms with no new output, so a prompt with no newline is
   shown.
 - Internal: the output masker for `secrit run` (v0.2).

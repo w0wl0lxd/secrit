@@ -238,8 +238,10 @@ a terminal, or an agent is detected, secrit stays the parent and masks the outpu
 value, and its base64, URL-safe base64, hex, percent and JSON forms, becomes
 `[secrit:NAME]`. A value shorter than 4 bytes is not masked, with a warning. Otherwise,
 and with `--no-mask`, secrit replaces itself with CMD. Ctrl-C and Ctrl-Z reach CMD as
-usual; TERM and HUP are forwarded to it. `run` exits with CMD's exit code, or ends by the
-signal that ended CMD. CMD runs with the umask that secrit started with.
+usual; TERM and HUP are forwarded to it. A signal that the caller ignores (`nohup`,
+`trap '' HUP`) stays ignored in secrit and in CMD, and secrit does not forward it (Linux;
+on other systems CMD starts with the default action). `run` exits with CMD's exit code,
+or ends by the signal that ended CMD. CMD runs with the umask that secrit started with.
 
 `get --stdout` writes to a pipe, a socket or a character device. It writes to a regular
 file only when the file is yours and group and others cannot read it (for example after

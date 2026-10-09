@@ -447,9 +447,10 @@ fn ctrl_c_to_a_child_that_traps_it_gives_its_exit_code() {
             sleep = tool("sleep"),
         ),
     );
-    // The outer shell ignores INT, so it lives to print the exit code.
+    // The outer shell traps INT, so it lives to print the exit code. It does
+    // not ignore INT: secrit and CMD would then ignore it too.
     let inner = format!(
-        "trap '' INT; {secrit} run --file V=n -- {child}; echo \"rc=$?\"",
+        "trap ':' INT; {secrit} run --file V=n -- {child}; echo \"rc=$?\"",
         secrit = quote(common::BIN),
         child = quote(child.to_str().unwrap()),
     );
@@ -613,4 +614,108 @@ fn bad_command_lines_are_usage_errors() {
     let out = env.run(["run", "--file", "V=n", "--", "no-such-program-x"], None);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     assert!(stderr(&out).contains("not found"), "{}", stderr(&out));
+}
+
+/// `sh -c inner` in the test directory, with the environment of secrit and
+/// no terminal.
+fn shell(env: &TestEnv, inner: &str) -> Output {
+    let mut s = Command::new(sh());
+    s.env_clear();
+    for (k, v) in env.cmd().get_envs() {
+        if let Some(v) = v {
+            s.env(k, v);
+        }
+    }
+    s.current_dir(env.root.path())
+        .args(["-c", inner])
+        .stdin(Stdio::null());
+    s.output().unwrap()
+}
+
+/// The `SigIgn` set from a line of `/proc/PID/status`.
+fn sig_ign(text: &str) -> u64 {
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .unwrap_or_else(|| panic!("no SigIgn line in {text:?}"));
+    u64::from_str_radix(line.trim(), 16).unwrap()
+}
+
+/// HUP (1) and INT (2) in a `SigIgn` set.
+const HUP_INT: u64 = 0b11;
+
+/// 7.1 step 5: a signal that the caller ignores stays ignored for CMD while
+/// secrit masks, as `nohup` and `trap '' SIG` expect.
+#[test]
+fn ignored_signals_stay_ignored_while_masking() {
+    let env = env_with_value();
+    let probe = format!(
+        "{sh} -c '{grep} SigIgn /proc/self/status'",
+        sh = sh(),
+        grep = tool("grep")
+    );
+    let control = shell(&env, &format!("trap '' HUP INT; exec {probe}"));
+    let via = shell(
+        &env,
+        &format!(
+            "trap '' HUP INT; exec {secrit} run --file V=n -- {probe}",
+            secrit = quote(common::BIN),
+        ),
+    );
+    assert_eq!(code(&via), 0, "{}", stderr(&via));
+    let control = sig_ign(&String::from_utf8_lossy(&control.stdout));
+    let got = sig_ign(&String::from_utf8_lossy(&via.stdout));
+    assert_eq!(control & HUP_INT, HUP_INT, "{control:x}");
+    assert_eq!(got, control, "SigIgn {got:x}, want {control:x}");
+}
+
+/// 7.1 step 6: in exec mode too, CMD keeps the signals that the caller
+/// ignores.
+#[test]
+fn ignored_signals_stay_ignored_in_exec_mode() {
+    let env = env_with_value();
+    let probe = |file: &str| {
+        format!(
+            "{sh} -c '{grep} SigIgn /proc/self/status > {file}'",
+            sh = sh(),
+            grep = tool("grep"),
+        )
+    };
+    let inner = format!(
+        "trap '' HUP INT; {control}; {secrit} run --no-mask --file V=n -- {via}; echo \"rc=$?\"",
+        control = probe("control"),
+        secrit = quote(common::BIN),
+        via = probe("via"),
+    );
+    let out = env.under_script(&inner);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("rc=0"), "{text}");
+    let control = sig_ign(&String::from_utf8_lossy(&read(&env, "control")));
+    let got = sig_ign(&String::from_utf8_lossy(&read(&env, "via")));
+    assert_eq!(control & HUP_INT, HUP_INT, "{control:x}");
+    assert_eq!(got, control, "SigIgn {got:x}, want {control:x}");
+}
+
+/// 7.1 step 5: with HUP ignored by the caller, a HUP to secrit neither
+/// ends secrit nor reaches CMD.
+#[test]
+fn an_ignored_hup_does_not_end_the_command() {
+    let env = env_with_value();
+    let child = env.script(
+        "longjob",
+        &format!(
+            "echo ready > ready\ni=0; while [ $i -lt 10 ]; do {sleep} 0.1; i=$((i+1)); done\necho survived",
+            sleep = tool("sleep"),
+        ),
+    );
+    let inner = format!(
+        "trap '' HUP; {secrit} run --file V=n -- {child} & p=$!; i=0; while [ ! -e ready ] && [ $i -lt 300 ]; do {sleep} 0.1; i=$((i+1)); done; kill -HUP $p; wait $p; echo \"rc=$?\"",
+        secrit = quote(common::BIN),
+        child = quote(child.to_str().unwrap()),
+        sleep = tool("sleep"),
+    );
+    let out = shell(&env, &inner);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("survived"), "{text}");
+    assert!(text.contains("rc=0"), "{text}");
 }

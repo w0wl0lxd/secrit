@@ -227,6 +227,11 @@ const PUMP_BYTES: usize = 64 * 1024;
 /// 7.1, step 5). The command inherits stdin and stays in secrit's process
 /// group, the foreground group, so terminal signals reach both.
 ///
+/// A signal that the caller ignored stays ignored in secrit and in the
+/// command, and is not forwarded ([`signals::ignored_at_start`]). Nothing
+/// reads the deferred-signal flag after the command ends, so a Ctrl-C that
+/// the command handled does not make secrit exit 130.
+///
 /// - INT and QUIT are recorded only: the command decides what they mean.
 /// - TERM and HUP are forwarded to the command; secrit keeps waiting.
 /// - TSTP does not stop secrit. When the command stops (Ctrl-Z), secrit
@@ -260,7 +265,7 @@ pub fn supervise<H>(
     let err_pipe = child.stderr.take();
     let exited = AtomicBool::new(false);
     let [out_masker, err_masker] = maskers;
-    let result = std::thread::scope(|s| {
+    std::thread::scope(|s| {
         let exited = &exited;
         let out = s.spawn(move || {
             let stdout = io::stdout();
@@ -282,10 +287,7 @@ pub fn supervise<H>(
         let status = child.wait();
         waited?;
         Ok(status?)
-    });
-    // A Ctrl-C that the command handled does not make secrit exit 130.
-    signals::clear_pending();
-    result
+    })
 }
 
 /// Poll the command until it exits. Forward TERM and HUP; follow a stop.

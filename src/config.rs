@@ -48,6 +48,8 @@ pub enum ConfigError {
     NoDefaultStore,
     #[error("config key lock.timeout_secs must be at least 1")]
     ZeroTimeout,
+    #[error("store {0} does not use the sops backend")]
+    NotSops(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +122,26 @@ pub struct StoreConfig {
     pub name: String,
     pub wire_hint: bool,
     pub backend: BackendConfig,
+}
+
+impl StoreConfig {
+    /// The sops settings, or `None` for a store of another backend.
+    #[must_use]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "None once a second backend exists (v0.2 plan 5.1)"
+    )]
+    pub fn sops(&self) -> Option<&SopsStore> {
+        match &self.backend {
+            BackendConfig::Sops(sops) => Some(sops),
+        }
+    }
+
+    /// [`Self::sops`], for the commands that only a sops store supports.
+    pub fn require_sops(&self) -> Result<&SopsStore, ConfigError> {
+        self.sops()
+            .ok_or_else(|| ConfigError::NotSops(self.name.clone()))
+    }
 }
 
 /// The backend of a store and its own settings.
@@ -404,8 +426,7 @@ timeout_secs = 5
 "#;
 
     fn sops_of(s: &StoreConfig) -> &SopsStore {
-        let BackendConfig::Sops(sops) = &s.backend;
-        sops
+        s.sops().unwrap()
     }
 
     #[test]
@@ -425,6 +446,18 @@ timeout_secs = 5
         );
         assert_eq!(c.lock_timeout, Duration::from_secs(5));
         assert_eq!(c.nix.unwrap().host, "myhost");
+    }
+
+    /// init and wire need a sops store, and say so for another backend.
+    #[test]
+    fn a_sops_store_gives_its_settings() {
+        let c = parse(FULL).unwrap();
+        let s = c.store(None).unwrap();
+        assert_eq!(s.require_sops().unwrap(), sops_of(s));
+        assert_eq!(
+            ConfigError::NotSops("main".into()).to_string(),
+            "store main does not use the sops backend"
+        );
     }
 
     #[test]

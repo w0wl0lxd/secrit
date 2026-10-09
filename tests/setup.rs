@@ -385,12 +385,12 @@ fn doctor_checks_the_sops_version_once() {
     let env = TestEnv::new();
     let second = env.store_dir.join("second.yaml");
     env.create_store(&second);
-    let mut text = std::fs::read_to_string(&env.config_file).unwrap();
-    text.push_str(&format!(
-        "\n[stores.second]\nbackend = \"sops\"\nfile = \"{}\"\nage_key_file = \"{}\"\n",
+    let text = format!(
+        "{}\n[stores.second]\nbackend = \"sops\"\nfile = \"{}\"\nage_key_file = \"{}\"\n",
+        std::fs::read_to_string(&env.config_file).unwrap(),
         second.display(),
         env.key_file.display()
-    ));
+    );
     std::fs::write(&env.config_file, text).unwrap();
     let out = env.run(["doctor", "--json"], None);
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));

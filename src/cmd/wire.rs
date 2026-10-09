@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, shell_path, shell_word};
 use crate::backend::BackendError;
 use crate::cli::WireFormat;
-use crate::config::BackendConfig;
 use crate::error::Error;
 use crate::git::{Repo, find_root};
 use crate::name::Name;
@@ -19,7 +18,7 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
     let text = match format {
         WireFormat::Nix => {
             let owner = owner_name(owner, &env)?;
-            let file = sops_file(ctx);
+            let file = sops_file(ctx)?;
             let flake = flake_root(ctx, file);
             nix_stanza(name, file, flake.as_deref(), &owner)
         }
@@ -51,9 +50,8 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
 }
 
 /// The store file that sops-nix reads.
-fn sops_file(ctx: &Ctx) -> &Path {
-    let BackendConfig::Sops(sops) = &ctx.store.backend;
-    &sops.file
+fn sops_file(ctx: &Ctx) -> Result<&Path, Error> {
+    Ok(&ctx.store.require_sops()?.file)
 }
 
 fn warn(ctx: &Ctx, msg: &str) {
@@ -61,7 +59,7 @@ fn warn(ctx: &Ctx, msg: &str) {
 }
 
 fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), Error> {
-    let file = sops_file(ctx);
+    let file = sops_file(ctx)?;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())

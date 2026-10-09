@@ -44,9 +44,42 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- Secret Service backend (`backend = "secret-service"`, Linux): each name is one item of
+  a collection on the D-Bus session bus (gnome-keyring, KWallet, or the KeePassXC Secret
+  Service server), with the label `secrit: NAME` and the attributes `application=secrit`,
+  `secrit-store=<store>` and `secrit-name=NAME`, so `secret-tool lookup secrit-name NAME`
+  reads it too. The store keys are `collection` (an alias or an object path, default
+  `default`) and `unlock` (`refuse`, the default, or `prompt`). `store`, `get`, `ls`, `rm`
+  and `doctor` work on it. `ls` reads the item attributes only.
+- `init --backend sops|secret-service`. For a Secret Service store, `init` checks that the
+  daemon answers and that the collection exists and is unlocked, then writes the config
+  section. It creates nothing in the daemon and refuses the sops flags.
+- `doctor` rows for a Secret Service store: the bus address, the daemon, the DH session,
+  the collection and its lock state, the count of secrit items, and a note that any
+  process of the user on the session bus can read the values. `doctor` needs `sops` only
+  when a store that it checks uses sops.
+- `store --replace --yes`: on a store that keeps no backup, `--yes` confirms the
+  replacement without a question.
+- Tests: the conformance suite runs on a Secret Service store too
+  (`tests/backend_secret_service.rs`), with a private `dbus-daemon` and
+  `gnome-keyring-daemon` per test and `secret-tool` to read values back. It runs in
+  `nix flake check`: the Nix build sandbox can run both daemons.
 
 ### Changed
 
+- `store --replace` and `rm` on a store that keeps no backup (Secret Service) print
+  `no backup; the old value is gone` and ask for `y` on the terminal, even for the owner;
+  with no terminal, only `--yes` confirms (exit 3 otherwise). The value is not read before
+  the answer. `rm` also says that the daemon may keep the old value in its own files.
+- `store --replace` without `--yes` on a free name of a store that keeps no backup does
+  not replace an item that another process makes before the write. secrit checks again
+  under its lock, keeps that item, and exits 3.
+- `wire` exits 3 on a store that is not a sops store, for every format, and prints no
+  stanza. `store` prints the `secrit wire` hint only for a sops store.
+- A key of another backend in a `[stores.NAME]` table is an error that names the key and
+  the backend, for example `config key stores.desk.file does not apply to backend
+  secret-service`. `wire_hint` applies to a sops store only. A sops store with no `file` gives `config key stores.NAME.file is
+  required for backend sops`.
 - Internal refactor for v0.2 backends, with no change to the config format, the messages
   or the exit codes. A `[stores.NAME]` table now parses to one settings type per
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
@@ -151,6 +184,23 @@ All notable changes to this project are recorded here. The format follows
 - `wire` writes a control character in a quoted store path as
   `${builtins.fromJSON ''"\uNNNN"''}`, so it never reaches the terminal raw and the Nix
   string keeps the same path.
+- A Secret Service store accepts only a `unix:path=<absolute path>` session bus address,
+  from `DBUS_SESSION_BUS_ADDRESS` or `$XDG_RUNTIME_DIR/bus`. The socket must belong to the
+  user, its directory must not be writable by group or others, and the bus daemon must
+  run as the user (peer credentials). Anything else exits 3. secrit connects to the
+  checked socket itself, so zbus never reads the environment. `doctor` uses the same
+  checks, peer credentials included, and shows a refused bus as a failed row.
+- A Secret Service session is always DH-encrypted; there is no plain-session code path.
+  secrit takes the value that the daemon returns without a copy and wipes it on drop,
+  and wipes its own copy of a value that it sends. The `secret-service` and `zbus`
+  crates keep more copies that secrit cannot wipe (documented in the README).
+- A locked collection exits 3. With `unlock = "prompt"`, secrit asks the daemon to unlock
+  only when no agent is detected and a terminal exists. Each daemon call runs in its own
+  thread with a 120 s deadline (exit 1); SIGINT, SIGTERM, SIGHUP or SIGQUIT during a call
+  exits 130 and releases the lock.
+- `store` without `--replace` on a Secret Service store searches, creates and searches
+  again under the secrit lock. When another item of the same name appears meanwhile, it
+  deletes its own item and exits 3, so parallel writers make one item.
 
 ### Changed from docs/PLAN.md
 

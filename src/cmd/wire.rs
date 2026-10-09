@@ -9,12 +9,23 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, shell_path, shell_word};
 use crate::backend::BackendError;
 use crate::cli::WireFormat;
-use crate::display::escape_path;
+use crate::display::{escape, escape_path};
 use crate::error::Error;
 use crate::git::{Repo, find_root};
 use crate::name::Name;
 
 pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> Result<(), Error> {
+    // Both formats point at a sops-nix file in /run/secrets. Another
+    // backend has no such file, so wire prints nothing for it (v0.2 plan
+    // 5.7: a format that needs a sops file exits 3 on an opaque store).
+    if ctx.store.sops().is_none() {
+        return Err(Error::Refused(format!(
+            "store {} uses the {} backend, and wire needs a sops store: sops-nix cannot read {}. A program reads the value with 'secrit get --stdout {name}'",
+            escape(&ctx.store.name),
+            ctx.store.backend.kind().as_str(),
+            ctx.backend.location()
+        )));
+    }
     let env = |k: &str| std::env::var_os(k);
     let text = match format {
         WireFormat::Nix => {

@@ -7,7 +7,9 @@ scrollback, and the write is crash-safe and lock-protected. The design is in
 [`docs/PLAN.md`](docs/PLAN.md).
 
 Status: v0.1. Every v0.1 command works: `store`, `get`, `ls`, `rm`, `init`, `doctor` and
-`wire`. `run` moved to v0.2 (see [What works](#what-works)).
+`wire`. `run` moved to v0.2 (see [What works](#what-works)). v0.2 adds a second backend:
+a [Secret Service store](#secret-service-store) keeps each value as an item of
+gnome-keyring, KWallet or the KeePassXC Secret Service server.
 
 ## What secrit does not protect against
 
@@ -28,10 +30,16 @@ Read this first.
   can read it too: for example Kitty remote control, a screen recorder or a screen share.
 - **No clipboard in v0.1.** secrit has no clipboard support: clipboard history daemons
   keep values on disk. Use `get --stdout` into a pipe instead.
-- **Old values.** `rm` and `store --replace` keep a ciphertext backup in
+- **Old values.** On a sops store, `rm` and `store --replace` keep a ciphertext backup in
   `$XDG_STATE_HOME/secrit/backups/` (default `~/.local/state/secrit/backups/`), the newest
   10 per store. Git history, backups and rendered `/run/secrets` copies keep old values.
   Rotate a leaked value at its source.
+- **Secret Service stores.** Any process of your user that can reach the D-Bus session
+  bus can read every value in an unlocked collection; it does not need secrit. A
+  Secret Service store keeps no backup: `store --replace` and `rm` destroy the old value
+  (secrit says so and asks first), and the daemon can keep old data in its own files.
+  The value crosses the bus encrypted (a DH session), but the `secret-service` and `zbus`
+  crates keep more copies in memory that secrit cannot wipe. secrit wipes its own copies.
 
 ## Install
 
@@ -104,6 +112,18 @@ timeout_secs = 30
 Paths must be absolute or start with `~/`. A configured `tools.sops` and the `.sops.yaml`
 must be owned by you, root or the Nix store, and neither the file nor its directory may be
 writable by group or others.
+
+A Secret Service store names a collection instead of a file:
+
+```toml
+[stores.desk]
+backend = "secret-service"
+collection = "default"   # optional; an alias, or an object path that starts with '/'
+unlock = "refuse"        # optional; "refuse" (default) or "prompt"
+```
+
+A sops key (`file`, `sops_config`, `age_key_file`) or `wire_hint` in a Secret Service
+store is an error, and so is `collection` or `unlock` in a sops store.
 
 **Keys.** secrit gives sops only an age key file (`SOPS_AGE_KEY_FILE`). sops runs with no
 usable `HOME`, so it never tries `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. Age keys from SSH
@@ -182,6 +202,48 @@ To set up the same store by hand:
 
    The value then appears at `/run/secrets/github-token`.
 
+## Secret Service store
+
+A Secret Service store keeps each name as one item of a collection on the D-Bus session
+bus: gnome-keyring, KWallet, or KeePassXC with its Secret Service integration. secrit
+needs no sops and no age key for it.
+
+```sh
+secrit init --backend secret-service --store desk   # checks the daemon, writes the config
+secrit --store desk store github-token
+secret-tool lookup secrit-name github-token          # libsecret reads the same item
+```
+
+`init --backend secret-service` checks that the daemon answers and that the collection
+exists and is unlocked. Then it writes the config section. It creates nothing in the daemon.
+
+- **Items.** Each item has the label `secrit: NAME` and the attributes
+  `application=secrit`, `secrit-store=<store>` and `secrit-name=NAME`. Two stores in one
+  collection do not see each other's items. `ls` reads the attributes only.
+- **The bus.** secrit reads `DBUS_SESSION_BUS_ADDRESS`, or uses `$XDG_RUNTIME_DIR/bus`
+  when it is not set. It accepts only a `unix:path=<absolute path>` address. The socket
+  must be yours, in a directory that group and others cannot write (so not `/tmp`), and
+  the bus daemon must run as you. Anything else exits 3. secrit connects to the checked
+  socket itself. `doctor` uses the same checks and shows a refused bus as a failed row.
+- **Encryption.** secrit always opens a DH session, so the daemon sends values encrypted.
+  It has no code path for a plain session.
+- **A locked collection** exits 3. secrit does not open the daemon's unlock prompt unless
+  the store sets `unlock = "prompt"`, and never when an agent is detected or there is no
+  terminal. A gnome-keyring that started with the keyring locked shows no names, so `ls`
+  exits 3 too.
+- **No backup.** `store --replace` and `rm` print `no backup; the old value is gone` and
+  ask for `y` on the terminal, even for you. `--yes` skips the question; with no terminal
+  it is the only way. When the name is free, `store --replace` asks nothing. If another
+  process makes the name before secrit writes, secrit keeps that item and exits 3; run the
+  command again to confirm the replace.
+- **Create only.** Without `--replace`, secrit searches, creates and searches again under
+  its lock, so parallel `store` runs make one item. Another program can still add an item
+  with the same attributes; then `get` exits 1 and names the count.
+- **Deadline.** Each daemon call has 120 seconds. SIGINT or SIGTERM during a call exits
+  130 and releases the lock; the daemon can still finish that call.
+- `wire` exits 3 on a Secret Service store: sops-nix cannot read it. A program reads the
+  value with `secrit get --stdout NAME`.
+
 ## Use
 
 ```sh
@@ -190,6 +252,7 @@ gh auth token | secrit store gh-token  # piped; one trailing newline is stripped
 secrit store tls-key --multiline < key.pem
 secrit store blob --raw < file         # keep the exact bytes
 secrit store github-token --replace    # overwrite; keeps a ciphertext backup
+secrit --store desk store tok --replace --yes   # no backup on a Secret Service store: --yes confirms
 
 secrit ls                              # names only; decrypts nothing
 secrit ls --json
@@ -222,7 +285,8 @@ file only when the file is yours and group and others cannot read it (for exampl
 
 Exit codes: `0` success, `1` failed, `2` usage error, `3` refused by a safety rule (agent,
 terminal, overwrite, name rule, an unsafe store file, store directory, config file, lock
-directory, `.sops.yaml` or `sops`), `4` lock timeout or a
+directory, `.sops.yaml` or `sops`, a locked collection or an unsafe session bus), `4` lock
+timeout or a
 concurrent change, `130` a signal cancelled the command before a write took effect. `init`
 keeps the files of the steps it finished; run it again to finish the setup.
 
@@ -269,6 +333,7 @@ not one that lands after it.
 | `store`, `ls`, `rm` | Works | |
 | `get` (reveal, `--stdout`) | Works | |
 | `init`, `doctor`, `wire` | Works | |
+| Secret Service store (`backend = "secret-service"`) | Not in v0.1 | v0.2: works (Linux) |
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
 | `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
@@ -277,7 +342,7 @@ not one that lands after it.
 ## Develop
 
 ```sh
-nix develop                       # Rust, sops, age, ssh-keygen, util-linux, cargo-nextest, cargo-deny
+nix develop                       # Rust, sops, age, ssh-keygen, util-linux, dbus, gnome-keyring, cargo-nextest, cargo-deny
 cargo nextest run --all-features  # unit, integration and terminal tests
 nix flake check                   # fmt, clippy, nextest, cargo-deny, the package, the HM module
 ```
@@ -286,7 +351,12 @@ The integration tests run the real `sops` and `age-keygen` against a temp direct
 a temp HOME and new age keys. They find the tools through `SECRIT_TEST_SOPS`,
 `SECRIT_TEST_AGE_KEYGEN` and `SECRIT_TEST_SSH_KEYGEN` (the devShell sets them), else
 `PATH`. The terminal tests need util-linux `script` and `setsid`; they fail, not skip,
-when those are missing. The `test-hooks` feature adds fault injection
+when those are missing. The Secret Service tests start a private `dbus-daemon` and
+`gnome-keyring-daemon` per test, with a temp keyring, and read values back with
+`secret-tool`. They find the tools through `SECRIT_TEST_DBUS_DAEMON`,
+`SECRIT_TEST_DBUS_SEND`, `SECRIT_TEST_DBUS_CONFIG`, `SECRIT_TEST_GNOME_KEYRING` and
+`SECRIT_TEST_SECRET_TOOL`, else `PATH`. They never touch your own session bus or keyring,
+and they run in `nix flake check` too. The `test-hooks` feature adds fault injection
 (`SECRIT_TEST_HOOK`) for the crash and signal tests; it is never on in a release build.
 
 ## Licence

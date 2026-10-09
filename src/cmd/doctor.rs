@@ -91,23 +91,31 @@ fn collect(
                 return r;
             }
         };
-    let sops = tool_check(&mut r, tools::SOPS, &config.tools.sops, env, true);
+    let stores: Result<Vec<&StoreConfig>, _> = match store_flag {
+        Some(name) => config.store(Some(name)).map(|s| vec![s]),
+        None => Ok(config.stores.values().collect()),
+    };
+    // sops is required only when a store that doctor checks uses it.
+    let sops_note = match &stores {
+        Ok(s) if !s.iter().any(|s| s.backend.kind() == BackendKind::Sops) => {
+            Some(" (no store here uses sops)")
+        }
+        _ => None,
+    };
+    let sops = tool_check(&mut r, tools::SOPS, &config.tools.sops, env, sops_note);
     tool_check(
         &mut r,
         tools::AGE_KEYGEN,
         &config.tools.age_keygen,
         env,
-        false,
+        Some(" (only 'secrit init' needs it)"),
     );
-    let stores: Vec<&StoreConfig> = match store_flag {
-        Some(name) => match config.store(Some(name)) {
-            Ok(s) => vec![s],
-            Err(e) => {
-                r.add("stores", Status::Fail, e.to_string());
-                return r;
-            }
-        },
-        None => config.stores.values().collect(),
+    let stores = match stores {
+        Ok(s) => s,
+        Err(e) => {
+            r.add("stores", Status::Fail, e.to_string());
+            return r;
+        }
     };
     if stores.is_empty() {
         r.add("stores", Status::Fail, "the config names no store");
@@ -187,7 +195,7 @@ fn tool_check(
     program: tools::Program,
     setting: &crate::config::ToolSetting,
     env: &dyn Fn(&str) -> Option<OsString>,
-    required: bool,
+    optional: Option<&str>,
 ) -> Option<ResolvedTool> {
     match tools::resolve(program, setting, env("PATH").as_deref()) {
         Ok(t) => {
@@ -216,11 +224,9 @@ fn tool_check(
             Some(t)
         }
         Err(e) => {
-            let status = if required { Status::Fail } else { Status::Warn };
-            let note = if required {
-                ""
-            } else {
-                " (only 'secrit init' needs it)"
+            let (status, note) = match optional {
+                None => (Status::Fail, ""),
+                Some(note) => (Status::Warn, note),
             };
             r.add(program.name, status, format!("{e}{note}"));
             None
@@ -264,7 +270,7 @@ mod tests {
             let mut r = Report::default();
             let path_env = path_dir.as_os_str().to_owned();
             let env = move |k: &str| (k == "PATH").then(|| path_env.clone());
-            assert!(tool_check(&mut r, program, setting, &env, true).is_some());
+            assert!(tool_check(&mut r, program, setting, &env, None).is_some());
             assert_eq!(r.rows().len(), 1, "{:?}", r.rows());
             r.rows()[0].clone()
         };

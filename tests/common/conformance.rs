@@ -20,6 +20,7 @@ macro_rules! conformance_suite {
             create_only_keeps_the_old_value,
             replace_changes_the_value,
             rm_needs_an_existing_name_and_a_confirmation,
+            replace_without_backup_needs_a_confirmation,
             ls_never_decrypts,
             values_never_reach_a_child_argv,
             child_stderr_never_shows_a_value,
@@ -64,7 +65,7 @@ fn assert_backups<F: Fixture>(f: &F, want_with_backups: usize) {
 /// the name reach the shell as positional parameters, never as shell text;
 /// the quote in the file name proves it. No pipe, so the exit status is
 /// secrit's.
-fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) {
+pub fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) {
     let dest = f.dirs().root.path().join("get 'it'.out");
     let _ = std::fs::remove_file(&dest);
     let mut envs = vec![
@@ -136,12 +137,22 @@ pub fn create_only_keeps_the_old_value<F: Fixture>() {
     assert_backups(&f, 0);
 }
 
+/// `store --replace`, with `--yes` when the backend keeps no backup: with
+/// no terminal, that is the only way to confirm (T55).
+fn replace_args<F: Fixture>(name: &str) -> Vec<&str> {
+    let mut args = vec!["store", name, "--replace"];
+    if !F::CAPS.backups {
+        args.push("--yes");
+    }
+    args
+}
+
 /// T12: `--replace` changes the value, with a backup when the backend
 /// keeps backups.
 pub fn replace_changes_the_value<F: Fixture>() {
     let f = F::new();
     assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
-    let out = f.dirs().run(["store", "n", "--replace"], Some(b"new"));
+    let out = f.dirs().run(replace_args::<F>("n"), Some(b"new"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert_stored(&f, "n", b"new");
     assert_eq!(f.names(), ["n"]);
@@ -162,6 +173,55 @@ pub fn rm_needs_an_existing_name_and_a_confirmation<F: Fixture>() {
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert_eq!(f.dirs().ls(), ["n"]);
     assert_stored(&f, "n", b"v");
+    assert_backups(&f, 0);
+}
+
+/// T55: a backend with no backup says so, and `store --replace` needs a
+/// `y` on the terminal or `--yes`, even for the owner. With no terminal and
+/// no `--yes` it exits 3 before it reads the value. A backend that keeps
+/// backups asks nothing.
+pub fn replace_without_backup_needs_a_confirmation<F: Fixture>() {
+    let f = F::new();
+    assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
+    let mut cmd = no_tty(&f.dirs().cmd());
+    cmd.args(["store", "n", "--replace"]);
+    let out = run_cmd(cmd, std::iter::empty::<&str>(), Some(b"new"));
+    if F::CAPS.backups {
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        assert!(!stderr(&out).contains("no backup"), "{}", stderr(&out));
+        assert_stored(&f, "n", b"new");
+        return;
+    }
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("pass --yes to replace without asking"),
+        "{}",
+        stderr(&out)
+    );
+    assert_stored(&f, "n", b"old");
+
+    // On a terminal, "n" keeps the old value and nothing reads a value.
+    let inner = format!(
+        "exec {} store n --replace",
+        super::env::sh_quote(std::path::Path::new(BIN))
+    );
+    let out = f.dirs().under_script_with(&inner, b"n\n");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("no backup; the old value is gone"), "{text}");
+    assert!(text.contains("not replaced"), "{text}");
+    assert_eq!(code(&out), 1, "{text}");
+    assert_stored(&f, "n", b"old");
+
+    let mut cmd = no_tty(&f.dirs().cmd());
+    cmd.args(["store", "n", "--replace", "--yes"]);
+    let out = run_cmd(cmd, std::iter::empty::<&str>(), Some(b"new"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no backup; the old value is gone"),
+        "{}",
+        stderr(&out)
+    );
+    assert_stored(&f, "n", b"new");
     assert_backups(&f, 0);
 }
 
@@ -193,7 +253,7 @@ pub fn values_never_reach_a_child_argv<F: Fixture>() {
     let d = f.dirs();
     let out = d.store_value("n", b"argv-canary-91f3");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let out = d.run(["store", "n", "--replace"], Some(b"argv-canary-2b7c"));
+    let out = d.run(replace_args::<F>("n"), Some(b"argv-canary-2b7c"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let (out, got) = get_to_file(&f, false, "n");
     assert_eq!(code(&out), 0, "{}", stderr(&out));

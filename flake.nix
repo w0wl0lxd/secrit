@@ -51,14 +51,25 @@
             SECRIT_TEST_AGE_KEYGEN = ageKeygenBin;
             SECRIT_TEST_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
             SECRIT_TEST_GIT = "${pkgs.git}/bin/git";
+            # The Secret Service fixture (v0.2 plan S10): a private session
+            # bus and gnome-keyring per test, read back with secret-tool.
+            SECRIT_TEST_DBUS_DAEMON = "${pkgs.dbus}/bin/dbus-daemon";
+            SECRIT_TEST_DBUS_SEND = "${pkgs.dbus}/bin/dbus-send";
+            SECRIT_TEST_DBUS_CONFIG = "${pkgs.dbus}/share/dbus-1/session.conf";
+            SECRIT_TEST_GNOME_KEYRING = "${pkgs.gnome-keyring}/bin/gnome-keyring-daemon";
+            SECRIT_TEST_SECRET_TOOL = "${pkgs.libsecret}/bin/secret-tool";
           };
-          # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and git.
+          # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and
+          # git; dbus-daemon, gnome-keyring-daemon and secret-tool.
           testTools = [
             pkgs.util-linux
             pkgs.openssh
             pkgs.coreutils
             pkgs.diffutils
             pkgs.git
+            pkgs.dbus
+            pkgs.gnome-keyring
+            pkgs.libsecret
           ];
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           secrit = craneLib.buildPackage (
@@ -167,6 +178,12 @@
                         stores.main = {
                           backend = "sops";
                           file = "~/store/secrit.yaml";
+                        };
+                        # One store of each backend kind (v0.2 plan 5.8).
+                        stores.desk = {
+                          backend = "secret-service";
+                          collection = "default";
+                          unlock = "refuse";
                         };
                         lock.timeout_secs = 5;
                       };

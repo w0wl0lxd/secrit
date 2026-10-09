@@ -20,7 +20,9 @@ use self::edit::{Op, SopsEdit};
 use self::format::{REGEX_RULES, SopsFormat, has_plaintext, has_recipients, non_string_kind};
 use self::runner::{MAX_NEW_FILE_BYTES, Runner};
 use super::atomic::{self, FileStore};
-use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WriteReport};
+use super::{
+    Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, Target, WriteReport,
+};
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::name::Name;
 use crate::paths;
@@ -254,6 +256,10 @@ impl SopsBackend {
 impl Backend for SopsBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Sops
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities { backups: true }
     }
 
     fn location(&self) -> &Location {

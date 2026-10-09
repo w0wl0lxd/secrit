@@ -50,6 +50,14 @@ impl Ctx {
         })
     }
 
+    /// Refuse NAME when this store cannot hold it, such as a nested name
+    /// on a store without nested keys (v0.2 plan 5.2). Exit 3, before any
+    /// input is read.
+    pub fn check_name(&self, name: &Name) -> Result<(), Error> {
+        let caps = self.backend.capabilities();
+        Ok(caps.check_name(name, self.backend.location())?)
+    }
+
     pub fn status(&self, msg: &str) {
         if !self.quiet {
             eprintln!("{msg}");

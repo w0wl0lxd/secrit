@@ -603,7 +603,7 @@ fn wire_checks_its_input() {
     assert!(stderr(&out).contains("pass --owner"));
     let out = env.run(["wire", "gh.token", "--format", "env"], None);
     assert_eq!(stdout(&out), "GH_TOKEN_FILE=/run/secrets/gh.token\n");
-    let out = env.run(["wire", "bad/name", "--owner", "a"], None);
+    let out = env.run(["wire", "bad//name", "--owner", "a"], None);
     assert_eq!(code(&out), 3);
 }
 

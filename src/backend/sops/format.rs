@@ -149,18 +149,27 @@ impl SopsFormat {
     }
 
     pub fn parse(self, bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
-        let parse_err = |what: &str| BackendError::Parse {
+        // The parser's own message can quote file content; it is not shown.
+        let value: Value = match self {
+            SopsFormat::Yaml => serde_saphyr::from_slice(bytes)
+                .map_err(|_| self.parse_error(path, "invalid YAML"))?,
+            SopsFormat::Json => strict_json(bytes).map_err(|what| self.parse_error(path, what))?,
+        };
+        self.doc(value, path)
+    }
+
+    /// A [`BackendError::Parse`] of the store file at `path`.
+    fn parse_error(self, path: &Path, what: &str) -> BackendError {
+        BackendError::Parse {
             location: Location::File(path.to_path_buf()),
             format: self.what(),
             what: what.into(),
-        };
-        // The parser's own message can quote file content; it is not shown.
-        let value: Value = match self {
-            SopsFormat::Yaml => {
-                serde_saphyr::from_slice(bytes).map_err(|_| parse_err("invalid YAML"))?
-            }
-            SopsFormat::Json => strict_json(bytes).map_err(parse_err)?,
-        };
+        }
+    }
+
+    /// The entries and the sops metadata of a parsed file.
+    fn doc(self, value: Value, path: &Path) -> Result<SopsDoc, BackendError> {
+        let parse_err = |what: &str| self.parse_error(path, what);
         let Value::Object(mut entries) = value else {
             return Err(parse_err("the top level is not a mapping"));
         };
@@ -177,40 +186,46 @@ impl SopsFormat {
         Ok(SopsDoc { entries, meta })
     }
 
-    /// Every sops run names the store's format, so a write would rewrite a
-    /// file of another format in the store's format (v0.2 plan V14, T50).
-    /// The write path refuses such a file before it reads a value. A YAML
-    /// store refuses a JSON file: a YAML file in flow style also parses as
-    /// JSON, but sops never writes one, and a leading UTF-8 BOM does not
-    /// hide a JSON file. A JSON store refuses a file that is not strict
-    /// JSON.
-    pub fn refuse_other(self, bytes: &[u8], path: &Path) -> Result<(), BackendError> {
+    /// [`Self::parse`] for the write path. Every sops run names the
+    /// store's format, so a write would rewrite a file of another format in
+    /// the store's format (v0.2 plan V14, T50). The write path refuses such
+    /// a file (exit 3) before it reads a value, and before the parse can
+    /// fail on it. A YAML store refuses a JSON file: a YAML file in flow
+    /// style also parses as JSON, but sops never writes one, and a leading
+    /// UTF-8 BOM does not hide a JSON file. A JSON store refuses a file
+    /// that is not strict JSON, and parses the file only once.
+    pub fn parse_to_write(self, bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
         self.refuse_other_name(path)?;
-        let other = match self {
+        match self {
             SopsFormat::Yaml => {
                 let body = bytes
                     .strip_prefix(UTF8_BOM)
                     .unwrap_or(bytes)
                     .trim_ascii_start();
-                let object = body.first() == Some(&b'{')
-                    && serde_json::from_slice::<IgnoredAny>(body).is_ok();
-                object.then_some("it is a sops JSON file")
+                if body.first() == Some(&b'{') && serde_json::from_slice::<IgnoredAny>(body).is_ok()
+                {
+                    return Err(self.other_format(path, "it is a sops JSON file"));
+                }
+                self.parse(bytes, path)
             }
-            SopsFormat::Json => strict_json(bytes)
-                .is_err()
-                .then_some("it is not a sops JSON file"),
-        };
-        match other {
-            Some(what) => Err(BackendError::Unsafe {
-                path: path.to_path_buf(),
-                reason: format!(
-                    "{what}, and the store's format is {}; a write would rewrite it as {}. \
-                     Set the store's format key to the format of the file",
-                    self.name(),
-                    self.label()
-                ),
-            }),
-            None => Ok(()),
+            SopsFormat::Json => {
+                let value = strict_json(bytes)
+                    .map_err(|_| self.other_format(path, "it is not a sops JSON file"))?;
+                self.doc(value, path)
+            }
+        }
+    }
+
+    /// The refusal of a file that `what` says is in another format.
+    fn other_format(self, path: &Path, what: &str) -> BackendError {
+        BackendError::Unsafe {
+            path: path.to_path_buf(),
+            reason: format!(
+                "{what}, and the store's format is {}; a write would rewrite it as {}. \
+                 Set the store's format key to the format of the file",
+                self.name(),
+                self.label()
+            ),
         }
     }
 
@@ -246,13 +261,20 @@ fn lower_file_name(path: &Path) -> String {
 
 /// `bytes` as strict JSON (v0.2 plan 6.1.2): one value, no byte order mark,
 /// and no key twice in one object, because a repeated key would hide an
-/// entry from the copy validation. The error is fixed text: a parser
-/// message can quote file content.
+/// entry from the copy validation. One pass: the only data error that
+/// [`StrictVisitor`] makes is a repeated key, and every other error is a
+/// syntax or end-of-input error. The error is fixed text: a parser message
+/// can quote file content.
 fn strict_json(bytes: &[u8]) -> Result<Value, &'static str> {
-    serde_json::from_slice::<IgnoredAny>(bytes).map_err(|_| "invalid JSON")?;
     serde_json::from_slice::<StrictValue>(bytes)
         .map(|v| v.0)
-        .map_err(|_| "a key appears twice in one object")
+        .map_err(|e| {
+            if e.is_data() {
+                "a key appears twice in one object"
+            } else {
+                "invalid JSON"
+            }
+        })
 }
 
 /// A JSON value that refuses a repeated key in an object.
@@ -453,29 +475,61 @@ pub(super) mod tests {
         assert_eq!(doc(BASE).entries.len(), 1);
     }
 
+    /// The refusal of a write: the error of [`SopsFormat::parse_to_write`]
+    /// when it is not a parse error.
+    fn refusal(f: SopsFormat, bytes: &[u8], path: &Path) -> Result<(), BackendError> {
+        match f.parse_to_write(bytes, path) {
+            Err(e @ BackendError::Unsafe { .. }) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// The write path parses a file in the store's format to the same
+    /// document as the read path, and a file that the read path cannot
+    /// parse gives the same parse error.
+    #[test]
+    fn parse_to_write_reads_the_same_doc_as_parse() {
+        for (f, text, path) in [
+            (SopsFormat::Yaml, BASE, "/s/main.yaml"),
+            (SopsFormat::Json, JSON_BASE, "/s/main.json"),
+        ] {
+            let path = Path::new(path);
+            let read = f.parse(text.as_bytes(), path).unwrap();
+            let write = f.parse_to_write(text.as_bytes(), path).unwrap();
+            assert_eq!(read.entries, write.entries);
+            assert_eq!(read.meta, write.meta);
+        }
+        let path = Path::new("/s/main.json");
+        let e = SopsFormat::Json
+            .parse_to_write(b"{\"a\": \"ENC[x]\"}", path)
+            .unwrap_err();
+        assert!(e.to_string().contains("no sops metadata block"), "{e}");
+        assert_eq!(e.exit(), Exit::Failed);
+    }
+
     #[test]
     fn a_yaml_store_refuses_another_format() {
         let yaml = Path::new("/s/main.yaml");
         let f = SopsFormat::Yaml;
-        assert!(f.refuse_other(BASE.as_bytes(), yaml).is_ok());
+        assert!(refusal(f, BASE.as_bytes(), yaml).is_ok());
         let json = br#"{"a": "ENC[x]", "sops": {"mac": "ENC[m]"}}"#;
         let bom = b"\xEF\xBB\xBF{\"a\": \"ENC[x]\"}";
         let bom_space = b"\xEF\xBB\xBF \n {}";
         for bytes in [&json[..], b"\n  {}\n", &bom[..], &bom_space[..]] {
-            let e = f.refuse_other(bytes, yaml).unwrap_err();
+            let e = refusal(f, bytes, yaml).unwrap_err();
             assert!(e.to_string().contains("it is a sops JSON file"), "{e}");
             assert!(e.to_string().contains("format is yaml"), "{e}");
             assert_eq!(e.exit(), Exit::Refused);
         }
         // Flow-style YAML that is not JSON stays allowed, with a BOM too.
-        assert!(f.refuse_other(b"{a: b}\n", yaml).is_ok());
-        assert!(f.refuse_other(b"\xEF\xBB\xBF{a: b}\n", yaml).is_ok());
+        assert!(refusal(f, b"{a: b}\n", yaml).is_ok());
+        assert!(refusal(f, b"\xEF\xBB\xBF{a: b}\n", yaml).is_ok());
         let mut bom_yaml = b"\xEF\xBB\xBF".to_vec();
         bom_yaml.extend_from_slice(BASE.as_bytes());
-        assert!(f.refuse_other(&bom_yaml, yaml).is_ok());
+        assert!(refusal(f, &bom_yaml, yaml).is_ok());
         for name in ["main.json", "MAIN.JSON", ".env", "a.env", "a.ini"] {
             let path = Path::new("/s").join(name);
-            let e = f.refuse_other(BASE.as_bytes(), &path).unwrap_err();
+            let e = refusal(f, BASE.as_bytes(), &path).unwrap_err();
             assert!(e.to_string().contains("as YAML"), "{name}: {e}");
             assert_eq!(e.exit(), Exit::Refused);
         }
@@ -503,7 +557,7 @@ pub(super) mod tests {
         let doc = f.parse(JSON_BASE.as_bytes(), path).unwrap();
         assert_eq!(doc.entries.len(), 1);
         assert!(doc.meta.contains_key("age"));
-        assert!(f.refuse_other(JSON_BASE.as_bytes(), path).is_ok());
+        assert!(refusal(f, JSON_BASE.as_bytes(), path).is_ok());
 
         // The YAML form of the same file, a byte order mark, trailing
         // text and a repeated key are refused, and the parse error quotes
@@ -531,14 +585,12 @@ pub(super) mod tests {
                 !text.contains("secret-ish") && !text.contains("ENC["),
                 "{text}"
             );
-            let e = f.refuse_other(bytes, path).unwrap_err();
+            let e = refusal(f, bytes, path).unwrap_err();
             assert!(e.to_string().contains("it is not a sops JSON file"), "{e}");
             assert_eq!(e.exit(), Exit::Refused);
         }
         for name in ["s.yaml", "S.YML", "s.env", "s.ini"] {
-            let e = f
-                .refuse_other(JSON_BASE.as_bytes(), &Path::new("/s").join(name))
-                .unwrap_err();
+            let e = refusal(f, JSON_BASE.as_bytes(), &Path::new("/s").join(name)).unwrap_err();
             assert!(e.to_string().contains("as JSON"), "{name}: {e}");
             assert_eq!(e.exit(), Exit::Refused);
         }

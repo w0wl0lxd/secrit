@@ -145,8 +145,7 @@ impl SopsBackend {
     /// The store file under the write-path checks, without decrypting.
     pub fn inspect(&self) -> Result<StoreFacts, BackendError> {
         let snap = self.store.read(true)?;
-        self.format.refuse_other(&snap.bytes, self.file())?;
-        let doc = self.format.parse(&snap.bytes, self.file())?;
+        let doc = self.format.parse_to_write(&snap.bytes, self.file())?;
         let rules = REGEX_RULES
             .iter()
             .copied()
@@ -240,8 +239,7 @@ impl SopsBackend {
     /// (exit 3) before the parse can fail on it (v0.2 plan V14).
     fn read_doc_to_write(&self) -> Result<format::SopsDoc, BackendError> {
         let snap = self.store.read(false)?;
-        self.format.refuse_other(&snap.bytes, self.file())?;
-        self.format.parse(&snap.bytes, self.file())
+        self.format.parse_to_write(&snap.bytes, self.file())
     }
 
     fn exists_error(&self, name: &Name) -> BackendError {

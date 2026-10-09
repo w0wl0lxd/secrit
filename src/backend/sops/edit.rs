@@ -36,8 +36,7 @@ impl FileEdit for SopsEdit<'_> {
 
     fn precheck(&self, original: &[u8]) -> Result<(SopsDoc, bool), BackendError> {
         let b = self.backend;
-        b.format.refuse_other(original, b.store.file())?;
-        let doc = b.format.parse(original, b.store.file())?;
+        let doc = b.format.parse_to_write(original, b.store.file())?;
         let existed = doc.entries.contains_key(self.name.as_str());
         match self.op {
             Op::Put(_, PutMode::CreateOnly) if existed => {

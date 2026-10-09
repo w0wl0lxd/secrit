@@ -31,9 +31,6 @@ pub use self::runner::MIN_SOPS;
 #[cfg(test)]
 pub use self::runner::{NEED_SOPS, PROMPT_HINT};
 
-/// The `.gitignore` pattern that matches every temp copy.
-pub const TEMP_IGNORE: &str = ".*.secrit-*.yaml";
-
 #[derive(Debug)]
 pub struct SopsBackend {
     store: FileStore,
@@ -91,10 +88,16 @@ impl SopsBackend {
         Ok(Self {
             location: Location::File(store.file.clone()),
             store: file,
-            format: SopsFormat::Yaml,
+            format: store_format(store),
             runner,
             age_key_file,
         })
+    }
+
+    /// The git sample and the `.gitignore` pattern of this store's temp
+    /// copies.
+    pub fn temp_ignore(&self) -> TempIgnore {
+        TempIgnore::new(self.file(), self.format)
     }
 
     /// The version that `sops --version` reports.
@@ -341,10 +344,36 @@ impl Backend for SopsBackend {
     }
 }
 
-/// A temp copy name of the store file `file`, to ask git whether it
-/// ignores temp copies.
-pub fn temp_sample(file: &Path) -> PathBuf {
-    atomic::temp_sample(file, SopsFormat::Yaml.temp_ext())
+/// The format of a store's file. v0.2 starts with YAML only; S4 reads it
+/// from the store config.
+fn store_format(_store: &SopsStore) -> SopsFormat {
+    SopsFormat::Yaml
+}
+
+/// How git sees the temp copies of one store. Both parts follow the
+/// store's format, because a temp copy ends in the format's extension.
+#[derive(Debug)]
+pub struct TempIgnore {
+    /// A temp copy name with a fixed random part, to ask git whether it
+    /// ignores temp copies.
+    pub sample: PathBuf,
+    /// The `.gitignore` pattern that matches every temp copy.
+    pub pattern: String,
+}
+
+impl TempIgnore {
+    fn new(file: &Path, format: SopsFormat) -> Self {
+        let ext = format.temp_ext();
+        Self {
+            sample: atomic::temp_sample(file, ext),
+            pattern: atomic::temp_ignore(ext),
+        }
+    }
+
+    /// The temp copies of `store`, from its config alone.
+    pub fn of(store: &SopsStore) -> Self {
+        Self::new(&store.file, store_format(store))
+    }
 }
 
 fn nearest_sops_config(dir: &Path) -> Option<PathBuf> {
@@ -412,6 +441,56 @@ mod tests {
         ));
         let v = SecretValue::new(b"v".to_vec());
         assert!(validate(&orig, &copy, &z, Op::Put(&v, PutMode::CreateOnly)).is_ok());
+    }
+
+    /// Whether the `.gitignore` glob `pattern` matches the file name `name`.
+    /// Only `*` is special, and no `/` occurs.
+    fn glob_matches(pattern: &str, name: &str) -> bool {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let (first, last) = (parts[0], parts[parts.len() - 1]);
+        if !name.starts_with(first) || !name[first.len()..].ends_with(last) {
+            return false;
+        }
+        let mut rest = &name[first.len()..name.len() - last.len()];
+        for part in &parts[1..parts.len() - 1] {
+            match rest.find(part) {
+                Some(i) => rest = &rest[i + part.len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// The `.gitignore` pattern and the git sample come from the format of
+    /// the store, so they match the temp copies that a write makes.
+    #[test]
+    fn the_temp_ignore_pattern_follows_the_format() {
+        let file = Path::new("/s/main.yaml");
+        for format in [SopsFormat::Yaml] {
+            let ext = format!(".{}", format.temp_ext());
+            let temp = TempIgnore::new(file, format);
+            let sample = temp.sample.file_name().unwrap().to_str().unwrap();
+            assert_eq!(temp.sample.parent(), Some(Path::new("/s")));
+            assert!(sample.ends_with(&ext), "{sample}");
+            assert!(temp.pattern.ends_with(&ext), "{}", temp.pattern);
+            assert!(glob_matches(&temp.pattern, sample), "{temp:?}");
+            assert!(!glob_matches(&temp.pattern, "main.yaml"), "{temp:?}");
+        }
+        // v0.1 printed this pattern; YAML stores keep it.
+        let yaml = TempIgnore::new(file, SopsFormat::Yaml);
+        assert_eq!(yaml.pattern, ".*.secrit-*.yaml");
+
+        // The store config and the backend give the same answer.
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), BASE);
+        let store = SopsStore {
+            file: b.file().to_path_buf(),
+            sops_config: None,
+            age_key_file: None,
+        };
+        let (of_store, of_backend) = (TempIgnore::of(&store), b.temp_ignore());
+        assert_eq!(of_store.sample, of_backend.sample);
+        assert_eq!(of_store.pattern, of_backend.pattern);
     }
 
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {

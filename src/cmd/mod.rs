@@ -11,9 +11,11 @@ pub mod wire;
 use std::ffi::OsString;
 use std::path::Path;
 
-use crate::backend::sops::{self, TEMP_IGNORE};
+use crate::backend::sops::TempIgnore;
 use crate::backend::{self, Backend};
-use crate::config::{Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home};
+use crate::config::{
+    Config, ConfigSource, ENV_CONFIG, NixConfig, SopsStore, StoreConfig, config_path, home,
+};
 use crate::display::escape;
 use crate::error::Error;
 use crate::git::Repo;
@@ -74,16 +76,17 @@ pub fn note_config_source(path: &Path, source: ConfigSource, quiet: bool) {
     }
 }
 
-/// The command that makes `repo` ignore the temp copies of `file`, or `None`
-/// when it ignores them already or git cannot tell. The sops backend names
-/// a sample temp copy for git to check.
-pub fn ignore_hint(repo: &Repo, file: &Path) -> Result<Option<String>, Error> {
-    let ignored = repo.is_ignored(&sops::temp_sample(file));
+/// The command that makes `repo` ignore the temp copies of `store`, or
+/// `None` when it ignores them already or git cannot tell. The sops backend
+/// names a sample temp copy for git to check.
+pub fn ignore_hint(repo: &Repo, store: &SopsStore) -> Result<Option<String>, Error> {
+    let temp = TempIgnore::of(store);
+    let ignored = repo.is_ignored(&temp.sample);
     git_interrupted(&ignored)?;
     Ok(ignored.is_ok_and(|i| !i).then(|| {
         format!(
             "echo {} >> {}",
-            shell_word(TEMP_IGNORE),
+            shell_word(&temp.pattern),
             shell_path(&repo.root.join(".gitignore"))
         )
     }))

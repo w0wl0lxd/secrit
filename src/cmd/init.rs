@@ -160,7 +160,7 @@ fn steps(
     interrupted()?;
 
     // 6. Next steps.
-    next_steps(&sops_store.file, &env, &out)?;
+    next_steps(sops_store, &env, &out)?;
     interrupted()
 }
 
@@ -634,12 +634,17 @@ fn store_section(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> 
     })
 }
 
-fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) -> Result<(), Error> {
+fn next_steps(
+    store: &SopsStore,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    out: &Out,
+) -> Result<(), Error> {
+    let file = &store.file;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
     {
-        if let Some(hint) = super::ignore_hint(&repo, file)? {
+        if let Some(hint) = super::ignore_hint(&repo, store)? {
             out.note(&format!("next: ignore temp copies: {hint}"));
         }
         let tracked = if file.exists() {

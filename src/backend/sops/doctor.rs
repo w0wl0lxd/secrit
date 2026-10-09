@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use super::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
+use super::{MIN_SOPS, SopsBackend};
 use crate::backend::{BackendError, DoctorCtx};
 use crate::cmd::doctor::git_add_hint;
 use crate::cmd::shell_path;
@@ -357,7 +357,8 @@ fn git_checks(
         }
     };
     let root = repo.root.display();
-    match repo.is_ignored(&super::temp_sample(backend.file())) {
+    let temp = backend.temp_ignore();
+    match repo.is_ignored(&temp.sample) {
         Ok(true) => r.add(
             format!("store {store}: git ignore"),
             Status::Ok,
@@ -366,7 +367,10 @@ fn git_checks(
         Ok(false) => r.add(
             format!("store {store}: git ignore"),
             Status::Warn,
-            format!("{root} does not ignore temp copies; add '{TEMP_IGNORE}' to its .gitignore"),
+            format!(
+                "{root} does not ignore temp copies; add '{}' to its .gitignore",
+                temp.pattern
+            ),
         ),
         Err(e) => r.add(
             format!("store {store}: git ignore"),

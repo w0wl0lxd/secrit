@@ -587,6 +587,12 @@ pub fn temp_sample(file: &Path, ext: &str) -> PathBuf {
     ))
 }
 
+/// The `.gitignore` pattern that matches every temp copy with the
+/// extension `ext`.
+pub fn temp_ignore(ext: &str) -> String {
+    format!(".*{TEMP_MARK}*.{ext}")
+}
+
 /// `.<base>.secrit-<random>.<ext>`: hidden, next to the store file, and
 /// with the store's extension.
 fn temp_name(base: &OsStr, random: &str, ext: &str) -> OsString {
@@ -766,5 +772,6 @@ mod tests {
             temp_name(OsStr::new("m.yaml"), "00aa", "yaml"),
             ".m.yaml.secrit-00aa.yaml"
         );
+        assert_eq!(temp_ignore("yaml"), ".*.secrit-*.yaml");
     }
 }

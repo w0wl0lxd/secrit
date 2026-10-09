@@ -23,7 +23,7 @@ keys.txt
 *.plaintext
 
 # secrit temp copies and backups (ciphertext only, but never commit them)
-.*.secrit-*.yaml
+.*.secrit-*
 *.secrit-bak.*
 
 # insta pending snapshots

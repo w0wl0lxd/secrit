@@ -434,6 +434,70 @@ fn doctor_checks_the_git_repository() {
     assert_eq!(status_of(&r, "store main: git"), ["ok"], "{r:?}");
 }
 
+/// v0.2 plan 6.1.5: the temp copies of a JSON store end in `.json`, so the
+/// v0.1 line `.*.secrit-*.yaml` does not ignore them. `doctor` warns and
+/// names the line for every format, `.*.secrit-*`; with it, the row is ok.
+/// A JSON store passes every other `doctor` check.
+#[test]
+fn doctor_checks_the_ignore_line_of_a_json_store() {
+    let env = TestEnv::with_format("json");
+    assert_eq!(code(&env.store_value("n", b"v")), 0);
+    let repo = env.store_dir.parent().unwrap().to_path_buf();
+    git(&env, &repo, &["init", "-q"]);
+    std::fs::write(repo.join(".gitignore"), ".*.secrit-*.yaml\n").unwrap();
+    git(&env, &repo, &["add", "secrets/main.json"]);
+    let out = run_cmd(with_git(&env), ["doctor"], None);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "warn  store main: git ignore: {} does not ignore temp copies; add '.*.secrit-*' to its .gitignore",
+            repo.display()
+        )),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stdout(&out).contains("fail"), "{}", stdout(&out));
+
+    std::fs::write(repo.join(".gitignore"), ".*.secrit-*\n").unwrap();
+    let out = run_cmd(with_git(&env), ["doctor", "--json"], None);
+    let r = rows(&out);
+    assert_eq!(status_of(&r, "store main: git ignore"), ["ok"], "{r:?}");
+    assert_eq!(status_of(&r, "store main: file"), ["ok"], "{r:?}");
+}
+
+/// A change of the `format` key changes the extension of new temp copies,
+/// but a crash can leave copies with the old extension. `doctor` lists a
+/// stale temp copy with the extension of any format, and no other file.
+#[test]
+fn doctor_lists_temp_copies_of_any_format() {
+    let env = TestEnv::with_format("json");
+    let old = SystemTime::now() - Duration::from_secs(7200);
+    for name in [
+        ".main.json.secrit-00aa.yaml",
+        ".main.json.secrit-00bb.json",
+        ".main.json.secrit-00cc.txt",
+    ] {
+        let path = env.store_dir.join(name);
+        std::fs::write(&path, "x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let out = env.run(["doctor"], None);
+    let all = stdout(&out);
+    assert!(
+        all.contains(
+            "store main: temp files: left by a crash or SIGKILL (ciphertext only); \
+             remove them when no secrit runs: .main.json.secrit-00aa.yaml, .main.json.secrit-00bb.json\n"
+        ),
+        "{all}"
+    );
+    assert!(!all.contains("00cc"), "{all}");
+}
+
 #[test]
 fn wire_prints_the_stanza_and_the_commands() {
     let env = TestEnv::new();
@@ -485,7 +549,7 @@ fn wire_prints_the_stanza_and_the_commands() {
     );
     // A-6 and B-4: the ignore line and the spell-checker reminder.
     let ignore_line = format!(
-        "then run: echo '.*.secrit-*.yaml' >> {}\n",
+        "then run: echo '.*.secrit-*' >> {}\n",
         repo.join(".gitignore").display()
     );
     assert!(err.contains(&ignore_line), "{err}");
@@ -686,7 +750,7 @@ fn init_in_a_repository_prints_the_git_steps() {
     let err = stderr(&out);
     assert!(
         err.contains(&format!(
-            "next: ignore temp copies: echo '.*.secrit-*.yaml' >> {}\n",
+            "next: ignore temp copies: echo '.*.secrit-*' >> {}\n",
             repo.join(".gitignore").display()
         )),
         "{err}"

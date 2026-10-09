@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::backend::sops::SopsFormat;
+
 pub const ENV_CONFIG: &str = "SECRIT_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 30;
@@ -77,6 +79,7 @@ struct RawConfig {
 struct RawStore {
     backend: BackendKind,
     file: String,
+    format: Option<SopsFormat>,
     sops_config: Option<String>,
     age_key_file: Option<String>,
     #[serde(default)]
@@ -155,6 +158,9 @@ pub enum BackendConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SopsStore {
     pub file: PathBuf,
+    /// The `format` key. With none, the backend takes the format from the
+    /// file name (v0.2 plan 5.8).
+    pub format: Option<SopsFormat>,
     pub sops_config: Option<PathBuf>,
     pub age_key_file: Option<PathBuf>,
 }
@@ -264,6 +270,7 @@ impl Config {
             let backend = match s.backend {
                 BackendKind::Sops => BackendConfig::Sops(SopsStore {
                     file: expand(&s.file, home, &key("file"))?,
+                    format: s.format,
                     sops_config: s
                         .sops_config
                         .map(|v| expand(&v, home, &key("sops_config")))
@@ -530,6 +537,7 @@ timeout_secs = 5
             wire_hint,
             backend: BackendConfig::Sops(SopsStore {
                 file: "/r/secrets/main.yaml".into(),
+                format: None,
                 sops_config: sops_config.map(PathBuf::from),
                 age_key_file: Some("/r/keys/key1.txt".into()),
             }),
@@ -564,7 +572,7 @@ timeout_secs = 5
         let e = parse(&format!("{head}file = \"/s.yaml\"\nfiel = \"/x\"\n")).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `wire_hint`"
+            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `format`, `sops_config`, `age_key_file`, `wire_hint`"
         );
         let e = parse(&format!("{head}file = 5\n")).unwrap_err();
         assert_eq!(
@@ -587,13 +595,35 @@ timeout_secs = 5
             for typo in [
                 "fiel = \"/x\"\n",
                 "wire-hint = true\n",
-                "format = \"yaml\"\n",
+                "Format = \"json\"\n",
             ] {
                 let bad = format!("{good}{typo}");
                 let e = parse(&bad).unwrap_err();
                 assert!(matches!(e, ConfigError::Parse { .. }), "{bad}");
                 assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
             }
+        }
+    }
+
+    /// The `format` key of a sops store takes `yaml` or `json` (v0.2 plan
+    /// 5.8). A format that secrit does not support yet is refused at its
+    /// own line.
+    #[test]
+    fn the_sops_format_key_is_checked() {
+        let head = "[stores.a]\nbackend = \"sops\"\nfile = \"/s.sops\"\n";
+        for (value, want) in [
+            ("yaml", Some(SopsFormat::Yaml)),
+            ("json", Some(SopsFormat::Json)),
+        ] {
+            let c = parse(&format!("{head}format = \"{value}\"\n")).unwrap();
+            assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, want);
+        }
+        let c = parse(head).unwrap();
+        assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, None);
+        for value in ["\"dotenv\"", "\"ini\"", "\"JSON\"", "5"] {
+            let e = parse(&format!("{head}format = {value}\n")).unwrap_err();
+            assert!(matches!(e, ConfigError::Parse { .. }), "{value}");
+            assert!(e.to_string().contains("line 4, column 10"), "{value}: {e}");
         }
     }
 

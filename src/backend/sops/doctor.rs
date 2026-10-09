@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use super::{MIN_SOPS, SopsBackend};
+use super::{MIN_SOPS, SopsBackend, SopsFormat};
 use crate::backend::{BackendError, DoctorCtx};
 use crate::cmd::doctor::git_add_hint;
 use crate::cmd::shell_path;
@@ -222,7 +222,7 @@ fn temp_files_check(r: &mut Report, check: &str, backend: &SopsBackend) {
         if !(n.starts_with(&prefix)
             && Path::new(&n)
                 .extension()
-                .is_some_and(|e| e == backend.format.temp_ext()))
+                .is_some_and(SopsFormat::is_temp_ext))
         {
             continue;
         }

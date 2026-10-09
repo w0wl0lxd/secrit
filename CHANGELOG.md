@@ -41,12 +41,27 @@ All notable changes to this project are recorded here. The format follows
   ignore them, as `init` does.
 - `init` and `wire` print a reminder to exclude the store file from a pre-commit spell
   checker, next to the `git add` line (PLAN Q1).
+- sops JSON stores (v0.2 plan S4). A store's `format` key takes `yaml` or `json`. With no
+  `format`, a file name that ends in `.json` means JSON and any other name means YAML; a
+  `.env` or `.ini` name is refused with exit 3 until secrit supports that format. Every
+  sops run passes the store's format as `--input-type` and `--output-type`, and temp
+  copies end in the format's extension. `doctor` lists a leftover temp copy with the
+  extension of any format, so a copy from before a `format` change shows too. A JSON
+  store must be strict JSON: one value, no byte order mark and no key twice in one object.
+- `secrit init --format yaml|json` creates a store in that format and writes the
+  `format` key into a new config. A flag that does not match the file name exits 3
+  before init makes a file.
+- `secrit wire` prints the store's format in the sops-nix stanza (`format = "json";`).
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
 
 ### Changed
 
+- The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
+  `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML
+  store, so `doctor` passes it there; for a JSON store, `doctor` warns and names the new
+  line.
 - Internal refactor for v0.2 backends, with no change to the config format, the messages
   or the exit codes. A `[stores.NAME]` table now parses to one settings type per
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
@@ -95,11 +110,13 @@ All notable changes to this project are recorded here. The format follows
   table. It printed a `default_store` line too, which broke the config when appended.
 - `init` and `doctor` announce a config picked by `SECRIT_CONFIG` on stderr, like the
   other commands; `-q` hides the line.
-- `store` and `rm` refuse a store file that is sops JSON (also after a UTF-8 byte order
-  mark), or whose name ends in `.json`, `.env` or `.ini`, with exit 3, and leave it
-  unchanged. Before, a write turned a JSON
-  store into YAML, which a reader that expects JSON cannot parse. `init` refuses such a
-  file too, and `doctor` shows it as a failed `file` row; `ls` and `get` still read it.
+- `store` and `rm` refuse a store file whose content or name does not match the store's
+  format, with exit 3, and leave it unchanged: sops JSON (also after a UTF-8 byte order
+  mark) or a `.json` name in a YAML store, and a file that is not strict JSON or a
+  `.yaml` or `.yml` name in a JSON store. Before, a write turned a JSON store into YAML,
+  which a reader that expects JSON cannot parse. `init` refuses such a file too, and
+  `doctor` shows it as a failed `file` row; `ls` and `get` still read a file that the
+  store's own parser reads.
 
 ### Security
 

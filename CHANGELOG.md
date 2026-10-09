@@ -44,7 +44,19 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
-- Internal: the output masker for the coming `secrit run` (v0.2). No command uses it yet.
+- `secrit run [--file VAR=NAME]... [--env VAR=NAME]... [--pristine] [--no-mask] -- CMD`
+  (v0.2, Linux). It reads every value first, then starts CMD. `--file` hands a value
+  through a sealed memfd named `secrit` (`VAR=/dev/fd/N`, readable more than once).
+  `--env` puts the value in the environment and refuses a value with NUL. `--pristine`
+  starts CMD with only those variables. When stdout or stderr is not a terminal, or an
+  agent is detected, the output is masked; otherwise, and with `--no-mask`, secrit
+  replaces itself with CMD. Under agent detection `--env` and `--no-mask` exit 3, and
+  `--file` runs with masking. Ctrl-C and Ctrl-Z reach CMD; when CMD stops, secrit stops
+  too, and `fg` resumes both. TERM and HUP are forwarded. secrit exits with CMD's exit
+  code, or ends by the signal that ended CMD. CMD gets the umask that secrit started with.
+  Held output goes out after 100 ms with no new output, so a prompt with no newline is
+  shown.
+- Internal: the output masker for `secrit run` (v0.2).
   It replaces a value and its base64 (both alphabets, three byte offsets, with and without
   padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
   possible start of a match, so a prompt with no newline goes out at once. A value shorter
@@ -60,6 +72,10 @@ All notable changes to this project are recorded here. The format follows
     value is shown. It never shows a full match.
   - Comparisons of secret bytes run in constant time. A small write after a large one no
     longer wipes the whole output buffer.
+  - A constant-time compare of the first 8 bytes of each pattern runs before the full
+    compare (issue #10). With a 4 KiB value and 64 MiB of output that often holds the
+    first byte of the value, a release build masked about 0.4 MiB/s before and about
+    120 MiB/s after.
 
 ### Changed
 

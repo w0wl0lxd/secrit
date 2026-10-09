@@ -202,6 +202,11 @@ secrit rm NAME [--yes]
 
 ### 4.5 `secrit run` (v0.2)
 
+Built in v0.2 (slice S13). The v0.2 plan, section 7.1, replaces this section where they
+differ: `--env` is refused under agent detection (Q27), `--pristine` is added, the tail
+buffer gives way to the prefix-hold rule with an idle flush, and the process model of 7.1
+step 5 applies.
+
 Moved to v0.2 (milestone M6, open question Q12). The memfd sealing and the output masking need
 their own design and tests. This section is the starting point for that design.
 
@@ -543,7 +548,8 @@ the readback and `get` give sops the bytes on stdin instead (SEC-11).
 7. Create `.<basename>.secrit-<random>.yaml` in the same directory with `O_EXCL | O_NOFOLLOW`,
    mode 0600, and copy the ciphertext into it. The copy holds ciphertext only.
 8. SIGINT, SIGTERM, SIGHUP and SIGQUIT are deferred in secrit (the stuck-process reaper
-   signals a whole process group). Run sops in its own process group, so a group signal does
+   signals a whole process group). The stop and deferred-signal rules of this step apply
+   to sops runs; the command of `run` follows v0.2 plan 7.1, step 5. Run sops in its own process group, so a group signal does
    not reach it:
    `sops --config C set --input-type yaml --output-type yaml --value-stdin COPY '["NAME"]'`
    (or `unset COPY '["NAME"]'`). The JSON-encoded value goes on stdin. Every sops run is
@@ -619,7 +625,7 @@ An agent is detected when any of these is true:
   `CLINE_ACTIVE`, `OPENCODE_CLIENT`;
 - `/dev/tty` cannot be opened.
 
-When an agent is detected: `get` is refused (in v0.2, `run --no-mask` is refused and `run`
+When an agent is detected: `get` is refused (in v0.2, `run --no-mask` and `run --env` are refused and `run`
 masks); `store`, `ls`, `rm --yes`, `doctor`, `wire` and `init` work. There is no override variable, because an
 agent can set any variable (open question Q5). The list lives in one constant and the docs.
 Whether an agent may write the store file at all is open question Q13: with the Q1 default,

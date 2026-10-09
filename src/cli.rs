@@ -117,6 +117,24 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = WireFormat::Nix)]
         format: WireFormat,
     },
+    /// Run a command with secrets in sealed memfds (--file) or in its environment (--env); its output is masked
+    Run {
+        /// Put the value of NAME in a sealed memfd and set VAR=/dev/fd/N (Linux)
+        #[arg(long = "file", value_name = "VAR=NAME")]
+        file: Vec<String>,
+        /// Set VAR to the value of NAME; refused when an agent is detected
+        #[arg(long = "env", value_name = "VAR=NAME")]
+        env: Vec<String>,
+        /// Start CMD with only the --file and --env variables
+        #[arg(long)]
+        pristine: bool,
+        /// Do not mask the output: secrit replaces itself with CMD; refused when an agent is detected
+        #[arg(long)]
+        no_mask: bool,
+        /// The command and its arguments, after '--'
+        #[arg(value_name = "CMD", required = true, last = true, num_args = 1..)]
+        command: Vec<OsString>,
+    },
     /// Print shell completions
     #[command(hide = true)]
     Completions {
@@ -235,6 +253,27 @@ mod tests {
         let msg = sanitized_message(err.kind());
         assert!(!msg.contains("hunter2"));
         assert!(!msg.contains("--value"));
+    }
+
+    #[test]
+    fn run_takes_the_command_after_a_double_dash() {
+        let cli = Cli::try_parse_from([
+            "secrit", "run", "--file", "A=a", "--env", "B=b", "--file", "C=c", "--", "cmd",
+            "--file", "x",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                file, env, command, ..
+            } => {
+                assert_eq!(file, ["A=a", "C=c"]);
+                assert_eq!(env, ["B=b"]);
+                assert_eq!(command, ["cmd", "--file", "x"]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["secrit", "run", "--file", "A=a", "cmd"]).is_err());
+        assert!(Cli::try_parse_from(["secrit", "run", "--file", "A=a"]).is_err());
     }
 
     #[test]

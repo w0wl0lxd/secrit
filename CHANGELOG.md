@@ -57,6 +57,9 @@ All notable changes to this project are recorded here. The format follows
   is unchanged.
 - CI: a `darwin-clippy` job runs clippy for `aarch64-apple-darwin` on Linux, to catch
   macOS cfg errors without a Mac.
+- A config parse error names the line and column of the bad key or value, for example
+  `invalid config file PATH: line 6, column 1: unknown field ...`. The unknown-key error
+  inside `[stores.NAME]` lists `backend` among the expected keys again.
 
 ### Fixed
 

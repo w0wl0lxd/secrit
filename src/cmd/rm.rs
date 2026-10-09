@@ -21,6 +21,7 @@ pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     ctx.status(&format!(
         "removed {name}. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked."
     ));
+    ctx.commit_hint(name, "Remove");
     Ok(())
 }
 

@@ -28,6 +28,7 @@ use crate::report::Report;
 use crate::secret::SecretValue;
 
 pub use self::runner::MIN_SOPS;
+pub(crate) use self::runner::redact;
 #[cfg(test)]
 pub use self::runner::{NEED_SOPS, PROMPT_HINT};
 

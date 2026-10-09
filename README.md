@@ -28,6 +28,9 @@ Read this first.
   can read it too: for example Kitty remote control, a screen recorder or a screen share.
 - **No clipboard in v0.1.** secrit has no clipboard support: clipboard history daemons
   keep values on disk. Use `get --stdout` into a pipe instead.
+- **gpg-agent (pass stores).** Any process that can use your gpg-agent can decrypt the
+  entries of a pass store while the agent caches the passphrase, or at any time when the
+  key has no passphrase. secrit's agent rules do not change that.
 - **Old values.** `rm` and `store --replace` keep a ciphertext backup in
   `$XDG_STATE_HOME/secrit/backups/` (default `~/.local/state/secrit/backups/`), the newest
   10 per store. Git history, backups and rendered `/run/secrets` copies keep old values.
@@ -89,13 +92,14 @@ group or others. Unknown keys are an error.
 default_store = "main"
 
 [stores.main]
-backend = "sops"                              # v0.1: only "sops"
+backend = "sops"                              # "sops" or "pass"
 file = "/etc/nixos/secrets/secrit.yaml"       # an existing sops file
 sops_config = "/etc/nixos/.sops.yaml"         # optional; default: nearest .sops.yaml upward from `file`
 age_key_file = "~/.config/sops/age/keys.txt"  # optional; default: $XDG_CONFIG_HOME/sops/age/keys.txt
 
 [tools]
 sops = "auto"        # "auto" = baked-in path, else PATH; or an absolute path
+gpg = "auto"         # pass stores: "auto" = baked-in path only (no PATH); or an absolute path
 
 [lock]
 timeout_secs = 30
@@ -181,6 +185,58 @@ To set up the same store by hand:
    ```
 
    The value then appears at `/run/secrets/github-token`.
+
+## pass layout store
+
+A store with `backend = "pass"` uses the password-store layout: one gpg-encrypted file
+per name, `<dir>/<prefix>/<name>.gpg`. `pass` and `gopass` read the entries that secrit
+writes, and secrit reads theirs. secrit runs `gpg` itself and never runs `pass` or
+`gopass`. The support is gopass-compatible, with no auto-sync: secrit never pulls, pushes
+or commits.
+
+```toml
+[stores.pw]
+backend = "pass"
+dir = "~/.password-store"   # the store directory; it must hold a .gpg-id (run 'pass init KEY')
+prefix = "secrit"           # optional; entries go in <dir>/secrit/
+gnupg_home = "~/.gnupg"     # optional; default: $GNUPGHOME when absolute, else ~/.gnupg
+value = "whole"             # or "first-line"
+pinentry = "error"          # or "agent"
+```
+
+`secrit init --backend pass --pass-dir DIR` checks the directory, the `.gpg-id` and each
+recipient key, then writes the config or, when a config exists, prints the
+`[stores.NAME]` section to add. It never creates the store: `pass init KEY` does that.
+`wire_hint` does not apply to a pass store, and `wire` works with sops stores only.
+
+- **Recipients.** secrit encrypts to the keys in the nearest `.gpg-id`, from the entry's
+  directory up to `dir`. Each line must name exactly one key in the keyring with a usable
+  encryption subkey. Recipients and settings from `gpg.conf` (`encrypt-to`,
+  `hidden-encrypt-to`) are not added. After the encryption, secrit lists the packets of
+  the new file (no decryption) and checks that only those keys can decrypt it, before the
+  rename.
+- **Signed `.gpg-id`.** A `.gpg-id.sig` beside the nearest `.gpg-id` refuses `store` and
+  `rm` with exit 3: secrit does not verify the signature yet.
+- **Value.** `store` writes the value and one newline, as `pass insert` does. With
+  `value = "whole"`, `get` returns the file minus one trailing newline, so every value
+  round-trips exactly. With `value = "first-line"`, `get` returns the first line (the pass
+  password, without the `login:` and `url:` lines), and `store` refuses a value with a
+  newline.
+- **Passphrase.** A write needs no passphrase. `get` passes `--pinentry-mode error` to
+  gpg: a passphrase that gpg-agent has cached works, and a needed passphrase fails at once
+  with a hint. With `pinentry = "agent"`, and only when no coding agent is detected and
+  `/dev/tty` opens, gpg-agent may ask with its own pinentry. That pinentry can be a GUI
+  window on your desktop.
+- **gpg runs** with a cleared environment that holds only `GNUPGHOME`, and with
+  `--batch --no-tty`. secrit takes `gpg` from `tools.gpg` or from the path baked into the
+  Nix package, never from `PATH`.
+- **git.** secrit never commits. When `dir` is in a git repository, `store` and `rm` print
+  the `git add` and `git commit` commands; run them yourself.
+- `ls` walks `<dir>/<prefix>` (8 levels at most) for `*.gpg` files. It decrypts nothing,
+  and it skips hidden names and symlinks. `rm` keeps a ciphertext backup, as for sops
+  stores; empty subdirectories stay.
+- `doctor` checks the `gpg` binary and version, the store directory, the `GNUPGHOME` mode,
+  the `.gpg-id`, each recipient key, a `.gpg-id.sig` (warn) and the git state.
 
 ## Use
 
@@ -271,13 +327,14 @@ not one that lands after it.
 | `init`, `doctor`, `wire` | Works | |
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
+| pass layout store (`backend = "pass"`) | Not in v0.1 | Works on this branch (v0.2, S11) |
 | `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
 | `--clip` (clipboard) | Not in v0.1 | v0.2, optional (Q4) |
 
 ## Develop
 
 ```sh
-nix develop                       # Rust, sops, age, ssh-keygen, util-linux, cargo-nextest, cargo-deny
+nix develop                       # Rust, sops, age, ssh-keygen, gnupg, pass, gopass, util-linux, cargo-nextest, cargo-deny
 cargo nextest run --all-features  # unit, integration and terminal tests
 nix flake check                   # fmt, clippy, nextest, cargo-deny, the package, the HM module
 ```
@@ -285,7 +342,9 @@ nix flake check                   # fmt, clippy, nextest, cargo-deny, the packag
 The integration tests run the real `sops` and `age-keygen` against a temp directory with
 a temp HOME and new age keys. They find the tools through `SECRIT_TEST_SOPS`,
 `SECRIT_TEST_AGE_KEYGEN` and `SECRIT_TEST_SSH_KEYGEN` (the devShell sets them), else
-`PATH`. The terminal tests need util-linux `script` and `setsid`; they fail, not skip,
+`PATH`. The pass tests run the real `gpg`, `pass` and `gopass` (`SECRIT_TEST_GPG`,
+`SECRIT_TEST_PASS`, `SECRIT_TEST_GOPASS`) with a new `GNUPGHOME` and keys in the temp
+directory. The terminal tests need util-linux `script` and `setsid`; they fail, not skip,
 when those are missing. The `test-hooks` feature adds fault injection
 (`SECRIT_TEST_HOOK`) for the crash and signal tests; it is never on in a release build.
 

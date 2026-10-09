@@ -64,7 +64,7 @@ fn assert_backups<F: Fixture>(f: &F, want_with_backups: usize) {
 /// the name reach the shell as positional parameters, never as shell text;
 /// the quote in the file name proves it. No pipe, so the exit status is
 /// secrit's.
-fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) {
+pub fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) {
     let dest = f.dirs().root.path().join("get 'it'.out");
     let _ = std::fs::remove_file(&dest);
     let mut envs = vec![

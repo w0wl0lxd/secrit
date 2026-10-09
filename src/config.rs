@@ -50,6 +50,14 @@ pub enum ConfigError {
     ZeroTimeout,
     #[error("store {0} does not use the sops backend")]
     NotSops(String),
+    #[error("config key {key} is required for the {backend} backend")]
+    MissingKey { key: String, backend: &'static str },
+    #[error("config key {key} does not apply to the {backend} backend; remove it")]
+    ForeignKey { key: String, backend: &'static str },
+    #[error(
+        "config key {key}: use a relative path of plain directory names, with no '.', '..' or hidden part"
+    )]
+    BadPrefix { key: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,11 +84,15 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawStore {
     backend: BackendKind,
-    file: String,
+    file: Option<String>,
     sops_config: Option<String>,
     age_key_file: Option<String>,
-    #[serde(default)]
-    wire_hint: bool,
+    dir: Option<String>,
+    prefix: Option<String>,
+    gnupg_home: Option<String>,
+    value: Option<PassValue>,
+    pinentry: Option<Pinentry>,
+    wire_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +107,7 @@ struct RawNix {
 struct RawTools {
     sops: Option<String>,
     age_keygen: Option<String>,
+    gpg: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +128,41 @@ impl Default for RawLock {
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Sops,
+    /// The password-store layout: one gpg file per name (v0.2 plan 6.4).
+    Pass,
+}
+
+impl BackendKind {
+    /// The value of the `backend` key.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendKind::Sops => "sops",
+            BackendKind::Pass => "pass",
+        }
+    }
+}
+
+/// Which part of a pass entry is the value (v0.2 plan 6.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PassValue {
+    /// The whole file minus one trailing newline.
+    #[default]
+    Whole,
+    /// The bytes before the first newline: the pass password.
+    FirstLine,
+}
+
+/// Whether gpg may ask gpg-agent for a pinentry on `get` (v0.2 plan 6.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Pinentry {
+    /// `--pinentry-mode error`: a needed passphrase fails at once.
+    #[default]
+    Error,
+    /// gpg-agent's own pinentry, only with no agent and a terminal.
+    Agent,
 }
 
 /// One store of the config.
@@ -128,13 +176,18 @@ pub struct StoreConfig {
 impl StoreConfig {
     /// The sops settings, or `None` for a store of another backend.
     #[must_use]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "None once a second backend exists (v0.2 plan 5.1)"
-    )]
     pub fn sops(&self) -> Option<&SopsStore> {
         match &self.backend {
             BackendConfig::Sops(sops) => Some(sops),
+            BackendConfig::Pass(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> BackendKind {
+        match &self.backend {
+            BackendConfig::Sops(_) => BackendKind::Sops,
+            BackendConfig::Pass(_) => BackendKind::Pass,
         }
     }
 
@@ -149,6 +202,32 @@ impl StoreConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
     Sops(SopsStore),
+    Pass(PassStore),
+}
+
+/// The settings of a pass layout store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassStore {
+    /// The password-store directory, the one that holds the root `.gpg-id`.
+    pub dir: PathBuf,
+    /// The subdirectory of `dir` that holds this store's entries, as plain
+    /// directory names joined by `/`; `None` for `dir` itself.
+    pub prefix: Option<String>,
+    /// `None`: `$GNUPGHOME` when it is absolute, else `~/.gnupg`.
+    pub gnupg_home: Option<PathBuf>,
+    pub value: PassValue,
+    pub pinentry: Pinentry,
+}
+
+impl PassStore {
+    /// The directory of the entries: `dir`, then `prefix`.
+    #[must_use]
+    pub fn entries_dir(&self) -> PathBuf {
+        match &self.prefix {
+            Some(p) => self.dir.join(p),
+            None => self.dir.clone(),
+        }
+    }
 }
 
 /// The settings of a sops store.
@@ -176,6 +255,17 @@ pub enum ToolSetting {
 pub struct ToolsConfig {
     pub sops: ToolSetting,
     pub age_keygen: ToolSetting,
+    pub gpg: ToolSetting,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            sops: ToolSetting::Auto,
+            age_keygen: ToolSetting::Auto,
+            gpg: ToolSetting::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,23 +350,11 @@ impl Config {
         }
         let mut stores = BTreeMap::new();
         for (name, s) in raw.stores {
-            let key = |k: &str| format!("stores.{name}.{k}");
-            let backend = match s.backend {
-                BackendKind::Sops => BackendConfig::Sops(SopsStore {
-                    file: expand(&s.file, home, &key("file"))?,
-                    sops_config: s
-                        .sops_config
-                        .map(|v| expand(&v, home, &key("sops_config")))
-                        .transpose()?,
-                    age_key_file: s
-                        .age_key_file
-                        .map(|v| expand(&v, home, &key("age_key_file")))
-                        .transpose()?,
-                }),
-            };
+            let wire_hint = s.wire_hint.unwrap_or(false);
+            let backend = parse_store(&name, s, home)?;
             let store = StoreConfig {
                 name: name.clone(),
-                wire_hint: s.wire_hint,
+                wire_hint,
                 backend,
             };
             stores.insert(name, store);
@@ -307,6 +385,7 @@ impl Config {
                     home,
                     "tools.age_keygen",
                 )?,
+                gpg: tool_setting(raw.tools.gpg.as_deref(), home, "tools.gpg")?,
             },
             lock_timeout: Duration::from_secs(raw.lock.timeout_secs),
         })
@@ -342,6 +421,79 @@ fn parse_message(text: &str, e: &toml::de::Error) -> String {
         })
         .unwrap_or_default();
     format!("{at}{}", e.message())
+}
+
+/// One store table as its backend's settings. A key that only another
+/// backend takes is an error, so a typo of the `backend` value is not
+/// silently a store with other defaults.
+fn parse_store(name: &str, s: RawStore, home: &Path) -> Result<BackendConfig, ConfigError> {
+    let backend = s.backend.name();
+    let key = |k: &str| format!("stores.{name}.{k}");
+    let refuse = |present: bool, k: &str| {
+        if present {
+            Err(ConfigError::ForeignKey {
+                key: key(k),
+                backend,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    let path = |v: Option<String>, k: &str| v.map(|v| expand(&v, home, &key(k))).transpose();
+    let required = |v: Option<String>, k: &str| -> Result<PathBuf, ConfigError> {
+        let v = v.ok_or_else(|| ConfigError::MissingKey {
+            key: key(k),
+            backend,
+        })?;
+        expand(&v, home, &key(k))
+    };
+    match s.backend {
+        BackendKind::Sops => {
+            refuse(s.dir.is_some(), "dir")?;
+            refuse(s.prefix.is_some(), "prefix")?;
+            refuse(s.gnupg_home.is_some(), "gnupg_home")?;
+            refuse(s.value.is_some(), "value")?;
+            refuse(s.pinentry.is_some(), "pinentry")?;
+            Ok(BackendConfig::Sops(SopsStore {
+                file: required(s.file, "file")?,
+                sops_config: path(s.sops_config, "sops_config")?,
+                age_key_file: path(s.age_key_file, "age_key_file")?,
+            }))
+        }
+        BackendKind::Pass => {
+            refuse(s.file.is_some(), "file")?;
+            refuse(s.sops_config.is_some(), "sops_config")?;
+            refuse(s.age_key_file.is_some(), "age_key_file")?;
+            // `wire` emits sops-nix stanzas only.
+            refuse(s.wire_hint.is_some(), "wire_hint")?;
+            Ok(BackendConfig::Pass(PassStore {
+                dir: required(s.dir, "dir")?,
+                prefix: s
+                    .prefix
+                    .map(|p| parse_prefix(&p, &key("prefix")))
+                    .transpose()?
+                    .flatten(),
+                gnupg_home: path(s.gnupg_home, "gnupg_home")?,
+                value: s.value.unwrap_or_default(),
+                pinentry: s.pinentry.unwrap_or_default(),
+            }))
+        }
+    }
+}
+
+/// The prefix as `a/b`, without a trailing `/`; `None` when it is empty.
+fn parse_prefix(value: &str, key: &str) -> Result<Option<String>, ConfigError> {
+    let parts: Vec<&str> = value.trim_end_matches('/').split('/').collect();
+    if parts == [""] {
+        return Ok(None);
+    }
+    let bad = |p: &&str| p.is_empty() || p.starts_with('.') || p.contains('\0');
+    if parts.iter().any(bad) {
+        return Err(ConfigError::BadPrefix {
+            key: key.to_owned(),
+        });
+    }
+    Ok(Some(parts.join("/")))
 }
 
 fn tool_setting(v: Option<&str>, home: &Path, key: &str) -> Result<ToolSetting, ConfigError> {
@@ -564,7 +716,7 @@ timeout_secs = 5
         let e = parse(&format!("{head}file = \"/s.yaml\"\nfiel = \"/x\"\n")).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `wire_hint`"
+            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `dir`, `prefix`, `gnupg_home`, `value`, `pinentry`, `wire_hint`"
         );
         let e = parse(&format!("{head}file = 5\n")).unwrap_err();
         assert_eq!(
@@ -581,7 +733,10 @@ timeout_secs = 5
     /// Each backend refuses the keys that it does not take (v0.2 plan 5.8).
     #[test]
     fn each_backend_refuses_unknown_keys() {
-        for (backend, keys) in [("sops", "file = \"/s.yaml\"\n")] {
+        for (backend, keys) in [
+            ("sops", "file = \"/s.yaml\"\n"),
+            ("pass", "dir = \"~/.password-store\"\n"),
+        ] {
             let good = format!("[stores.a]\nbackend = \"{backend}\"\n{keys}");
             assert!(parse(&good).is_ok(), "{good}");
             for typo in [
@@ -595,6 +750,114 @@ timeout_secs = 5
                 assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
             }
         }
+    }
+
+    /// A key of another backend, or a missing required key, names the key
+    /// and the backend.
+    #[test]
+    fn each_backend_refuses_the_keys_of_another() {
+        for (backend, good, foreign) in [
+            (
+                "sops",
+                "file = \"/s.yaml\"\n",
+                &[
+                    "dir = \"/d\"\n",
+                    "prefix = \"p\"\n",
+                    "gnupg_home = \"/g\"\n",
+                    "value = \"whole\"\n",
+                    "pinentry = \"error\"\n",
+                ][..],
+            ),
+            (
+                "pass",
+                "dir = \"/d\"\n",
+                &[
+                    "file = \"/s.yaml\"\n",
+                    "sops_config = \"/c\"\n",
+                    "age_key_file = \"/k\"\n",
+                    "wire_hint = false\n",
+                ][..],
+            ),
+        ] {
+            let head = format!("[stores.a]\nbackend = \"{backend}\"\n");
+            for extra in foreign {
+                let e = parse(&format!("{head}{good}{extra}")).unwrap_err();
+                let key = extra.split(' ').next().unwrap();
+                assert_eq!(
+                    e.to_string(),
+                    format!(
+                        "config key stores.a.{key} does not apply to the {backend} backend; remove it"
+                    )
+                );
+            }
+            let e = parse(&head).unwrap_err();
+            assert!(matches!(e, ConfigError::MissingKey { .. }), "{e}");
+            assert!(e.to_string().contains(backend), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_pass_store_parses_with_defaults() {
+        let c = parse("[stores.p]\nbackend = \"pass\"\ndir = \"~/.password-store\"\n").unwrap();
+        let s = c.store(Some("p")).unwrap();
+        assert_eq!(s.kind(), BackendKind::Pass);
+        assert!(s.sops().is_none());
+        assert!(matches!(s.require_sops(), Err(ConfigError::NotSops(_))));
+        let BackendConfig::Pass(p) = &s.backend else {
+            panic!("not a pass store");
+        };
+        assert_eq!(
+            p,
+            &PassStore {
+                dir: "/home/u/.password-store".into(),
+                prefix: None,
+                gnupg_home: None,
+                value: PassValue::Whole,
+                pinentry: Pinentry::Error,
+            }
+        );
+        assert_eq!(c.tools.gpg, ToolSetting::Auto);
+
+        let c = parse(
+            "[stores.p]\nbackend = \"pass\"\ndir = \"/d\"\nprefix = \"team/x/\"\ngnupg_home = \"~/g\"\nvalue = \"first-line\"\npinentry = \"agent\"\n\n[tools]\ngpg = \"/nix/store/x-gnupg/bin/gpg\"\n",
+        )
+        .unwrap();
+        let BackendConfig::Pass(p) = &c.store(Some("p")).unwrap().backend else {
+            panic!("not a pass store");
+        };
+        assert_eq!(p.prefix.as_deref(), Some("team/x"));
+        assert_eq!(p.entries_dir(), Path::new("/d/team/x"));
+        assert_eq!(p.gnupg_home.as_deref(), Some(Path::new("/home/u/g")));
+        assert_eq!(p.value, PassValue::FirstLine);
+        assert_eq!(p.pinentry, Pinentry::Agent);
+        assert_eq!(
+            c.tools.gpg,
+            ToolSetting::Path("/nix/store/x-gnupg/bin/gpg".into())
+        );
+    }
+
+    #[test]
+    fn a_pass_prefix_stays_inside_the_store() {
+        let with = |prefix: &str| {
+            parse(&format!(
+                "[stores.p]\nbackend = \"pass\"\ndir = \"/d\"\nprefix = \"{prefix}\"\n"
+            ))
+        };
+        for bad in ["..", "a/../b", "/abs", "a//b", ".hidden", "a/./b"] {
+            assert!(
+                matches!(with(bad), Err(ConfigError::BadPrefix { .. })),
+                "{bad}"
+            );
+        }
+        let c = with("").unwrap();
+        let BackendConfig::Pass(p) = &c.store(Some("p")).unwrap().backend else {
+            panic!("not a pass store");
+        };
+        assert_eq!(p.prefix, None);
+        assert!(matches!(
+            parse("[stores.p]\nbackend = \"pass\"\ndir = \"/d\"\nvalue = \"all\"\n"),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]

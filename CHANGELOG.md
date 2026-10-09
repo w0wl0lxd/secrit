@@ -55,8 +55,31 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- sops key sources (v0.2 plan S8): `age_ssh_key_file` (an SSH key with no passphrase),
+  `age_key_cmd` (an absolute, trusted program; `age_key_cmd_timeout_secs`, default 20)
+  and `age_plugin_dir` (the only `PATH` that sops gets; it holds only trusted
+  `age-plugin-*` programs). An unsafe key command or plugin directory exits 3.
+- A `[stores.NAME.identity]` table with `kind` `file`, `ssh-file`, `key-cmd` or `plugin`.
+  A plugin identity never falls back to the age key file, needs `/dev/tty`, writes one
+  touch line per decrypting sops run, and uses `touch_timeout_secs` (default 30) as the
+  sops deadline. It refuses a fido2-hmac v2 recipient, a plain key that the user can
+  read, a non-age key type, a YubiKey slot with touch policy `cached`, and a `level`
+  stricter than the slot. This build serves levels up to `touch`. A stub file that holds
+  a plain age key, or that is larger than 16 KiB, exits 3. A store name shows in the
+  touch line with its control characters escaped, and a run that secrit refuses before
+  sops starts writes no touch line.
+- `doctor` rows for the SSH key (owner, mode and passphrase, from the key header only),
+  the key command (trust rule and shebang), the plugin directory and the plugin identity.
+  `doctor` runs `age-plugin-yubikey --list` only from a plugin directory that passes the
+  trust rule.
 
 ### Changed
+
+- The message for a sops run that stopped to ask on the terminal names the configured key
+  source, not "v0.1 supports only an age key file". A key command that fails because it
+  needs `PATH` gets a note on the cleared environment. A run that hits the shorter key
+  source deadline says what it may wait on.
+- The default age key file applies only when the store names no other key source.
 
 - The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
   `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML

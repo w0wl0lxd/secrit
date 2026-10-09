@@ -122,12 +122,10 @@ pub fn open_with(
     match &store.backend {
         BackendConfig::Sops(sops) => {
             let path = tool(tools::SOPS, &config.tools.sops)?;
-            Ok(Box::new(SopsBackend::new(
-                sops,
-                path,
-                config.lock_timeout,
-                env,
-            )?))
+            Ok(Box::new(
+                SopsBackend::new(sops, path, config.lock_timeout, env)?
+                    .with_store_name(&store.name),
+            ))
         }
     }
 }
@@ -274,6 +272,19 @@ pub enum BackendError {
         step: &'static str,
         target: Target,
         after: std::time::Duration,
+    },
+    /// [`Self::ToolTimeout`] of a run that may have waited on a key source
+    /// (v0.2 plan 6.2, slice S8). `waits` says what it may wait on.
+    #[error(
+        "{tool} {step} for {target} did not finish within {} ms and was ended; the original file is untouched. {waits}",
+        after.as_millis()
+    )]
+    KeySourceTimeout {
+        tool: &'static str,
+        step: &'static str,
+        target: Target,
+        after: std::time::Duration,
+        waits: &'static str,
     },
     #[error(
         "no .sops.yaml for {}; sops needs a creation rule for it to create the file (pass --sops-config, or --write-sops-config to 'secrit init')",
@@ -496,7 +507,7 @@ mod tests {
                     target: named(),
                     hint: sops::PROMPT_HINT.into(),
                 },
-                "sops decrypt for 'tok' in /s/main.yaml stopped to ask for input on the terminal (a passphrase-protected key?) and was ended. secrit v0.1 supports only an age key file without a passphrase: set age_key_file in the config",
+                "sops decrypt for 'tok' in /s/main.yaml stopped to ask for input on the terminal (a passphrase-protected key?) and was ended. The key in age_key_file must have no passphrase, because secrit never gives sops the terminal (ruling Q24)",
             ),
             (
                 BackendError::ToolTimeout {
@@ -506,6 +517,16 @@ mod tests {
                     after: Duration::from_millis(1500),
                 },
                 "sops set for 'tok' in /s/main.yaml did not finish within 1500 ms and was ended; the original file is untouched",
+            ),
+            (
+                BackendError::KeySourceTimeout {
+                    tool: "sops",
+                    step: "decrypt",
+                    target: named(),
+                    after: Duration::from_millis(3000),
+                    waits: "The key command may wait.",
+                },
+                "sops decrypt for 'tok' in /s/main.yaml did not finish within 3000 ms and was ended; the original file is untouched. The key command may wait.",
             ),
             (
                 BackendError::ToolOutputTooLarge {

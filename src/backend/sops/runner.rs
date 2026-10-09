@@ -10,6 +10,9 @@
 //! crate forbids `unsafe`, so the stop is detected instead.
 //!
 //! Each run takes its own cap on the bytes it accepts on stdout.
+//!
+//! The key sources (v0.2 plan 6.2) live in `keys.rs`: they set the child
+//! variables, the deadline, the prompt hint and the touch line.
 
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
@@ -18,6 +21,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 use super::format::SopsFormat;
+use super::keys::KeySources;
 use crate::backend::{BackendError, Location, Target, ToolStatus};
 use crate::child::{self, ChildError, ChildOutput};
 use crate::display::escape;
@@ -29,8 +33,10 @@ use crate::trust::{self, TrustError};
 pub const MIN_SOPS: (u64, u64) = (3, 11);
 /// [`MIN_SOPS`] and the reason, for [`BackendError::ToolTooOld`].
 pub const NEED_SOPS: &str = "3.11 or newer (for 'set --value-stdin' and 'unset')";
-/// What to do when sops stops to ask on the terminal.
-pub const PROMPT_HINT: &str = "secrit v0.1 supports only an age key file without a passphrase: set age_key_file in the config";
+/// What to do when sops stops to ask on the terminal with the age key
+/// file of v0.1. Each key source has its own hint (`keys.rs`).
+#[cfg(test)]
+pub const PROMPT_HINT: &str = super::keys::AGE_KEY_HINT;
 /// The tool name in [`BackendError`] messages.
 const TOOL: &str = "sops";
 /// The `HOME` that sops gets. sops looks for `~/.ssh/id_ed25519` and
@@ -50,30 +56,40 @@ pub struct Runner {
     dir: PathBuf,
     /// Set once the sops version and the `.sops.yaml` passed their checks.
     checked: OnceLock<()>,
+    /// v0.2 S8: the key sources, the deadline and the touch line.
+    keys: KeySources,
 }
 
 impl Runner {
-    /// `age_key_file` reaches sops as `SOPS_AGE_KEY_FILE`.
+    /// `keys` add their child variables to the cleared environment.
     pub fn new(
         sops: PathBuf,
         sops_config: Option<PathBuf>,
-        age_key_file: Option<&Path>,
+        keys: KeySources,
         dir: PathBuf,
     ) -> Self {
         let mut child_env: Vec<(OsString, OsString)> = vec![
             ("SOPS_DISABLE_VERSION_CHECK".into(), "1".into()),
             ("HOME".into(), CHILD_HOME.into()),
         ];
-        if let Some(k) = age_key_file {
-            child_env.push(("SOPS_AGE_KEY_FILE".into(), k.as_os_str().to_owned()));
-        }
+        child_env.extend(keys.child_env());
         Self {
             sops,
             sops_config,
             child_env,
             dir,
             checked: OnceLock::new(),
+            keys,
         }
+    }
+
+    /// The key sources of the store.
+    pub fn keys(&self) -> &KeySources {
+        &self.keys
+    }
+
+    pub fn keys_mut(&mut self) -> &mut KeySources {
+        &mut self.keys
     }
 
     pub fn sops(&self) -> &Path {
@@ -119,6 +135,7 @@ impl Runner {
             return Ok(());
         }
         self.check_sops_config()?;
+        self.keys.check_sources()?;
         self.checked_version()?;
         let _ = self.checked.set(());
         Ok(())
@@ -225,10 +242,11 @@ impl Runner {
             .arg("--value-stdin")
             .arg(path)
             .arg(name.sops_path());
+        self.touch("set", &target)?;
         let out = self.run(cmd, Some(&json), 0, "set", target.clone())?;
         if !out.status.success() {
             let inner = &json[1..json.len() - 1];
-            return Err(failed("set", target, &out, &[value.expose(), inner]));
+            return Err(self.failed("set", target, &out, &[value.expose(), inner]));
         }
         Ok(())
     }
@@ -248,9 +266,10 @@ impl Runner {
             .arg(format.input_type())
             .arg(path)
             .arg(name.sops_path());
+        self.touch("unset", &target)?;
         let out = self.run(cmd, None, 0, "unset", target.clone())?;
         if !out.status.success() {
-            return Err(failed("unset", target, &out, &[]));
+            return Err(self.failed("unset", target, &out, &[]));
         }
         Ok(())
     }
@@ -274,12 +293,20 @@ impl Runner {
             .args(["--output-type", "json", "--extract"])
             .arg(name.sops_path())
             .arg("/dev/stdin");
+        self.touch(step, &target)?;
         let out = self.run(cmd, Some(bytes), MAX_VALUE_BYTES, step, target.clone())?;
         if !out.status.success() {
-            return Err(failed(step, target, &out, secrets));
+            return Err(self.failed(step, target, &out, secrets));
         }
         let mut stdout = out.stdout;
         Ok(SecretValue::new(std::mem::take(&mut *stdout)))
+    }
+
+    /// The touch line of a plugin identity, after the once-only checks: a
+    /// run that secrit refuses asks for no touch.
+    fn touch(&self, step: &str, target: &Target) -> Result<(), BackendError> {
+        self.check_once()?;
+        self.keys.touch(step, target)
     }
 
     /// [`Self::run_unchecked`] after the once-only checks. `step` and
@@ -304,7 +331,7 @@ impl Runner {
         step: &'static str,
         target: Target,
     ) -> Result<ChildOutput, BackendError> {
-        let timeout = child::timeout();
+        let timeout = self.keys.timeout();
         child::run(cmd, stdin, stdout_cap, timeout).map_err(|e| match e {
             ChildError::Io(source) => BackendError::Io {
                 step: "run",
@@ -316,13 +343,22 @@ impl Runner {
                 tool: TOOL,
                 step,
                 target,
-                hint: PROMPT_HINT.into(),
+                hint: self.keys.prompt_hint(),
             },
-            ChildError::Timeout => BackendError::ToolTimeout {
-                tool: TOOL,
-                step,
-                target,
-                after: timeout,
+            ChildError::Timeout => match self.keys.waits() {
+                Some(waits) => BackendError::KeySourceTimeout {
+                    tool: TOOL,
+                    step,
+                    target,
+                    after: timeout,
+                    waits,
+                },
+                None => BackendError::ToolTimeout {
+                    tool: TOOL,
+                    step,
+                    target,
+                    after: timeout,
+                },
             },
             ChildError::Overflow => BackendError::ToolOutputTooLarge {
                 tool: TOOL,
@@ -330,6 +366,27 @@ impl Runner {
                 target,
             },
         })
+    }
+}
+
+impl Runner {
+    /// [`failed`], with the key command note when its stderr shows that
+    /// the key command could not run (T47a).
+    pub fn failed(
+        &self,
+        step: &'static str,
+        target: Target,
+        out: &ChildOutput,
+        secrets: &[&[u8]],
+    ) -> BackendError {
+        let mut e = failed(step, target, out, secrets);
+        if let (Some(note), BackendError::Tool { stderr, .. }) =
+            (self.keys.failure_note(&out.stderr), &mut e)
+        {
+            stderr.push_str(if stderr.is_empty() { ":\n  " } else { "\n  " });
+            stderr.push_str(note);
+        }
+        e
     }
 }
 

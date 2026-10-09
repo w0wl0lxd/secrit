@@ -613,7 +613,7 @@ mod tests {
             );
             assert_eq!(e.exit(), Exit::Refused);
         }
-        for bad in ["x_unencrypted", "p_unencrypted/k", "a/b_unencrypted/c"] {
+        for bad in ["x_unencrypted", "p_unencrypted/k", "q/b_unencrypted/c"] {
             let e = b.check_put(&name(bad), PutMode::CreateOnly).unwrap_err();
             assert!(
                 matches!(e, BackendError::Name(NameError::UnencryptedSuffix { .. })),

@@ -384,7 +384,10 @@ fn an_unconfirmed_replace_keeps_an_item_made_meanwhile() {
     // `--yes` confirms the replace before secrit looks, so it replaces.
     let out = d.run(["store", "n", "--replace", "--yes"], Some(b"mine"));
     ok(&out);
-    assert!(f.read_back("n").as_deref() == Some(&b"mine"[..]));
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"mine"[..]),
+        "--yes did not replace the item"
+    );
     assert_eq!(f.item_count("n"), 1);
 }
 

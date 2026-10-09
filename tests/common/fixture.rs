@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::env::{Dirs, TestEnv};
+use super::env::{Dirs, TestEnv, sh_quote};
 
 /// What a backend can do, as the conformance cases need to know it. The
 /// first two fields follow `Capabilities` (v0.2 plan 5.2); a field joins
@@ -22,8 +22,16 @@ pub struct Caps {
     pub child_tool: bool,
 }
 
+/// The text before each stdin line that the tool of
+/// [`Fixture::fail_tool_echoing_stdin`] writes to stderr.
+pub const ECHO_PREFIX: &str = "tool echo: ";
+
 pub trait Fixture: Sized {
     const CAPS: Caps;
+
+    /// The note in a secrit error that says it left out child stderr lines
+    /// because they may hold the value.
+    const REDACTION_NOTE: &'static str;
 
     /// A temp environment with an empty store and a config whose
     /// `[stores.main]` table is [`Self::config_section`].
@@ -48,8 +56,9 @@ pub trait Fixture: Sized {
     /// arguments to `log`, one per line. Only when `CAPS.child_tool`.
     fn log_tool_argv(&self, log: &Path);
 
-    /// Replace the child tool with one that copies its stdin to stderr and
-    /// exits 1. Only when `CAPS.child_tool`.
+    /// Replace the child tool with one that copies each line of its stdin
+    /// to stderr after [`ECHO_PREFIX`] and exits 1. Only when
+    /// `CAPS.child_tool`.
     fn fail_tool_echoing_stdin(&self);
 }
 
@@ -64,16 +73,12 @@ impl Fixture for SopsFixture {
         backups: true,
         child_tool: true,
     };
+    const REDACTION_NOTE: &'static str = "line(s) not shown, because they may hold the value";
 
     fn new() -> Self {
-        let env = TestEnv::new();
-        let fixture = Self { env };
-        fixture.env.write_store_config(
-            &fixture.config_section(),
-            &format!("sops = \"{}\"", fixture.env.sops.display()),
-            120,
-        );
-        fixture
+        Self {
+            env: TestEnv::new(),
+        }
     }
 
     fn dirs(&self) -> &Dirs {
@@ -108,9 +113,9 @@ impl Fixture for SopsFixture {
         let wrapper = self.env.script(
             "sops-argv",
             &format!(
-                "for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nexec '{}' \"$@\"",
-                log.display(),
-                self.env.sops.display()
+                "for a in \"$@\"; do printf '%s\\n' \"$a\" >> {}; done\nexec {} \"$@\"",
+                sh_quote(log),
+                sh_quote(&self.env.sops)
             ),
         );
         self.env.write_config_with(&wrapper, "");
@@ -119,7 +124,9 @@ impl Fixture for SopsFixture {
     fn fail_tool_echoing_stdin(&self) {
         let fake = self.env.fake_sops(
             "sops-echo",
-            "while IFS= read -r l || [ -n \"$l\" ]; do printf 'sops says: %s\\n' \"$l\" >&2; done\nexit 1",
+            &format!(
+                "while IFS= read -r l || [ -n \"$l\" ]; do printf '{ECHO_PREFIX}%s\\n' \"$l\" >&2; done\nexit 1"
+            ),
         );
         self.env.write_config_with(&fake, "");
     }

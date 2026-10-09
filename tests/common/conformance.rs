@@ -3,10 +3,12 @@
 //! case in a backend's test file. Threat ids refer to PLAN 13 and the v0.2
 //! plan 9. The write gate case (T27) joins when slice S1b merges.
 
+use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
+use std::process::Output;
 
 use super::env::{BIN, assert_absent, code, no_tty, run_cmd, stderr};
-use super::fixture::Fixture;
+use super::fixture::{ECHO_PREFIX, Fixture};
 
 /// Every case, as `#[test]` functions that run it on `$fixture`.
 #[macro_export]
@@ -58,16 +60,24 @@ fn assert_backups<F: Fixture>(f: &F, want_with_backups: usize) {
 }
 
 /// `get NAME --stdout` into a private file, under `script` so that agent
-/// detection sees a terminal. `prefix` goes before the secrit command. No
-/// pipe, so the exit status is secrit's.
-fn get_to_file<F: Fixture>(f: &F, prefix: &str, name: &str) -> (std::process::Output, Vec<u8>) {
-    let dest = f.dirs().root.path().join("get.out");
+/// detection sees a terminal; `agent` sets `CLAUDECODE=1`. The paths and
+/// the name reach the shell as positional parameters, never as shell text;
+/// the quote in the file name proves it. No pipe, so the exit status is
+/// secrit's.
+fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) {
+    let dest = f.dirs().root.path().join("get 'it'.out");
     let _ = std::fs::remove_file(&dest);
-    let inner = format!(
-        "umask 077; {prefix}'{BIN}' get '{name}' --stdout > '{}'",
-        dest.display()
-    );
-    let out = f.dirs().under_script(&inner);
+    let mut envs = vec![
+        ("GET_BIN", OsStr::new(BIN)),
+        ("GET_NAME", OsStr::new(name)),
+        ("GET_OUT", dest.as_os_str()),
+    ];
+    if agent {
+        envs.push(("CLAUDECODE", OsStr::new("1")));
+    }
+    let inner = "umask 077; set -- \"$GET_BIN\" \"$GET_NAME\" \"$GET_OUT\"; \
+                 unset GET_BIN GET_NAME GET_OUT; exec \"$1\" get \"$2\" --stdout > \"$3\"";
+    let out = f.dirs().under_script_env(inner, &envs);
     (out, std::fs::read(&dest).unwrap_or_default())
 }
 
@@ -110,7 +120,7 @@ pub fn get_stdout_returns_the_exact_value<F: Fixture>() {
         .dirs()
         .run(["store", "n", "--raw"], Some(b"exact\nbytes\n"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let (out, got) = get_to_file(&f, "", "n");
+    let (out, got) = get_to_file(&f, false, "n");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(got == b"exact\nbytes\n", "get --stdout bytes differ");
 }
@@ -166,7 +176,7 @@ pub fn ls_never_decrypts<F: Fixture>() {
     assert_eq!(code(&f.dirs().store_value("n", b"locked-canary-6d0e")), 0);
     f.lock_values();
     assert_eq!(f.dirs().ls(), ["n"]);
-    let (out, got) = get_to_file(&f, "", "n");
+    let (out, got) = get_to_file(&f, false, "n");
     assert_ne!(code(&out), 0, "get worked on a locked store");
     assert_absent(&out, "locked-canary-6d0e");
     assert!(got.is_empty(), "get wrote a value from a locked store");
@@ -176,7 +186,7 @@ pub fn ls_never_decrypts<F: Fixture>() {
 /// store, replace, get or rm.
 pub fn values_never_reach_a_child_argv<F: Fixture>() {
     let f = F::new();
-    let log = f.dirs().root.path().join("argv.log");
+    let log = f.dirs().root.path().join("argv 'it'.log");
     if F::CAPS.child_tool {
         f.log_tool_argv(&log);
     }
@@ -185,7 +195,7 @@ pub fn values_never_reach_a_child_argv<F: Fixture>() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let out = d.run(["store", "n", "--replace"], Some(b"argv-canary-2b7c"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let (out, got) = get_to_file(&f, "", "n");
+    let (out, got) = get_to_file(&f, false, "n");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(got == b"argv-canary-2b7c", "get --stdout bytes differ");
     let out = d.run(["rm", "n", "--yes"], None);
@@ -206,22 +216,33 @@ pub fn values_never_reach_a_child_argv<F: Fixture>() {
 /// value, and the store keeps its old value. A daemon backend has no child
 /// stderr.
 pub fn child_stderr_never_shows_a_value<F: Fixture>() {
-    let f = F::new();
     if !F::CAPS.child_tool {
         return;
     }
+    let f = F::new();
     assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
     f.fail_tool_echoing_stdin();
     let out = f.dirs().store_value("m", b"stderr-canary-5c2e");
-    assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert_absent(&out, "stderr-canary-5c2e");
+    assert_redacted::<F>(&out, "stderr-canary-5c2e");
     let out = f
         .dirs()
         .run(["store", "n", "--replace"], Some(b"stderr-canary-8a41"));
-    assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert_absent(&out, "stderr-canary-8a41");
+    assert_redacted::<F>(&out, "stderr-canary-8a41");
     assert_eq!(f.names(), ["n"]);
     assert_stored(&f, "n", b"old");
+}
+
+/// A failed write shows no value and drops each echoed line whole (SEC-15).
+/// The redaction note proves that the value reached the tool.
+fn assert_redacted<F: Fixture>(out: &Output, value: &str) {
+    assert_eq!(code(out), 1, "{}", stderr(out));
+    assert_absent(out, value);
+    let err = stderr(out);
+    assert!(!err.contains(ECHO_PREFIX), "{err}");
+    assert!(
+        err.contains(F::REDACTION_NOTE),
+        "the value never reached the tool: {err}"
+    );
 }
 
 /// T4: `get` is refused when an agent is detected, even on a terminal, and
@@ -237,7 +258,7 @@ pub fn get_is_refused_for_agents<F: Fixture>() {
     assert!(stderr(&out).contains("CLAUDECODE"));
     assert_absent(&out, "get-canary-77aa");
 
-    let (out, got) = get_to_file(&f, "CLAUDECODE=1 ", "n");
+    let (out, got) = get_to_file(&f, true, "n");
     assert_eq!(code(&out), 3, "get on a terminal for an agent");
     assert!(String::from_utf8_lossy(&out.stdout).contains("CLAUDECODE"));
     assert_absent(&out, "get-canary-77aa");

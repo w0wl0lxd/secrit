@@ -194,32 +194,27 @@ impl Dirs {
     }
 
     pub fn under_script_with(&self, inner: &str, input: &[u8]) -> Output {
-        let script = which::which("script")
-            .expect("util-linux 'script' is needed for the pty tests; run in 'nix develop'");
-        let mut s = Command::new(script);
-        s.env_clear();
-        for (k, v) in self.cmd().get_envs() {
-            if let Some(v) = v {
-                s.env(k, v);
-            }
-        }
-        s.env("SHELL", "/bin/sh").current_dir(self.root.path());
-        run_cmd(s, ["-q", "-e", "-c", inner, "/dev/null"], Some(input))
+        run_cmd(
+            self.script_cmd(),
+            ["-q", "-e", "-c", inner, "/dev/null"],
+            Some(input),
+        )
+    }
+
+    /// [`Self::under_script`], with `envs` added to the environment. `script`
+    /// joins a command's arguments into one shell string, so a path or a
+    /// name reaches `inner` safely only as a variable.
+    pub fn under_script_env(&self, inner: &str, envs: &[(&str, &OsStr)]) -> Output {
+        let mut s = self.script_cmd();
+        s.envs(envs.iter().copied());
+        run_cmd(s, ["-q", "-e", "-c", inner, "/dev/null"], None)
     }
 
     /// [`Self::under_script`], with `script`'s stdin held open until it
     /// exits, so no end-of-input reaches the terminal.
     pub fn under_script_held(&self, inner: &str) -> Output {
-        let mut s = Command::new(bin("script"));
-        s.env_clear();
-        for (k, v) in self.cmd().get_envs() {
-            if let Some(v) = v {
-                s.env(k, v);
-            }
-        }
-        s.env("SHELL", "/bin/sh")
-            .current_dir(self.root.path())
-            .args(["-q", "-e", "-c", inner, "/dev/null"])
+        let mut s = self.script_cmd();
+        s.args(["-q", "-e", "-c", inner, "/dev/null"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -245,6 +240,22 @@ impl Dirs {
             stderr: err.join().unwrap(),
         }
     }
+
+    /// util-linux `script` with the secrit environment and `/bin/sh` as its
+    /// shell, in the temp root.
+    fn script_cmd(&self) -> Command {
+        let script = which::which("script")
+            .expect("util-linux 'script' is needed for the pty tests; run in 'nix develop'");
+        let mut s = Command::new(script);
+        s.env_clear();
+        for (k, v) in self.cmd().get_envs() {
+            if let Some(v) = v {
+                s.env(k, v);
+            }
+        }
+        s.env("SHELL", "/bin/sh").current_dir(self.root.path());
+        s
+    }
 }
 
 /// The v0.1 environment: [`Dirs`] plus a sops store and its age keys.
@@ -267,6 +278,11 @@ impl Deref for TestEnv {
     fn deref(&self) -> &Dirs {
         &self.dirs
     }
+}
+
+/// `p` as one single-quoted shell word, also when it holds a quote.
+pub fn sh_quote(p: &Path) -> String {
+    format!("'{}'", p.display().to_string().replace('\'', r"'\''"))
 }
 
 /// The git binary for the repository tests.

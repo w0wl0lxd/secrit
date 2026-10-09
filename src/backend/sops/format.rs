@@ -58,8 +58,8 @@ pub struct SopsDoc {
 }
 
 impl SopsFormat {
-    /// Every format, for the tests that must cover each one.
-    #[cfg(test)]
+    /// Every format: for the tests that must cover each one, and for the
+    /// temp copies that `doctor` lists.
     pub const ALL: [SopsFormat; 2] = [SopsFormat::Yaml, SopsFormat::Json];
 
     /// The format of the store `file`: `explicit` (the `format` key), else
@@ -103,6 +103,13 @@ impl SopsFormat {
     /// The extension of a temp copy, so sops reads it in this format.
     pub fn temp_ext(self) -> &'static str {
         self.name()
+    }
+
+    /// Whether `ext` is the temp copy extension of any format. A change of
+    /// the `format` key changes the extension, so a stale temp copy can
+    /// have the extension of another format.
+    pub fn is_temp_ext(ext: &std::ffi::OsStr) -> bool {
+        Self::ALL.iter().any(|f| ext == f.temp_ext())
     }
 
     /// What sops encrypts for a new store file with no entries: the JSON

@@ -9,10 +9,11 @@ use std::time::{Duration, SystemTime};
 
 use super::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
 use crate::backend::{BackendError, DoctorCtx};
-use crate::cmd::doctor::{Report, Status, git_add_hint};
+use crate::cmd::doctor::git_add_hint;
 use crate::cmd::shell_path;
 use crate::display::escape;
 use crate::git::Repo;
+use crate::report::{Report, Status};
 
 /// A temp copy younger than this may belong to a write that still runs.
 const STALE_TEMP: Duration = Duration::from_secs(3600);
@@ -20,10 +21,10 @@ const STALE_TEMP: Duration = Duration::from_secs(3600);
 /// the store file (SEC-2).
 const OLD_BACKUP_MARK: &str = ".secrit-bak.";
 
-/// The rows of one sops store. The first store with a sops binary also
-/// checks the sops version, once per run.
+/// The rows of one sops store, and the sops version row when `ctx` asks
+/// for it.
 pub(super) fn rows(r: &mut Report, backend: &SopsBackend, ctx: &DoctorCtx<'_>) {
-    if ctx.tool_found && !r.has("sops version") {
+    if ctx.tool_found && ctx.tool_version {
         version_check(r, backend);
     }
     store_checks(r, ctx.store, backend, ctx.tool_found, ctx.env);

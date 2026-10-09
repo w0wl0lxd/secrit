@@ -21,15 +21,15 @@ use self::format::{REGEX_RULES, SopsFormat, has_plaintext, has_recipients, non_s
 use self::runner::{MAX_NEW_FILE_BYTES, Runner};
 use super::atomic::{self, FileStore};
 use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WriteReport};
-use crate::cmd::doctor::Report;
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::name::Name;
 use crate::paths;
+use crate::report::Report;
 use crate::secret::SecretValue;
 
+pub use self::runner::MIN_SOPS;
 #[cfg(test)]
-pub use self::runner::PROMPT_HINT;
-pub use self::runner::{MIN_SOPS, NEED_SOPS};
+pub use self::runner::{NEED_SOPS, PROMPT_HINT};
 
 /// The `.gitignore` pattern that matches every temp copy.
 pub const TEMP_IGNORE: &str = ".*.secrit-*.yaml";
@@ -100,6 +100,11 @@ impl SopsBackend {
     /// The version that `sops --version` reports.
     pub fn sops_version(&self) -> Result<(u64, u64, u64), BackendError> {
         self.runner.version()
+    }
+
+    /// [`Self::sops_version`], refused when it is older than [`MIN_SOPS`].
+    pub fn checked_version(&self) -> Result<(u64, u64, u64), BackendError> {
+        self.runner.checked_version()
     }
 
     pub fn file(&self) -> &Path {
@@ -350,7 +355,8 @@ fn nearest_sops_config(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::format::tests::BASE;
+    use super::format::tests::{BASE, doc};
+    use super::format::validate;
     use super::*;
     use crate::error::Exit;
 
@@ -373,12 +379,39 @@ mod tests {
 
         // NAME itself may be the cleartext entry: the write replaces or
         // removes it.
-        let b = backend_for(tmp.path(), &format!("{BASE}e: \"\"\n"));
+        let b = backend_for(tmp.path(), &format!("{BASE}e: plain\n"));
         let e_name = Name::parse("e").unwrap();
         assert!(b.check_put(&e_name, PutMode::Replace).is_ok());
         assert!(b.check_remove(&e_name).is_ok());
         let e = b.check_remove(&z).unwrap_err();
         assert!(matches!(e, BackendError::Missing { .. }), "{e}");
+    }
+
+    /// sops never encrypts an empty string, so an empty leaf holds no
+    /// secret, the same as a null leaf.
+    #[test]
+    fn an_empty_string_leaf_is_not_plaintext() {
+        assert!(!has_plaintext(&Value::String(String::new())));
+        assert!(!has_plaintext(&Value::Null));
+        let nested: Value = serde_json::from_str(r#"{"k": ["", null], "m": {"n": ""}}"#).unwrap();
+        assert!(!has_plaintext(&nested));
+        assert!(has_plaintext(&Value::String(" ".into())));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), &format!("{BASE}e: \"\"\n"));
+        let z = Name::parse("z").unwrap();
+        let a = Name::parse("a").unwrap();
+        assert!(b.check_put(&z, PutMode::CreateOnly).is_ok());
+        assert!(b.check_remove(&a).is_ok());
+        assert!(b.inspect().unwrap().plaintext.is_empty());
+
+        // The copy validation keeps the empty entry too.
+        let orig = doc(&format!("{BASE}e: \"\"\n"));
+        let copy = doc(&format!(
+            "{BASE}e: \"\"\nz: ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]\n"
+        ));
+        let v = SecretValue::new(b"v".to_vec());
+        assert!(validate(&orig, &copy, &z, Op::Put(&v, PutMode::CreateOnly)).is_ok());
     }
 
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {

@@ -119,22 +119,26 @@ impl Runner {
             return Ok(());
         }
         self.check_sops_config()?;
-        self.check_version()?;
+        self.checked_version()?;
         let _ = self.checked.set(());
         Ok(())
     }
 
-    fn check_version(&self) -> Result<(), BackendError> {
-        let found = self.version();
-        match found {
-            Ok(v) if (v.0, v.1) >= MIN_SOPS => Ok(()),
-            Ok((a, b, c)) => Err(BackendError::ToolTooOld {
-                tool: TOOL,
-                found: format!("{a}.{b}.{c}"),
-                path: self.sops.clone(),
-                need: NEED_SOPS,
-            }),
-            Err(e) => Err(e),
+    /// [`Self::version`], refused when it is older than [`MIN_SOPS`].
+    pub fn checked_version(&self) -> Result<(u64, u64, u64), BackendError> {
+        let (a, b, c) = self.version()?;
+        if (a, b) < MIN_SOPS {
+            return Err(self.too_old(format!("{a}.{b}.{c}")));
+        }
+        Ok((a, b, c))
+    }
+
+    fn too_old(&self, found: String) -> BackendError {
+        BackendError::ToolTooOld {
+            tool: TOOL,
+            found,
+            path: self.sops.clone(),
+            need: NEED_SOPS,
         }
     }
 
@@ -157,12 +161,7 @@ impl Runner {
         let text = String::from_utf8_lossy(&out.stdout);
         match parse_sops_version(&text) {
             Some(v) if out.status.success() => Ok(v),
-            _ => Err(BackendError::ToolTooOld {
-                tool: TOOL,
-                found: "an unknown version".into(),
-                path: self.sops.clone(),
-                need: NEED_SOPS,
-            }),
+            _ => Err(self.too_old("an unknown version".into())),
         }
     }
 

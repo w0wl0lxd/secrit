@@ -5,62 +5,17 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
 use crate::agent;
 use crate::backend::{self, DoctorCtx};
-use crate::config::{Config, ConfigSource, ENV_CONFIG, Env, StoreConfig, config_path, home};
+use crate::config::{
+    BackendKind, Config, ConfigSource, ENV_CONFIG, Env, StoreConfig, config_path, home,
+};
 use crate::display::escape;
 use crate::error::Error;
 use crate::git::Repo;
 use crate::harden::HardenReport;
+use crate::report::{Report, Status};
 use crate::tools::{self, ResolvedTool, ToolSource};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Ok,
-    Info,
-    Warn,
-    Fail,
-}
-
-impl Status {
-    fn label(self) -> &'static str {
-        match self {
-            Status::Ok => "ok",
-            Status::Info => "info",
-            Status::Warn => "warn",
-            Status::Fail => "fail",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Row {
-    pub check: String,
-    pub status: Status,
-    pub detail: String,
-}
-
-/// The rows of one `doctor` run, in order.
-#[derive(Debug, Default)]
-pub struct Report(Vec<Row>);
-
-impl Report {
-    pub fn add(&mut self, check: impl Into<String>, status: Status, detail: impl Into<String>) {
-        self.0.push(Row {
-            check: check.into(),
-            status,
-            detail: detail.into(),
-        });
-    }
-
-    /// Whether a row for `check` exists already.
-    pub fn has(&self, check: &str) -> bool {
-        self.0.iter().any(|r| r.check == check)
-    }
-}
 
 pub fn run(
     config_flag: Option<&Path>,
@@ -75,11 +30,11 @@ pub fn run(
     super::interrupted()?;
     let mut out = std::io::stdout().lock();
     let written = if json {
-        serde_json::to_writer_pretty(&mut out, &report.0)
+        serde_json::to_writer_pretty(&mut out, report.rows())
             .map_err(std::io::Error::other)
             .and_then(|()| writeln!(out))
     } else {
-        report.0.iter().try_for_each(|c| {
+        report.rows().iter().try_for_each(|c| {
             writeln!(
                 out,
                 "{:<4}  {}: {}",
@@ -90,7 +45,12 @@ pub fn run(
         })
     };
     written.map_err(|e| Error::Failed(format!("could not write to stdout: {e}")))?;
-    match report.0.iter().filter(|c| c.status == Status::Fail).count() {
+    match report
+        .rows()
+        .iter()
+        .filter(|c| c.status == Status::Fail)
+        .count()
+    {
         0 => Ok(()),
         n => Err(Error::Failed(format!("{n} check(s) failed"))),
     }
@@ -159,6 +119,8 @@ fn collect(
         .as_ref()
         .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
     let tool = |_: tools::Program, _: &crate::config::ToolSetting| Ok(sops_path.clone());
+    // The backend kinds whose tool version has a row already.
+    let mut versioned: Vec<BackendKind> = Vec::new();
     for store in stores {
         let backend = match backend::open_with(store, &config, env, &tool) {
             Ok(b) => b,
@@ -167,11 +129,16 @@ fn collect(
                 continue;
             }
         };
+        let kind = backend.kind();
         let ctx = DoctorCtx {
             store: &store.name,
             tool_found: sops.is_some(),
+            tool_version: !versioned.contains(&kind),
             env,
         };
+        if ctx.tool_version {
+            versioned.push(kind);
+        }
         backend.doctor(&mut r, &ctx);
     }
     r
@@ -298,8 +265,8 @@ mod tests {
             let path_env = path_dir.as_os_str().to_owned();
             let env = move |k: &str| (k == "PATH").then(|| path_env.clone());
             assert!(tool_check(&mut r, program, setting, &env, true).is_some());
-            assert_eq!(r.0.len(), 1, "{:?}", r.0);
-            r.0.remove(0)
+            assert_eq!(r.rows().len(), 1, "{:?}", r.rows());
+            r.rows()[0].clone()
         };
         let auto = crate::config::ToolSetting::Auto;
 

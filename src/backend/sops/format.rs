@@ -27,6 +27,8 @@ const KEY_TYPES: &[&str] = &[
 /// does not evaluate them, so it does not write a file that sets one. The
 /// suffix rules are enforced by the name check instead.
 pub const REGEX_RULES: &[&str] = &["unencrypted_regex", "encrypted_regex"];
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// The file name endings that sops reads as another format than YAML.
 const NON_YAML_ENDINGS: [&str; 3] = [".json", ".env", ".ini"];
 
@@ -74,7 +76,7 @@ impl SopsFormat {
 
     pub fn parse(self, bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
         let parse_err = |what: &str| BackendError::Parse {
-            location: Location::file(path),
+            location: Location::File(path.to_path_buf()),
             format: self.what(),
             what: what.into(),
         };
@@ -101,11 +103,16 @@ impl SopsFormat {
     /// write turns a JSON store into YAML, which a consumer that reads it as
     /// JSON cannot parse (v0.2 plan, V14). The write path refuses such a
     /// file before it reads a value. A YAML file in flow style also parses
-    /// as JSON; sops never writes one.
+    /// as JSON; sops never writes one. A leading UTF-8 BOM does not hide a
+    /// JSON file.
     pub fn refuse_other(self, bytes: &[u8], path: &Path) -> Result<(), BackendError> {
         self.refuse_other_name(path)?;
-        let object = bytes.trim_ascii_start().first() == Some(&b'{')
-            && serde_json::from_slice::<IgnoredAny>(bytes).is_ok();
+        let body = bytes
+            .strip_prefix(UTF8_BOM)
+            .unwrap_or(bytes)
+            .trim_ascii_start();
+        let object =
+            body.first() == Some(&b'{') && serde_json::from_slice::<IgnoredAny>(body).is_ok();
         if object {
             return Err(BackendError::Unsafe {
                 path: path.to_path_buf(),
@@ -148,10 +155,11 @@ pub fn has_recipients(meta: &Map<String, Value>) -> bool {
     })
 }
 
-/// Whether `v` holds a leaf that sops did not encrypt.
+/// Whether `v` holds a leaf that sops did not encrypt. sops never encrypts
+/// an empty string or a null; such a leaf holds no secret.
 pub fn has_plaintext(v: &Value) -> bool {
     match v {
-        Value::String(s) => !s.starts_with("ENC["),
+        Value::String(s) => !s.is_empty() && !s.starts_with("ENC["),
         Value::Bool(_) | Value::Number(_) => true,
         Value::Null => false,
         Value::Array(a) => a.iter().any(has_plaintext),
@@ -238,7 +246,7 @@ pub(super) mod tests {
 
     pub const BASE: &str = "a: ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\nsops:\n  age:\n    - recipient: age1x\n      enc: blob\n  mac: ENC[AES256_GCM,data:m,type:str]\n  lastmodified: '1'\n  version: 3.13.3\n";
 
-    fn doc(yaml: &str) -> SopsDoc {
+    pub fn doc(yaml: &str) -> SopsDoc {
         SopsFormat::Yaml
             .parse(yaml.as_bytes(), Path::new("/t.yaml"))
             .unwrap()
@@ -276,13 +284,19 @@ pub(super) mod tests {
         let f = SopsFormat::Yaml;
         assert!(f.refuse_other(BASE.as_bytes(), yaml).is_ok());
         let json = br#"{"a": "ENC[x]", "sops": {"mac": "ENC[m]"}}"#;
-        for bytes in [&json[..], b"\n  {}\n"] {
+        let bom = b"\xEF\xBB\xBF{\"a\": \"ENC[x]\"}";
+        let bom_space = b"\xEF\xBB\xBF \n {}";
+        for bytes in [&json[..], b"\n  {}\n", &bom[..], &bom_space[..]] {
             let e = f.refuse_other(bytes, yaml).unwrap_err();
             assert!(e.to_string().contains("sops JSON file"), "{e}");
             assert_eq!(e.exit(), Exit::Refused);
         }
-        // Flow-style YAML that is not JSON stays allowed.
+        // Flow-style YAML that is not JSON stays allowed, with a BOM too.
         assert!(f.refuse_other(b"{a: b}\n", yaml).is_ok());
+        assert!(f.refuse_other(b"\xEF\xBB\xBF{a: b}\n", yaml).is_ok());
+        let mut bom_yaml = b"\xEF\xBB\xBF".to_vec();
+        bom_yaml.extend_from_slice(BASE.as_bytes());
+        assert!(f.refuse_other(&bom_yaml, yaml).is_ok());
         for name in ["main.json", "MAIN.JSON", ".env", "a.env", "a.ini"] {
             let path = Path::new("/s").join(name);
             let e = f.refuse_other(BASE.as_bytes(), &path).unwrap_err();

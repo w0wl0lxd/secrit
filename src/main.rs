@@ -14,6 +14,7 @@ mod harden;
 mod lock;
 mod name;
 mod paths;
+mod report;
 mod secret;
 mod signals;
 mod testhook;

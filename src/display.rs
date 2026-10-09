@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use zeroize::Zeroizing;
 
@@ -45,6 +46,12 @@ pub fn escape(s: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+/// A path with every unsafe character escaped, for a message.
+#[must_use]
+pub fn escape_path(p: &Path) -> String {
+    escape(&p.to_string_lossy()).into_owned()
 }
 
 /// Feed the terminal form of `value` to `emit`, piece by piece. `\n` becomes

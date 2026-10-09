@@ -11,14 +11,14 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{interrupted, shell_path};
-use crate::backend::sops::{MIN_SOPS, NEED_SOPS, SopsBackend};
-use crate::backend::{BackendError, atomic};
+use crate::backend::atomic;
+use crate::backend::sops::SopsBackend;
 use crate::child;
 use crate::config::{
     BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
     config_path, home,
 };
-use crate::display::escape;
+use crate::display::{escape, escape_path};
 use crate::error::{Error, Exit};
 use crate::git::{Repo, find_root};
 use crate::signals;
@@ -95,7 +95,7 @@ fn steps(
         Err(e) => return Err(e.into()),
     };
     let store = store_config(args, store_flag, existing.as_ref())?;
-    let sops_store = sops_of(&store);
+    let sops_store = store.require_sops()?;
     let tools_config = existing.as_ref().map_or(
         ToolsConfig {
             sops: ToolSetting::Auto,
@@ -116,16 +116,7 @@ fn steps(
         path_env.as_deref(),
     )?;
     let backend = SopsBackend::new(sops_store, sops.path.clone(), lock_timeout, &env)?;
-    let (a, b, c) = backend.sops_version()?;
-    if (a, b) < MIN_SOPS {
-        return Err(BackendError::ToolTooOld {
-            tool: "sops",
-            found: format!("{a}.{b}.{c}"),
-            path: sops.path,
-            need: NEED_SOPS,
-        }
-        .into());
-    }
+    let (a, b, c) = backend.checked_version()?;
     out.note(&format!(
         "sops {a}.{b}.{c} at {}; age-keygen at {}",
         escape(&sops.path.to_string_lossy()),
@@ -146,7 +137,7 @@ fn steps(
         let facts = backend.inspect()?;
         out.note(&format!(
             "store file {} exists ({} names); unchanged",
-            escape(&sops_store.file.to_string_lossy()),
+            escape_path(&sops_store.file),
             facts.names
         ));
     } else {
@@ -173,12 +164,6 @@ fn steps(
     interrupted()
 }
 
-/// The sops settings of a store. sops is the only backend that init sets up.
-fn sops_of(store: &StoreConfig) -> &SopsStore {
-    let BackendConfig::Sops(sops) = &store.backend;
-    sops
-}
-
 /// The store that this run sets up: the flags, else the config.
 fn store_config(
     args: &InitArgs,
@@ -190,7 +175,8 @@ fn store_config(
         .unwrap_or(DEFAULT_STORE)
         .to_owned();
     let configured = existing.and_then(|c| c.stores.get(&name));
-    let configured_sops = configured.map(sops_of);
+    // sops is the only backend that init sets up.
+    let configured_sops = configured.map(StoreConfig::require_sops).transpose()?;
     let absolute = |p: &Path| {
         std::path::absolute(p).map_err(|e| Error::Usage(format!("{}: {e}", p.display())))
     };
@@ -616,8 +602,8 @@ struct NewSection<'a> {
 fn new_stores<'a>(
     store: &'a StoreConfig,
     args: &InitArgs,
-) -> std::collections::BTreeMap<&'a str, NewStore<'a>> {
-    let sops = sops_of(store);
+) -> Result<std::collections::BTreeMap<&'a str, NewStore<'a>>, Error> {
+    let sops = store.require_sops()?;
     let mut stores = std::collections::BTreeMap::new();
     stores.insert(
         store.name.as_str(),
@@ -628,7 +614,7 @@ fn new_stores<'a>(
             age_key_file: args.age_key.as_ref().and(sops.age_key_file.as_deref()),
         },
     );
-    stores
+    Ok(stores)
 }
 
 fn to_toml(value: &impl Serialize) -> Result<String, Error> {
@@ -638,13 +624,13 @@ fn to_toml(value: &impl Serialize) -> Result<String, Error> {
 fn config_text(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
     to_toml(&NewConfig {
         default_store: &store.name,
-        stores: new_stores(store, args),
+        stores: new_stores(store, args)?,
     })
 }
 
 fn store_section(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
     to_toml(&NewSection {
-        stores: new_stores(store, args),
+        stores: new_stores(store, args)?,
     })
 }
 

@@ -66,6 +66,11 @@ All notable changes to this project are recorded here. The format follows
 - A config parse error names the line and column of the bad key or value, for example
   `invalid config file PATH: line 6, column 1: unknown field ...`. The unknown-key error
   inside `[stores.NAME]` lists `backend` among the expected keys again.
+- Internal refactor with no change in behaviour: the sops backend is split into one module
+  each for the sops runs, the file format, the edit and the `doctor` rows. The write
+  protocol, store-file creation, backups and the fsync helpers move into a module that is
+  not specific to sops, and the default paths (age key, backups, locks) move into one
+  module.
 
 ### Fixed
 

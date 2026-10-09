@@ -60,12 +60,13 @@ fn warn(ctx: &Ctx, msg: &str) {
 }
 
 fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), Error> {
-    let file = sops_file(ctx)?;
+    let store = ctx.store.require_sops()?;
+    let file = &store.file;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
     {
-        if let Some(hint) = super::ignore_hint(&repo, file)? {
+        if let Some(hint) = super::ignore_hint(&repo, store)? {
             ctx.status(&format!("then run: {hint}"));
         }
         let tracked = if file.exists() {

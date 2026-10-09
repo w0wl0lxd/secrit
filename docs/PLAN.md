@@ -763,8 +763,11 @@ src/
   error.rs       error type and exit codes
   child.rs       bounded child runs (process group, deadline, capped stdout, reaping)
   git.rs         read-only git queries (check-ignore, ls-files)
+  paths.rs       default paths that follow the platform (the age key file)
   backend/mod.rs     Backend trait
-  backend/sops.rs    sops backend, write protocol, store-file creation, sops version check
+  backend/atomic.rs  write protocol, store-file creation, backups, fsync helpers
+  backend/sops/      mod.rs (backend), runner.rs (sops runs, version check),
+                     format.rs (parse, validate), edit.rs (store and rm), doctor.rs (rows)
   cmd/{mod,store,get,ls,rm,init,doctor,wire}.rs
 tests/
   common/mod.rs  TestEnv harness

@@ -40,11 +40,11 @@ use super::{
     WriteReport,
 };
 use crate::child::{self, ChildError, ChildOutput};
-use crate::cmd::doctor::Report;
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::display::escape;
 use crate::lock::{self, LockError};
 use crate::name::{Name, NameError};
+use crate::report::Report;
 use crate::secret::{MAX_VALUE_BYTES, SecretValue};
 use crate::signals;
 use crate::testhook;

@@ -6,12 +6,12 @@ pub mod sops;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::cmd::doctor::Report;
 use crate::config::{BackendConfig, BackendKind, Config, Env, StoreConfig, ToolSetting};
 use crate::display::escape;
 use crate::error::{Error, Exit};
 use crate::lock::LockError;
 use crate::name::{Name, NameError};
+use crate::report::Report;
 use crate::secret::SecretValue;
 use crate::tools::{self, Program, ResolvedTool, ToolSource};
 
@@ -31,10 +31,6 @@ pub struct WriteReport {
 }
 
 pub trait Backend {
-    #[expect(
-        dead_code,
-        reason = "read by doctor and init when a second backend exists (v0.2 plan 5.1)"
-    )]
     fn kind(&self) -> BackendKind;
     /// Where the store lives, for messages and errors.
     fn location(&self) -> &Location;
@@ -73,6 +69,9 @@ pub struct DoctorCtx<'a> {
     /// Whether the tool that the backend runs was found. When it was not,
     /// the backend skips the rows that need it.
     pub tool_found: bool,
+    /// Whether this store also checks the tool's version. `doctor` sets it
+    /// for the first store of each backend kind, so the row shows once.
+    pub tool_version: bool,
     pub env: &'a Env,
 }
 
@@ -81,6 +80,7 @@ impl fmt::Debug for DoctorCtx<'_> {
         f.debug_struct("DoctorCtx")
             .field("store", &self.store)
             .field("tool_found", &self.tool_found)
+            .field("tool_version", &self.tool_version)
             .finish_non_exhaustive()
     }
 }

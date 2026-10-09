@@ -13,6 +13,7 @@ mod git;
 mod harden;
 mod lock;
 mod name;
+mod report;
 mod secret;
 mod signals;
 mod testhook;

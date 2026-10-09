@@ -1170,6 +1170,8 @@ fn read_entry(
     Ok((OwnedFd::from(f), bytes))
 }
 
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
 /// The file name endings that sops reads as another format than YAML.
 const NON_YAML_ENDINGS: [&str; 3] = [".json", ".env", ".ini"];
 
@@ -1177,11 +1179,14 @@ const NON_YAML_ENDINGS: [&str; 3] = [".json", ".env", ".ini"];
 /// turns a JSON store into YAML, which a consumer that reads it as JSON
 /// cannot parse (v0.2 plan, V14). The write path refuses such a file before
 /// it reads a value. A YAML file in flow style also parses as JSON; sops
-/// never writes one.
+/// never writes one. A leading UTF-8 BOM does not hide a JSON file.
 fn refuse_non_yaml(bytes: &[u8], path: &Path) -> Result<(), BackendError> {
     refuse_non_yaml_name(path)?;
-    let object = bytes.trim_ascii_start().first() == Some(&b'{')
-        && serde_json::from_slice::<IgnoredAny>(bytes).is_ok();
+    let body = bytes
+        .strip_prefix(UTF8_BOM)
+        .unwrap_or(bytes)
+        .trim_ascii_start();
+    let object = body.first() == Some(&b'{') && serde_json::from_slice::<IgnoredAny>(body).is_ok();
     if object {
         return Err(BackendError::Unsafe {
             path: path.to_path_buf(),
@@ -1244,10 +1249,11 @@ fn has_recipients(meta: &Map<String, Value>) -> bool {
     })
 }
 
-/// Whether `v` holds a leaf that sops did not encrypt.
+/// Whether `v` holds a leaf that sops did not encrypt. sops never encrypts
+/// an empty string or a null; such a leaf holds no secret.
 fn has_plaintext(v: &Value) -> bool {
     match v {
-        Value::String(s) => !s.starts_with("ENC["),
+        Value::String(s) => !s.is_empty() && !s.starts_with("ENC["),
         Value::Bool(_) | Value::Number(_) => true,
         Value::Null => false,
         Value::Array(a) => a.iter().any(has_plaintext),
@@ -1632,13 +1638,19 @@ mod tests {
         let yaml = Path::new("/s/main.yaml");
         assert!(refuse_non_yaml(BASE.as_bytes(), yaml).is_ok());
         let json = br#"{"a": "ENC[x]", "sops": {"mac": "ENC[m]"}}"#;
-        for bytes in [&json[..], b"\n  {}\n"] {
+        let bom = b"\xEF\xBB\xBF{\"a\": \"ENC[x]\"}";
+        let bom_space = b"\xEF\xBB\xBF \n {}";
+        for bytes in [&json[..], b"\n  {}\n", &bom[..], &bom_space[..]] {
             let e = refuse_non_yaml(bytes, yaml).unwrap_err();
             assert!(e.to_string().contains("sops JSON file"), "{e}");
             assert_eq!(e.exit(), Exit::Refused);
         }
-        // Flow-style YAML that is not JSON stays allowed.
+        // Flow-style YAML that is not JSON stays allowed, with a BOM too.
         assert!(refuse_non_yaml(b"{a: b}\n", yaml).is_ok());
+        assert!(refuse_non_yaml(b"\xEF\xBB\xBF{a: b}\n", yaml).is_ok());
+        let mut bom_yaml = b"\xEF\xBB\xBF".to_vec();
+        bom_yaml.extend_from_slice(BASE.as_bytes());
+        assert!(refuse_non_yaml(&bom_yaml, yaml).is_ok());
         for name in ["main.json", "MAIN.JSON", ".env", "a.env", "a.ini"] {
             let path = Path::new("/s").join(name);
             let e = refuse_non_yaml(BASE.as_bytes(), &path).unwrap_err();
@@ -1721,12 +1733,39 @@ mod tests {
 
         // NAME itself may be the cleartext entry: the write replaces or
         // removes it.
-        let b = backend_for(tmp.path(), &format!("{BASE}e: \"\"\n"));
+        let b = backend_for(tmp.path(), &format!("{BASE}e: plain\n"));
         let e_name = Name::parse("e").unwrap();
         assert!(b.check_put(&e_name, PutMode::Replace).is_ok());
         assert!(b.check_remove(&e_name).is_ok());
         let e = b.check_remove(&z).unwrap_err();
         assert!(matches!(e, BackendError::Missing { .. }), "{e}");
+    }
+
+    /// sops never encrypts an empty string, so an empty leaf holds no
+    /// secret, the same as a null leaf.
+    #[test]
+    fn an_empty_string_leaf_is_not_plaintext() {
+        assert!(!has_plaintext(&Value::String(String::new())));
+        assert!(!has_plaintext(&Value::Null));
+        let nested: Value = serde_json::from_str(r#"{"k": ["", null], "m": {"n": ""}}"#).unwrap();
+        assert!(!has_plaintext(&nested));
+        assert!(has_plaintext(&Value::String(" ".into())));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), &format!("{BASE}e: \"\"\n"));
+        let z = Name::parse("z").unwrap();
+        let a = Name::parse("a").unwrap();
+        assert!(b.check_put(&z, PutMode::CreateOnly).is_ok());
+        assert!(b.check_remove(&a).is_ok());
+        assert!(b.inspect().unwrap().plaintext.is_empty());
+
+        // The copy validation keeps the empty entry too.
+        let orig = doc(&format!("{BASE}e: \"\"\n"));
+        let copy = doc(&format!(
+            "{BASE}e: \"\"\nz: ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]\n"
+        ));
+        let v = SecretValue::new(b"v".to_vec());
+        assert!(validate(&orig, &copy, &z, Op::Put(&v, PutMode::CreateOnly)).is_ok());
     }
 
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {

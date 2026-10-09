@@ -70,7 +70,8 @@ All notable changes to this project are recorded here. The format follows
   lock, and on each retry.
 - The copy validation refuses a new file in which any entry is not encrypted, also an
   entry that was cleartext before the write. `store` and `rm` find such an entry before they read a value or
-  ask, and refuse with exit 3; NAME itself may be the cleartext entry.
+  ask, and refuse with exit 3; NAME itself may be the cleartext entry. An empty string
+  or a null is not cleartext: sops never encrypts it, and it holds no secret.
 - sops errors name the step, the secret name and the store file (`sops set failed for
   'NAME' in FILE`), and so do the validation, timeout, prompt and output-size errors.
   `rm` of a missing name names the file. age-keygen run errors no longer show Debug text
@@ -80,8 +81,9 @@ All notable changes to this project are recorded here. The format follows
   table. It printed a `default_store` line too, which broke the config when appended.
 - `init` and `doctor` announce a config picked by `SECRIT_CONFIG` on stderr, like the
   other commands; `-q` hides the line.
-- `store` and `rm` refuse a store file that is sops JSON, or whose name ends in `.json`,
-  `.env` or `.ini`, with exit 3, and leave it unchanged. Before, a write turned a JSON
+- `store` and `rm` refuse a store file that is sops JSON (also after a UTF-8 byte order
+  mark), or whose name ends in `.json`, `.env` or `.ini`, with exit 3, and leave it
+  unchanged. Before, a write turned a JSON
   store into YAML, which a reader that expects JSON cannot parse. `init` refuses such a
   file too, and `doctor` shows it as a failed `file` row; `ls` and `get` still read it.
 

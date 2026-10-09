@@ -1320,7 +1320,9 @@ PLAN 4.5 holds, with these changes:
      pattern. Flush the rest at once. Flush everything at EOF. Match leftmost-longest,
    and grow a match while another match starts inside it and ends after it. After an
    idle period (100 ms by default) S13 calls `flush_held`, so a prompt with no newline
-   is shown; at most a proper prefix of one pattern goes out unmasked.
+   is shown; at most a proper prefix of one pattern goes out unmasked. The masker keeps
+   the released bytes (at most the longest pattern length minus one), so the rest of
+   the value is masked when it follows later.
      This replaces the "longest − 1 bytes" tail of PLAN 4.5, which held prompts with no
      newline.
    - The matcher is hand-written over `Zeroizing<Vec<u8>>`. `aho-corasick` keeps buffers

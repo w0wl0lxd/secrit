@@ -3,17 +3,26 @@
 //! Every external program secrit starts (sops, age-keygen, git) runs here:
 //! in its own process group, with a deadline, with capped stdout, and with
 //! the whole group killed and reaped before [`run`] returns.
+//!
+//! The command of `secrit run` is different: [`supervise`] runs it in
+//! secrit's own process group, with no deadline and no output cap, and
+//! masks its output (v0.2 plan 7.1, step 5).
 
 use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, getpid, kill_process, kill_process_group, waitid,
+};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::mask::Masker;
 use crate::signals;
 
 /// The longest one child run may take. With an age key file, sops needs well
@@ -205,6 +214,184 @@ fn wait_child(pid: Pid, overflow: &AtomicBool, timeout: Duration) -> Result<(), 
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// How long the output of [`supervise`] stays idle before the masker
+/// releases the bytes it holds (v0.2 plan 7.1, step 4).
+pub const IDLE: Duration = Duration::from_millis(100);
+/// How often [`supervise`] polls the command (v0.2 plan 7.1, step 5).
+const SUPERVISE_POLL: Duration = Duration::from_millis(25);
+const PUMP_BYTES: usize = 64 * 1024;
+
+/// Run `cmd` for `secrit run` and mask its stdout and stderr (v0.2 plan
+/// 7.1, step 5). The command inherits stdin and stays in secrit's process
+/// group, the foreground group, so terminal signals reach both.
+///
+/// A signal that the caller ignored stays ignored in secrit and in the
+/// command, and is not forwarded ([`signals::ignored_at_start`]). Nothing
+/// reads the deferred-signal flag after the command ends, so a Ctrl-C that
+/// the command handled does not make secrit exit 130.
+///
+/// - INT and QUIT are recorded only: the command decides what they mean.
+/// - TERM and HUP are forwarded to the command; secrit keeps waiting.
+/// - TSTP does not stop secrit. When the command stops (Ctrl-Z), secrit
+///   stops itself, so the shell sees the whole job stop. After `fg`
+///   secrit sends CONT to the command and waits again. A stopped command
+///   is never killed.
+/// - No deadline and no output cap.
+///
+/// `handoff` is dropped right after the spawn: it holds secrit's copies of
+/// the memfds, which only the command needs. `cmd` is dropped there too.
+/// It holds the `--env` values, and std frees them without a wipe.
+///
+/// The pumps stop at the end of the output, or when the command has
+/// exited and its output stays idle for [`IDLE`]. A process that the
+/// command left behind and that writes later gets `EPIPE`.
+pub fn supervise<H>(
+    mut cmd: Command,
+    maskers: [Masker; 2],
+    handoff: H,
+) -> Result<ExitStatus, ChildError> {
+    let _critical = signals::Critical::enter();
+    signals::record()?;
+    let _ = signals::take();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let spawned = cmd.spawn();
+    drop(cmd);
+    drop(handoff);
+    let mut child = spawned?;
+    let pid = Pid::from_child(&child);
+    let out_pipe = child.stdout.take();
+    let err_pipe = child.stderr.take();
+    let exited = AtomicBool::new(false);
+    let [out_masker, err_masker] = maskers;
+    std::thread::scope(|s| {
+        let exited = &exited;
+        let out = s.spawn(move || {
+            let stdout = io::stdout();
+            pump(out_pipe, stdout.as_fd(), out_masker, exited)
+        });
+        let err = s.spawn(move || {
+            let stderr = io::stderr();
+            pump(err_pipe, stderr.as_fd(), err_masker, exited)
+        });
+        let waited = wait_supervised(pid);
+        if waited.is_err() {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        exited.store(true, Ordering::SeqCst);
+        // A write error (a closed stdout) only ends that pump; the command
+        // then gets EPIPE, as in a pipeline.
+        let _ = out.join();
+        let _ = err.join();
+        let status = child.wait();
+        waited?;
+        Ok(status?)
+    })
+}
+
+/// Poll the command until it exits. Forward TERM and HUP; follow a stop.
+fn wait_supervised(pid: Pid) -> Result<(), ChildError> {
+    loop {
+        forward(pid);
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED
+                | WaitIdOptions::STOPPED
+                | WaitIdOptions::NOHANG
+                | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(st)) if st.stopped() => {
+                let _ = kill_process(getpid(), Signal::STOP);
+                // Here again after a CONT, for example from `fg`.
+                let _ = kill_process(pid, Signal::CONT);
+            }
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(Errno::INTR) => {}
+            Err(e) => return Err(ChildError::Io(e.into())),
+        }
+        std::thread::sleep(SUPERVISE_POLL);
+    }
+}
+
+/// Send TERM and HUP on to the command. INT, QUIT and TSTP reach it from
+/// the terminal, or not at all.
+fn forward(pid: Pid) {
+    for sig in signals::take() {
+        let signal = match sig {
+            signal_hook::consts::SIGTERM => Signal::TERM,
+            signal_hook::consts::SIGHUP => Signal::HUP,
+            _ => continue,
+        };
+        let _ = kill_process(pid, signal);
+    }
+}
+
+/// Copy `pipe` to `out` through `masker`. When the pipe stays idle for
+/// [`IDLE`], release the held bytes (`flush_held`), so a prompt with no
+/// newline is shown.
+fn pump(
+    pipe: Option<impl Read + AsFd>,
+    out: BorrowedFd<'_>,
+    mut masker: Masker,
+    exited: &AtomicBool,
+) -> io::Result<()> {
+    let Some(mut pipe) = pipe else {
+        return Ok(());
+    };
+    let idle = Timespec {
+        tv_sec: 0,
+        tv_nsec: IDLE.subsec_nanos().into(),
+    };
+    let mut buf = Zeroizing::new(vec![0u8; PUMP_BYTES]);
+    loop {
+        let mut fds = [PollFd::new(&pipe, PollFlags::IN)];
+        match poll(&mut fds, Some(&idle)) {
+            Ok(0) => {
+                write_all(out, masker.flush_held())?;
+                if exited.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+            Ok(_) => {}
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        }
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let written = write_all(out, masker.feed(&buf[..n]));
+                buf[..n].zeroize();
+                written?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    write_all(out, masker.finish())
+}
+
+/// Write all of `data` to `out` with no buffer in between, so held bytes
+/// leave at once and no copy stays in a std buffer.
+fn write_all(out: BorrowedFd<'_>, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        match rustix::io::write(out, data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => data = &data[n..],
+            Err(Errno::INTR) => {}
+            Err(Errno::AGAIN) => {
+                // A non-blocking stdout: wait until it takes more.
+                let mut fds = [PollFd::new(&out, PollFlags::OUT)];
+                match poll(&mut fds, None) {
+                    Ok(_) | Err(Errno::INTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

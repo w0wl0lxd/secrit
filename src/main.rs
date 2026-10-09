@@ -10,14 +10,10 @@ mod config;
 mod display;
 mod error;
 mod git;
+#[cfg(target_os = "linux")]
+mod handoff;
 mod harden;
 mod lock;
-// `run` (v0.2 plan S13) is the first reader; that slice removes the
-// `expect`. Under `cfg(test)` the unit tests read every item.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by `run` from v0.2 plan S13")
-)]
 mod mask;
 mod name;
 mod report;
@@ -33,6 +29,7 @@ use std::process::ExitCode;
 use clap::CommandFactory;
 
 use crate::cli::{Cli, Command};
+use crate::cmd::run::Ended;
 use crate::cmd::{Ctx, StoreArgs, parse_name};
 use crate::error::Error;
 
@@ -51,7 +48,12 @@ fn main() -> ExitCode {
         }
     }
     match dispatch(cli, hardened) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Ended::Code(code)) => ExitCode::from(code),
+        Ok(Ended::Signal(sig)) => {
+            // `run`: CMD ended by a signal, so secrit ends by it too (T45).
+            signals::die_by(sig);
+            ExitCode::from(u8::try_from(128 + sig).unwrap_or(1))
+        }
         Err(e) => {
             eprintln!("secrit: {e}");
             ExitCode::from(e.exit().code())
@@ -59,7 +61,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
+fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
     let Cli {
         config,
         store,
@@ -72,7 +74,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
     signals::defer()
         .map_err(|e| Error::Failed(format!("could not install signal handlers: {e}")))?;
     let ctx = || Ctx::load(config.as_deref(), store.as_deref(), quiet);
-    match command {
+    let done = match command {
         Command::Store {
             name,
             replace,
@@ -130,6 +132,23 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             let name = parse_name(&name)?;
             cmd::wire::run(&ctx()?, &name, owner.as_deref(), format)
         }
+        Command::Run {
+            file,
+            env,
+            pristine,
+            no_mask,
+            command,
+        } => {
+            // The command line and the agent rules come before the config.
+            let plan = cmd::run::check(cmd::run::RunArgs {
+                file,
+                env,
+                pristine,
+                no_mask,
+                command,
+            })?;
+            return cmd::run::run(&ctx()?, &plan);
+        }
         Command::Completions { shell } => {
             clap_complete::generate(
                 clap_complete::Shell::from(shell),
@@ -139,5 +158,6 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             );
             Ok(())
         }
-    }
+    };
+    done.map(|()| Ended::Code(0))
 }

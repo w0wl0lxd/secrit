@@ -6,8 +6,9 @@ prompt or from stdin. The value never goes on the command line, never reaches th
 scrollback, and the write is crash-safe and lock-protected. The design is in
 [`docs/PLAN.md`](docs/PLAN.md).
 
-Status: v0.1. Every v0.1 command works: `store`, `get`, `ls`, `rm`, `init`, `doctor` and
-`wire`. `run` moved to v0.2 (see [What works](#what-works)).
+Status: v0.1, with v0.2 work in progress. Every v0.1 command works: `store`, `get`, `ls`,
+`rm`, `init`, `doctor` and `wire`. `run` (v0.2) works on Linux (see
+[What works](#what-works)).
 
 ## What secrit does not protect against
 
@@ -28,6 +29,19 @@ Read this first.
   can read it too: for example Kitty remote control, a screen recorder or a screen share.
 - **No clipboard in v0.1.** secrit has no clipboard support: clipboard history daemons
   keep values on disk. Use `get --stdout` into a pipe instead.
+- **`secrit run` hands values to another program.** Masking of its output prevents
+  accidents only. A program can print a value in a form that secrit does not know (T44),
+  and base64 that is wrapped into lines is not matched. Masking covers stdout and stderr
+  only, and the command sees pipes, not a terminal. After 100 ms of idle output secrit
+  shows the bytes that it holds, so a prefix of a value can show. When the rest of the
+  value follows later, the rest is masked; the prefix stays shown. While secrit masks,
+  it stops the copy of the output when CMD has exited and the output stays idle for
+  100 ms. A background process that CMD leaves running and that writes later gets `EPIPE`
+  or `SIGPIPE`, and its output is lost. Any process of your user can read an `--env`
+  value in `/proc/PID/environ` (also `ps eww` and `docker inspect`), and a `--file` value
+  through `/proc/PID/fd/N` (T42, T57); masking covers neither. The memfd and `VAR` pass
+  to grandchildren; `sudo` and other programs that close every fd above 2 lose `--file`
+  values; memfd pages can reach swap.
 - **Old values.** `rm` and `store --replace` keep a ciphertext backup in
   `$XDG_STATE_HOME/secrit/backups/` (default `~/.local/state/secrit/backups/`), the newest
   10 per store. Git history, backups and rendered `/run/secrets` copies keep old values.
@@ -200,6 +214,10 @@ secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused o
 
 secrit rm github-token                 # asks on the terminal; --yes to skip
 
+secrit run --file TOKEN_FILE=github-token -- some-cmd   # TOKEN_FILE=/dev/fd/N, a sealed memfd
+secrit run --env TOKEN=github-token -- some-cmd         # the value in the environment
+secrit run --pristine --file KEY=db-pass -- server      # only the --file and --env variables
+
 secrit doctor                          # read-only checks; exit 1 when one fails
 secrit doctor --json
 secrit wire github-token               # sops-nix stanza on stdout; git and rebuild steps on stderr
@@ -216,6 +234,21 @@ At the terminal prompt, a tab is kept. The terminal limits one line to 4095 byte
 longer value. `--multiline` at the prompt reads lines until a line that holds only `.`, and
 asks once, not twice.
 
+`run` (Linux) reads every value first, then starts CMD. `--file VAR=NAME` puts the value
+in a sealed memfd named `secrit` and sets `VAR=/dev/fd/N`; the command can open that path
+more than once. `--env VAR=NAME` puts the value itself in `VAR` and refuses a value with a
+NUL byte. `--pristine` starts CMD with only those variables. When stdout or stderr is not
+a terminal, or an agent is detected, secrit stays the parent and masks the output: each
+value, and its base64, URL-safe base64, hex, percent and JSON forms, becomes
+`[secrit:NAME]`. A value shorter than 4 bytes is not masked, with a warning. Otherwise,
+and with `--no-mask`, secrit replaces itself with CMD. Ctrl-C and Ctrl-Z reach CMD as
+usual; TERM and HUP are forwarded to it. A signal that the caller ignores (`nohup`,
+`trap '' HUP`) stays ignored in secrit and in CMD, and secrit does not forward it (Linux;
+on other systems CMD starts with the default action). `run` exits with CMD's exit code,
+or ends by the signal that ended CMD. CMD runs with the umask that secrit started with.
+CMD keeps `RLIMIT_CORE=0` on purpose: it holds the values too, so it writes no core dump.
+The hard limit is 0 too, so an unprivileged CMD cannot raise it.
+
 `get --stdout` writes to a pipe, a socket or a character device. It writes to a regular
 file only when the file is yours and group and others cannot read it (for example after
 `umask 077`).
@@ -224,7 +257,8 @@ Exit codes: `0` success, `1` failed, `2` usage error, `3` refused by a safety ru
 terminal, overwrite, name rule, an unsafe store file, store directory, config file, lock
 directory, `.sops.yaml` or `sops`), `4` lock timeout or a
 concurrent change, `130` a signal cancelled the command before a write took effect. `init`
-keeps the files of the steps it finished; run it again to finish the setup.
+keeps the files of the steps it finished; run it again to finish the setup. `run` exits
+with the exit code of CMD once CMD has started.
 
 ### Rules secrit enforces
 
@@ -240,7 +274,9 @@ keeps the files of the steps it finished; run it again to finish the setup.
   `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`,
   `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE` or `OPENCODE_CLIENT`), `get` is refused. There is no override: an agent can set any
   variable. With no terminal at all (`/dev/tty` cannot be opened, as in cron or
-  `ssh -T`), `get` is also refused. `store`, `ls` and `rm --yes` work.
+  `ssh -T`), `get` is also refused. `run --env` and `run --no-mask` are refused in both
+  cases; `run --file` works and its output is always masked. `store`, `ls` and `rm --yes`
+  work.
 - **Terminal output.** `get` never writes a control character from the value to the
   terminal: it shows `\xNN` in reverse video instead. `ls` escapes names the same way.
 - **The write protocol.** secrit takes a lock in `$XDG_RUNTIME_DIR/secrit/`, copies the
@@ -271,7 +307,7 @@ not one that lands after it.
 | `init`, `doctor`, `wire` | Works | |
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
-| `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
+| `run` (memfd, masking) | Works on Linux (v0.2, S13) | `--file` needs Linux |
 | `--clip` (clipboard) | Not in v0.1 | v0.2, optional (Q4) |
 
 ## Develop

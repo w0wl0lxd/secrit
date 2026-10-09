@@ -252,7 +252,11 @@ keeps the files of the steps it finished; run it again to finish the setup.
   `OPENCODE_CLIENT` or `COPILOT_CLI`), in its own environment or in the environment of a
   parent process (at most 64 levels up), or when there is no terminal at all (`/dev/tty`
   cannot be opened, as in cron or `ssh -T`). There is no override: an agent can set any
-  variable. Under an agent, `get` is refused.
+  variable. Under an agent, `get` is refused. The walk reads the environment that each
+  parent process had when it started. So a long-lived process that started in an agent
+  session (for example a terminal multiplexer server) makes every shell under it an agent.
+  The question and the `doctor` agent row name the pid and the name of that process. Start
+  that process again outside the agent session.
 - **The write gate.** Under an agent, `store`, `rm` and `init` ask on the terminal for the
   secret name (the store name for `init`) and go on only when it is typed exactly. A `y`
   does not confirm, and `rm --yes` still asks. secrit discards input that was typed before

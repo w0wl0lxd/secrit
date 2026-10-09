@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::config::{BackendConfig, BackendKind, Config, Env, StoreConfig, ToolSetting};
-use crate::display::escape;
+use crate::display::escape_path;
 use crate::error::{Error, Exit};
 use crate::lock::LockError;
 use crate::name::{Name, NameError};
@@ -143,14 +143,6 @@ pub enum Location {
 }
 
 impl Location {
-    /// The location as v0.1 printed it where it did not escape it.
-    #[must_use]
-    pub fn raw(&self) -> std::path::Display<'_> {
-        match self {
-            Location::File(p) => p.display(),
-        }
-    }
-
     #[must_use]
     pub fn file(path: &Path) -> Self {
         Location::File(path.to_path_buf())
@@ -161,7 +153,7 @@ impl Location {
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Location::File(p) => f.write_str(&escape(&p.display().to_string())),
+            Location::File(p) => f.write_str(&escape_path(p)),
         }
     }
 }
@@ -209,27 +201,27 @@ pub enum BackendError {
     Exists { name: Name, location: Location },
     #[error("'{name}' does not exist in {location}")]
     Missing { name: Name, location: Location },
-    #[error("refusing {}: {reason}", path.display())]
+    #[error("refusing {}: {reason}", escape_path(path))]
     Unsafe { path: PathBuf, reason: String },
     #[error(transparent)]
     Name(#[from] NameError),
-    #[error("refusing to write {}: {reason}", path.display())]
+    #[error("refusing to write {}: {reason}", escape_path(path))]
     CleartextRule { path: PathBuf, reason: String },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(
         "{} changed while secrit was writing it, on the first try and on {MAX_RETRIES} retries; nothing was written",
-        .0.display()
+        escape_path(.0)
     )]
     Changed(PathBuf),
-    #[error("{step} {}: {source}", path.display())]
+    #[error("{step} {}: {source}", escape_path(path))]
     Io {
         step: &'static str,
         path: PathBuf,
         source: std::io::Error,
     },
     /// `format` names what the store should be, such as "sops YAML file".
-    #[error("could not parse {} as a {format}: {what}", location.raw())]
+    #[error("could not parse {location} as a {format}: {what}")]
     Parse {
         location: Location,
         format: &'static str,
@@ -251,7 +243,7 @@ pub enum BackendError {
     Interrupted,
     #[error(
         "the store file {} does not exist; create it first (see the README, section 'Set up a store')",
-        .0.display()
+        escape_path(.0)
     )]
     NoStoreFile(PathBuf),
     #[error(
@@ -281,7 +273,7 @@ pub enum BackendError {
     },
     #[error(
         "no .sops.yaml for {}; sops needs a creation rule for it to create the file (pass --sops-config, or --write-sops-config to 'secrit init')",
-        .0.display()
+        escape_path(.0)
     )]
     NoSopsConfig(PathBuf),
     #[error(
@@ -293,7 +285,7 @@ pub enum BackendError {
         target: Target,
     },
     /// `need` is the oldest version secrit accepts and why.
-    #[error("{} is {tool} {found}; secrit needs {tool} {need}", path.display())]
+    #[error("{} is {tool} {found}; secrit needs {tool} {need}", escape_path(path))]
     ToolTooOld {
         tool: &'static str,
         found: String,
@@ -531,22 +523,64 @@ mod tests {
         ]);
     }
 
-    /// A location with a control character is escaped where v0.1 escaped
-    /// the path, and shown as is where v0.1 showed it as is.
+    /// A store path with a control character is escaped in every error,
+    /// so the path cannot drive the terminal.
     #[test]
-    fn locations_escape_as_v01_did() {
-        let odd = Location::File(PathBuf::from("/s/a\u{1b}b.yaml"));
-        assert_eq!(odd.to_string(), "/s/a\\x1bb.yaml");
+    fn every_error_escapes_the_path() {
+        let odd = PathBuf::from("/s/a\u{1b}b.yaml");
+        let location = Location::File(odd.clone());
+        assert_eq!(location.to_string(), "/s/a\\x1bb.yaml");
         let target = Target {
-            location: odd.clone(),
+            location: location.clone(),
             name: Some(tok()),
         };
         assert_eq!(target.to_string(), "'tok' in /s/a\\x1bb.yaml");
-        let e = BackendError::Parse {
-            location: odd,
-            format: "sops YAML file",
-            what: "invalid YAML".into(),
-        };
-        assert!(e.to_string().contains('\u{1b}'), "{e}");
+        let reason = String::new;
+        let errors = [
+            BackendError::Exists {
+                name: tok(),
+                location: location.clone(),
+            },
+            BackendError::Missing {
+                name: tok(),
+                location: location.clone(),
+            },
+            BackendError::Unsafe {
+                path: odd.clone(),
+                reason: reason(),
+            },
+            BackendError::CleartextRule {
+                path: odd.clone(),
+                reason: reason(),
+            },
+            BackendError::Changed(odd.clone()),
+            BackendError::Io {
+                step: "open",
+                path: odd.clone(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            BackendError::Parse {
+                location,
+                format: "sops YAML file",
+                what: reason(),
+            },
+            BackendError::Validation {
+                target,
+                reason: reason(),
+            },
+            BackendError::NoStoreFile(odd.clone()),
+            BackendError::NoSopsConfig(odd.clone()),
+            BackendError::ToolTooOld {
+                tool: "sops",
+                found: "3.10.0".into(),
+                path: odd,
+                need: sops::NEED_SOPS,
+            },
+        ];
+        for e in errors {
+            let text = e.to_string();
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(text.contains("/s/a\\x1bb.yaml"), "{text}");
+        }
     }
 }

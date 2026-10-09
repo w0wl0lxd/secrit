@@ -100,6 +100,9 @@ All notable changes to this project are recorded here. The format follows
   SSH key from `~/.ssh`.
 - Reveal mode shows control characters in a value as `\xNN` in reverse video, so a value
   cannot leave the alternate screen or send terminal commands. `ls` escapes names too.
+- Every message that names a store file, a backup or the sops binary escapes control
+  characters in the path. Before, the `stored ... in PATH` and backup lines and some errors
+  (`refusing PATH`, `could not parse PATH`) printed the path as is.
 - A signal during reveal clears the screen and restores the terminal (exit 130).
 - `get --stdout` refuses a regular file that group or others can read, or that another
   user owns, and a block device.

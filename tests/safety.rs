@@ -545,6 +545,58 @@ fn ls_escapes_control_characters() {
     assert!(String::from_utf8(json.stdout).unwrap().contains("\\u001b"));
 }
 
+/// A store path with a control character is escaped in the status lines
+/// and in every error, as the name errors escape it.
+#[test]
+fn store_paths_are_escaped_on_stderr() {
+    let env = TestEnv::new();
+    let odd = env.store_dir.join("a\u{1b}b.yaml");
+    env.create_store(&odd);
+    let text = std::fs::read_to_string(&env.config_file).unwrap().replace(
+        &env.store_file.display().to_string(),
+        &format!("{}/a\\u001bb.yaml", env.store_dir.display()),
+    );
+    std::fs::write(&env.config_file, text).unwrap();
+    let shown = "a\\x1bb.yaml";
+    let escaped = |out: &std::process::Output| {
+        let err = stderr(out);
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        assert!(err.contains(shown), "{err}");
+    };
+
+    let out = env.store_value("tok", b"v\n");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("stored tok in main ("),
+        "{}",
+        stderr(&out)
+    );
+    escaped(&out);
+    let out = env.run(["store", "tok", "--replace"], Some(b"w\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("backup of the old file: "),
+        "{}",
+        stderr(&out)
+    );
+    escaped(&out);
+
+    // BackendError::Parse.
+    std::fs::write(&odd, "not: [yaml\n").unwrap();
+    let out = env.run(["ls"], None);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("could not parse"), "{}", stderr(&out));
+    escaped(&out);
+
+    // BackendError::Unsafe.
+    std::fs::remove_file(&odd).unwrap();
+    std::os::unix::fs::symlink(&env.store_file, &odd).unwrap();
+    let out = env.run(["ls"], None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("refusing"), "{}", stderr(&out));
+    escaped(&out);
+}
+
 /// R6: the name rules come before the config, so a bad name exits 3 even
 /// with no config.
 #[test]

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, shell_path, shell_word};
 use crate::backend::BackendError;
 use crate::cli::WireFormat;
+use crate::display::escape_path;
 use crate::error::Error;
 use crate::git::{Repo, find_root};
 use crate::name::Name;
@@ -38,7 +39,7 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
         Err(BackendError::NoStoreFile(p)) => {
             warn(
                 ctx,
-                &format!("{} does not exist yet; run 'secrit init'", p.display()),
+                &format!("{} does not exist yet; run 'secrit init'", escape_path(&p)),
             );
         }
         Err(e) => return Err(e.into()),
@@ -178,7 +179,7 @@ fn nix_stanza(name: &Name, file: &Path, flake: Option<&Path>, owner: &str) -> St
     let source = match (rel, flake) {
         (Some(r), Some(f)) if nix_path_ok(&r) => format!(
             "{r}; # relative to {}; adjust it to the .nix file that holds this stanza",
-            crate::display::escape(&f.to_string_lossy())
+            escape_path(f)
         ),
         _ if nix_path_ok(&abs) => {
             format!("{abs}; # absolute; pure flake evaluation needs a path inside the flake")

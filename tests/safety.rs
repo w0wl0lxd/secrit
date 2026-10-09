@@ -304,6 +304,33 @@ fn a_store_that_is_not_yaml_is_refused_and_unchanged() {
     }
 }
 
+/// sops never encrypts an empty string: `sops encrypt` keeps `a: ""` in
+/// clear. Such an entry holds no secret, so `store` and `rm` accept the
+/// file, the copy validation and the readback pass, and the entry stays.
+#[test]
+fn an_empty_value_from_sops_does_not_block_a_write() {
+    let env = TestEnv::new();
+    env.create_store_with(&env.store_file, &[], br#"{"a": "", "b": "x"}"#);
+    let text = String::from_utf8(env.store_bytes()).unwrap();
+    assert!(text.contains("a: \"\""), "sops encrypted the empty value");
+    assert!(!text.contains("b: x"), "sops did not encrypt b");
+
+    let out = env.store_value("c", b"new value");
+    assert_eq!(code(&out), 0, "store: {}", stderr(&out));
+    env.assert_value("c", "new value");
+    let out = env.run(["rm", "--yes", "b"], None);
+    assert_eq!(code(&out), 0, "rm: {}", stderr(&out));
+
+    let all = env.decrypt();
+    assert_eq!(
+        all.get("a"),
+        Some(&serde_json::Value::String(String::new()))
+    );
+    assert!(!all.contains_key("b"));
+    assert_eq!(env.ls(), ["a", "c"]);
+    assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
+}
+
 /// A-5 (PLAN 8.1, step 4): the store directory is checked again after the
 /// lock is taken, so a chmod while secrit waited for the lock is seen.
 #[cfg(feature = "test-hooks")]
@@ -516,6 +543,58 @@ fn ls_escapes_control_characters() {
     );
     let json = env.run(["ls", "--json"], None);
     assert!(String::from_utf8(json.stdout).unwrap().contains("\\u001b"));
+}
+
+/// A store path with a control character is escaped in the status lines
+/// and in every error, as the name errors escape it.
+#[test]
+fn store_paths_are_escaped_on_stderr() {
+    let env = TestEnv::new();
+    let odd = env.store_dir.join("a\u{1b}b.yaml");
+    env.create_store(&odd);
+    let text = std::fs::read_to_string(&env.config_file).unwrap().replace(
+        &env.store_file.display().to_string(),
+        &format!("{}/a\\u001bb.yaml", env.store_dir.display()),
+    );
+    std::fs::write(&env.config_file, text).unwrap();
+    let shown = "a\\x1bb.yaml";
+    let escaped = |out: &std::process::Output| {
+        let err = stderr(out);
+        assert!(!err.contains('\u{1b}'), "{err:?}");
+        assert!(err.contains(shown), "{err}");
+    };
+
+    let out = env.store_value("tok", b"v\n");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("stored tok in main ("),
+        "{}",
+        stderr(&out)
+    );
+    escaped(&out);
+    let out = env.run(["store", "tok", "--replace"], Some(b"w\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("backup of the old file: "),
+        "{}",
+        stderr(&out)
+    );
+    escaped(&out);
+
+    // BackendError::Parse.
+    std::fs::write(&odd, "not: [yaml\n").unwrap();
+    let out = env.run(["ls"], None);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(stderr(&out).contains("could not parse"), "{}", stderr(&out));
+    escaped(&out);
+
+    // BackendError::Unsafe.
+    std::fs::remove_file(&odd).unwrap();
+    std::os::unix::fs::symlink(&env.store_file, &odd).unwrap();
+    let out = env.run(["ls"], None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("refusing"), "{}", stderr(&out));
+    escaped(&out);
 }
 
 /// R6: the name rules come before the config, so a bad name exits 3 even

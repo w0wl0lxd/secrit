@@ -20,6 +20,7 @@ mod lock;
 )]
 mod mask;
 mod name;
+mod report;
 mod secret;
 mod signals;
 mod testhook;

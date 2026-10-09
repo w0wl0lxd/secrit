@@ -102,8 +102,9 @@ pub fn gate_open() -> bool {
 
 /// The pid at which the ancestor walk stops (`SECRIT_TEST_ANCESTOR_STOP`).
 /// The integration tests set it to their own pid, so an agent variable in
-/// the environment of the test runner does not count.
-#[cfg(feature = "test-hooks")]
+/// the environment of the test runner does not count. The walk reads
+/// `/proc`, so only Linux has this function.
+#[cfg(all(feature = "test-hooks", target_os = "linux"))]
 #[must_use]
 pub fn ancestor_stop() -> Option<u32> {
     std::env::var("SECRIT_TEST_ANCESTOR_STOP")
@@ -111,7 +112,7 @@ pub fn ancestor_stop() -> Option<u32> {
         .and_then(|v| v.parse().ok())
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(all(not(feature = "test-hooks"), target_os = "linux"))]
 #[must_use]
 pub fn ancestor_stop() -> Option<u32> {
     None

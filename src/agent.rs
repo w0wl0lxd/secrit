@@ -32,6 +32,7 @@ pub const AGENT_VARS: &[&str] = &[
 ];
 
 /// The most ancestors the walk reads. It also ends a cycle in `/proc`.
+#[cfg(any(target_os = "linux", test))]
 pub const MAX_ANCESTORS: usize = 64;
 
 /// The most bytes read from the environment of one ancestor. The kernel
@@ -56,6 +57,7 @@ pub struct Comm {
 }
 
 impl Comm {
+    #[cfg(any(target_os = "linux", test))]
     #[must_use]
     pub fn new(name: &[u8]) -> Self {
         let mut bytes = [0u8; 16];
@@ -90,7 +92,12 @@ impl fmt::Debug for Comm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
     Variable(&'static str),
-    /// An ancestor process has the variable in its environment.
+    /// An ancestor process has the variable in its environment. The walk
+    /// reads `/proc`, so only Linux makes this variant.
+    #[cfg_attr(
+        not(any(target_os = "linux", test)),
+        expect(dead_code, reason = "the ancestor walk reads /proc")
+    )]
     Ancestor {
         var: &'static str,
         pid: u32,
@@ -199,6 +206,7 @@ pub fn gated_decrypt(agent: Option<Agent>, tty_opens: bool) -> GatedDecrypt {
 }
 
 /// One process as the walk sees it.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcInfo {
     pub ppid: u32,
@@ -210,6 +218,7 @@ pub struct ProcInfo {
 /// Walk from `first` up the parents, at most [`MAX_ANCESTORS`] steps, and
 /// return the first process with an agent variable. The walk ends at pid 0,
 /// after pid 1, at `stop`, or at a process that `read` cannot see.
+#[cfg(any(target_os = "linux", test))]
 pub fn walk(
     first: u32,
     stop: Option<u32>,
@@ -239,6 +248,7 @@ pub fn walk(
 /// The parent pid and the name in `/proc/PID/stat`. The name is in
 /// parentheses and can hold spaces and `)`, so the fields after it start
 /// after the last `)`.
+#[cfg(any(target_os = "linux", test))]
 #[must_use]
 pub fn parse_stat(stat: &[u8]) -> Option<(Comm, u32)> {
     let open = stat.iter().position(|&b| b == b'(')?;

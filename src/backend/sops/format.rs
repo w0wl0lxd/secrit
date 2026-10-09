@@ -15,7 +15,7 @@ use crate::display::escape;
 use crate::name::Name;
 
 /// The recipient keys of the sops metadata.
-const KEY_TYPES: &[&str] = &[
+pub(super) const KEY_TYPES: &[&str] = &[
     "age",
     "pgp",
     "kms",

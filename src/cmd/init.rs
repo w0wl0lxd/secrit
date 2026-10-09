@@ -207,6 +207,7 @@ fn store_config(
             Some(p) => Some(absolute(p)?),
             None => configured_sops.and_then(|s| s.age_key_file.clone()),
         },
+        keys: configured_sops.map(|s| s.keys.clone()).unwrap_or_default(),
     };
     if let Some(have) = configured_sops {
         refuse_a_differing_flag(have, &sops, &name)?;
@@ -718,6 +719,7 @@ mod tests {
             format,
             sops_config: None,
             age_key_file: None,
+            keys: crate::config::SopsKeys::default(),
         };
         let (json, yaml) = (Some(SopsFormat::Json), Some(SopsFormat::Yaml));
         for (have, flag) in [

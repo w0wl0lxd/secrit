@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use super::keys::{self, Shebang, SshKeyHeader};
 use super::{MIN_SOPS, SopsBackend, SopsFormat};
 use crate::backend::{BackendError, DoctorCtx};
 use crate::cmd::doctor::git_add_hint;
@@ -55,8 +56,8 @@ fn store_checks(
     env: &dyn Fn(&str) -> Option<OsString>,
 ) {
     let name = |what: &str| format!("store {store}: {what}");
-    let (status, detail) = age_key(backend.age_key_file());
-    r.add(name("age key"), status, detail);
+    // v0.2 S8: one row per key source.
+    key_source_rows(r, &name, backend);
 
     match backend.store.check_dir() {
         Ok(()) => r.add(
@@ -114,6 +115,120 @@ fn store_checks(
     temp_files_check(r, &name("temp files"), backend);
     backups_check(r, &name("backups"), backend);
     git_checks(r, store, backend, env);
+}
+
+/// The rows of the key sources (v0.2 plan 6.2). The age key row stays
+/// when the store uses an age key file, or names no key source at all.
+fn key_source_rows(r: &mut Report, name: &dyn Fn(&str) -> String, backend: &SopsBackend) {
+    let keys = backend.runner.keys();
+    let other = keys.ssh_key().is_some() || keys.key_cmd().is_some() || keys.plugin().is_some();
+    if keys.age_key_file().is_some() || !other {
+        let (status, detail) = age_key(keys.age_key_file());
+        r.add(name("age key"), status, detail);
+    }
+    if let Some(p) = keys.ssh_key() {
+        let (status, detail) = ssh_key(p);
+        r.add(name("ssh key"), status, detail);
+    }
+    if let Some(c) = keys.key_cmd() {
+        match keys::check_key_cmd(c) {
+            Ok(()) => r.add(
+                name("key command"),
+                Status::Ok,
+                format!(
+                    "{}; it runs once per sops run that decrypts (a store runs it twice)",
+                    c.display()
+                ),
+            ),
+            Err(e) => r.add(name("key command"), Status::Fail, e.to_string()),
+        }
+        let (status, detail) = key_cmd_shebang(c);
+        r.add(name("key command shebang"), status, detail);
+    }
+    if let Some(d) = keys.plugin_dir() {
+        match keys::check_plugin_dir(d) {
+            Ok(()) => r.add(
+                name("age plugin directory"),
+                Status::Ok,
+                d.display().to_string(),
+            ),
+            Err(e) => r.add(name("age plugin directory"), Status::Fail, e.to_string()),
+        }
+    }
+    if let Some(p) = keys.plugin() {
+        let (status, detail) = plugin_identity(p, keys.plugin_dir());
+        r.add(name("identity"), status, detail);
+    }
+}
+
+fn ssh_key(p: &Path) -> (Status, String) {
+    let shown = p.display();
+    if let Err(reason) = keys::check_private_key(p) {
+        return (Status::Fail, format!("{shown}: {reason}"));
+    }
+    match keys::ssh_key_header(p) {
+        Ok(SshKeyHeader::Unencrypted) => (Status::Ok, format!("{shown} (no passphrase)")),
+        Ok(SshKeyHeader::Encrypted) => (
+            Status::Fail,
+            format!(
+                "{shown} has a passphrase; sops cannot ask for it, because secrit never gives sops the terminal (ruling Q24)"
+            ),
+        ),
+        Ok(SshKeyHeader::NotOpenSsh) => (
+            Status::Warn,
+            format!("{shown} is not an OpenSSH private key; secrit cannot check its passphrase"),
+        ),
+        Err(e) => (Status::Fail, format!("{shown}: {e}")),
+    }
+}
+
+/// T47a: the key command runs with no `PATH`, so a script needs an
+/// absolute interpreter.
+fn key_cmd_shebang(c: &Path) -> (Status, String) {
+    let rule = "it runs with no PATH and HOME=/nonexistent, so use an absolute interpreter path, as in the README wrapper ('Keys')";
+    match keys::shebang(c) {
+        Ok(Shebang::Absolute) => (Status::Ok, "absolute interpreter or binary".into()),
+        Ok(Shebang::Env) => (
+            Status::Warn,
+            format!(
+                "{} uses '#!/usr/bin/env', which searches PATH; {rule}",
+                c.display()
+            ),
+        ),
+        Ok(Shebang::Missing) => (
+            Status::Warn,
+            format!(
+                "{} has no absolute '#!' line and is not a binary; {rule}",
+                c.display()
+            ),
+        ),
+        Err(e) => (Status::Fail, format!("{}: {e}", c.display())),
+    }
+}
+
+/// The stub and the level of a plugin identity. Only age-plugin-yubikey
+/// reports a slot policy (6.7.8 rule 4).
+fn plugin_identity(p: &keys::Plugin, dir: Option<&Path>) -> (Status, String) {
+    let stub = match p.read_stub() {
+        Ok(s) => s,
+        Err(e) => return (Status::Fail, e.to_string()),
+    };
+    let level = p.level().as_str();
+    let shown = p.stub_path().display();
+    match p.check_level(dir.unwrap_or(Path::new("/"))) {
+        Err(e) => (Status::Fail, e.to_string()),
+        Ok(()) if stub.plugin == "yubikey" => (
+            Status::Ok,
+            format!("{shown} (plugin yubikey, level {level}; the slot policy allows it)"),
+        ),
+        Ok(()) => (
+            Status::Warn,
+            format!(
+                "{shown} (plugin {}, level {level} not checked: secrit reads the slot policy of age-plugin-yubikey only)",
+                stub.plugin
+            ),
+        ),
+    }
 }
 
 fn age_key(path: Option<&Path>) -> (Status, String) {

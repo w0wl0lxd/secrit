@@ -47,8 +47,9 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
-- Internal refactor for v0.2 backends, with no change to the config format, the messages
-  or the exit codes. A `[stores.NAME]` table now parses to one settings type per
+- Internal refactor for v0.2 backends, with no change to the config format or the exit
+  codes. Messages change only as the entries below say (config parse errors, escaped
+  paths). A `[stores.NAME]` table now parses to one settings type per
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
   store through one backend factory. The sops error variants are generic tool errors
   that print the v0.1 text for sops. The test hooks moved into one module.

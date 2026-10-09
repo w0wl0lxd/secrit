@@ -44,6 +44,22 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- Internal: the output masker for the coming `secrit run` (v0.2). No command uses it yet.
+  It replaces a value and its base64 (both alphabets, three byte offsets, with and without
+  padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
+  possible start of a match, so a prompt with no newline goes out at once. A value shorter
+  than 4 bytes is not masked, with a warning.
+  - It also masks uppercase hex; percent-encoding with lowercase hex digits, with `+` for a
+    space (Python `quote_plus`, Go `QueryEscape`), as JavaScript `encodeURIComponent`
+    writes it, and as Python `quote` writes it; and the JSON escapes of Go `json.Marshal`
+    and Python `json.dumps`, with an escaped `/` and with uppercase hex digits.
+  - It also masks a value without its final `\n` or `\r\n`, as `--raw` can store it.
+  - Overlapping values are masked as one region, labelled `[secrit:A+B]`. Before, the
+    second value of an overlap stayed partly visible.
+  - `flush_held` releases held bytes after an idle period, so a prompt that starts like a
+    value is shown. It never shows a full match.
+  - Comparisons of secret bytes run in constant time. A small write after a large one no
+    longer wipes the whole output buffer.
 
 ### Changed
 

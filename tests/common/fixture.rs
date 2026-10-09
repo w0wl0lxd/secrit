@@ -34,6 +34,10 @@ pub trait Fixture: Sized {
     /// because they may hold the value.
     const REDACTION_NOTE: &'static str;
 
+    /// Two names that the store can hold, in sorted order, for the round
+    /// trip case. A store with a narrower name grammar gives its own.
+    const NAMES: [&'static str; 2] = ["a-key_1", "b.key"];
+
     /// A temp environment with an empty store and a config whose
     /// `[stores.main]` table is [`Self::config_section`].
     fn new() -> Self;
@@ -65,8 +69,11 @@ pub trait Fixture: Sized {
 
 /// The sops format of a [`SopsFixtureStore`] fixture.
 pub trait FixtureFormat {
-    /// The sops `--input-type` and the store file's extension.
+    /// The sops `--input-type` of the store file.
     const NAME: &'static str;
+
+    /// [`Fixture::NAMES`] for a store in this format.
+    const NAMES: [&'static str; 2] = ["a-key_1", "b.key"];
 }
 
 /// A sops YAML store (`main.yaml`).
@@ -83,6 +90,15 @@ impl FixtureFormat for Json {
     const NAME: &'static str = "json";
 }
 
+/// A sops dotenv store (`main.env`). Its names are variable names (v0.2
+/// plan 5.4).
+pub struct Dotenv;
+
+impl FixtureFormat for Dotenv {
+    const NAME: &'static str = "dotenv";
+    const NAMES: [&'static str; 2] = ["A_KEY_1", "b_key"];
+}
+
 /// A sops store in the format `F`, encrypted to two temp age keys.
 pub struct SopsFixtureStore<F: FixtureFormat> {
     env: TestEnv,
@@ -93,6 +109,8 @@ pub struct SopsFixtureStore<F: FixtureFormat> {
 pub type SopsFixture = SopsFixtureStore<Yaml>;
 /// A sops JSON store (v0.2 plan S4).
 pub type SopsJsonFixture = SopsFixtureStore<Json>;
+/// A sops dotenv store (v0.2 plan S6).
+pub type SopsDotenvFixture = SopsFixtureStore<Dotenv>;
 
 impl<F: FixtureFormat> SopsFixtureStore<F> {
     /// The [`TestEnv`] of the store, for the checks that only sops has.
@@ -108,6 +126,7 @@ impl<F: FixtureFormat> Fixture for SopsFixtureStore<F> {
         child_tool: true,
     };
     const REDACTION_NOTE: &'static str = "line(s) not shown, because they may hold the value";
+    const NAMES: [&'static str; 2] = F::NAMES;
 
     fn new() -> Self {
         Self {

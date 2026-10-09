@@ -10,6 +10,8 @@
 //!
 //! The rules of a store format (the reserved `sops` key, the suffix rules)
 //! are not here: each backend checks them in `check_put` (v0.2 plan 5.4).
+//! The grammar of a format that is narrower than a key path is here, as
+//! [`Name::check_dotenv`]; the backend still decides when it applies.
 
 use std::fmt;
 
@@ -30,6 +32,10 @@ pub const DEFAULT_UNENCRYPTED_SUFFIX: &str = "_unencrypted";
 
 /// The top-level key that the sops file format reserves for its metadata.
 pub const RESERVED: &str = "sops";
+
+/// The prefix of the lines that sops reads as the metadata of a dotenv
+/// file. sops matches it with the case as written.
+pub const DOTENV_METADATA_PREFIX: &str = "sops_";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
@@ -59,6 +65,28 @@ pub enum NameError {
         "NAME '{name}' has no segment that ends with '{suffix}' (the file's encrypted_suffix), so sops would store its value in cleartext"
     )]
     MissingEncryptedSuffix { name: String, suffix: String },
+    #[error(
+        "NAME must be a variable name in a dotenv store: one segment that starts with a letter or '_' and has only A-Z, a-z, 0-9 and '_'"
+    )]
+    NotVariable,
+    #[error(
+        "NAME starts with '{DOTENV_METADATA_PREFIX}', and sops reads each '{DOTENV_METADATA_PREFIX}' line of a dotenv file as its own metadata"
+    )]
+    MetadataPrefix,
+}
+
+/// Whether `s` is a variable name: `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, the
+/// name grammar of a dotenv store (v0.2 plan 5.4).
+#[must_use]
+pub fn is_variable(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+        && bytes.len() <= MAX_SEGMENT_LEN
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 /// A validated secret name: a key path of one or more segments.
@@ -130,6 +158,20 @@ impl Name {
             }
         }
         None
+    }
+
+    /// The dotenv rule (v0.2 plan 5.4): one segment that is a variable
+    /// name, and no `sops_` prefix. sops reads a `sops_` line back as
+    /// metadata, so a value under such a name would vanish from the
+    /// entries (T58).
+    pub fn check_dotenv(&self) -> Result<(), NameError> {
+        if self.0.starts_with(DOTENV_METADATA_PREFIX) {
+            return Err(NameError::MetadataPrefix);
+        }
+        if !is_variable(&self.0) {
+            return Err(NameError::NotVariable);
+        }
+        Ok(())
     }
 
     /// The sops path expression that addresses this key: `["a"]["b"]`.
@@ -272,6 +314,47 @@ mod tests {
         assert_eq!(n.sops_path(), r#"["a.b-c_d"]"#);
         let n = Name::parse("a/b/c").unwrap();
         assert_eq!(n.sops_path(), r#"["a"]["b"]["c"]"#);
+    }
+
+    /// v0.2 plan 5.4: the dotenv grammar is `^[A-Za-z_][A-Za-z0-9_]{0,127}$`.
+    #[test]
+    fn variable_names_follow_the_dotenv_grammar() {
+        let longest = "x".repeat(MAX_SEGMENT_LEN);
+        for ok in ["A", "a", "_", "_x", "API_KEY", "a1_B2", longest.as_str()] {
+            assert!(is_variable(ok), "{ok}");
+        }
+        let too_long = "x".repeat(MAX_SEGMENT_LEN + 1);
+        for bad in [
+            "",
+            "0a",
+            "a.b",
+            "a-b",
+            "a/b",
+            "a b",
+            "a=b",
+            "\u{e9}",
+            too_long.as_str(),
+        ] {
+            assert!(!is_variable(bad), "{bad}");
+        }
+    }
+
+    /// T58: a dotenv name must not start with `sops_`; the match keeps
+    /// the case, as sops does. The error never repeats the name.
+    #[test]
+    fn the_dotenv_rule_refuses_the_metadata_prefix() {
+        let check = |s: &str| Name::parse(s).unwrap().check_dotenv();
+        for ok in ["TOKEN", "a1_B2", "sops", "SOPS_X", "Sops_x", "xsops_y"] {
+            assert_eq!(check(ok), Ok(()), "{ok}");
+        }
+        for bad in ["sops_x", "sops_mac", "sops_", "sops_a.b", "sops_a/b"] {
+            assert_eq!(check(bad), Err(NameError::MetadataPrefix), "{bad}");
+        }
+        for bad in ["a.b", "a-b", "0a", "a/b", "a/sops_x"] {
+            let e = check(bad).unwrap_err();
+            assert_eq!(e, NameError::NotVariable, "{bad}");
+            assert!(!e.to_string().contains(bad), "{e}");
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::report::Report;
 use crate::secret::SecretValue;
 use crate::tools::{self, Program, ResolvedTool, ToolSource};
 
-use self::sops::SopsBackend;
+use self::sops::{SopsBackend, SopsFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutMode {
@@ -61,6 +61,16 @@ pub trait Backend {
     /// The backend's own `doctor` rows (store file, keys, rules, git).
     /// Read-only: it creates, changes and decrypts nothing.
     fn doctor(&self, report: &mut Report, ctx: &DoctorCtx<'_>);
+    /// What `wire` can tell a consumer about NAME, if anything (v0.2 plan
+    /// 5.7). Must not decrypt.
+    fn wire_source(&self, name: &Name) -> Option<WireSource>;
+}
+
+/// Where a consumer such as sops-nix reads a secret (v0.2 plan 5.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireSource {
+    /// A sops file, with the format that sops-nix must read it as.
+    SopsFile { file: PathBuf, format: SopsFormat },
 }
 
 /// What `doctor` gives a backend for its own rows.

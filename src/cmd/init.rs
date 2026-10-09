@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use super::{interrupted, shell_path};
 use crate::backend::atomic;
-use crate::backend::sops::SopsBackend;
+use crate::backend::sops::{SopsBackend, SopsFormat};
 use crate::child;
 use crate::config::{
     BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
@@ -32,6 +32,8 @@ const MAX_RECIPIENTS_BYTES: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct InitArgs {
     pub sops_file: Option<PathBuf>,
+    /// The store file format; written to the config as `format`.
+    pub format: Option<SopsFormat>,
     pub sops_config: Option<PathBuf>,
     pub age_key: Option<PathBuf>,
     pub write_sops_config: bool,
@@ -116,6 +118,9 @@ fn steps(
         path_env.as_deref(),
     )?;
     let backend = SopsBackend::new(sops_store, sops.path.clone(), lock_timeout, &env)?;
+    // Before any file is made: sops must read the file name in the
+    // store's format.
+    backend.check_file_name()?;
     let (a, b, c) = backend.checked_version()?;
     out.note(&format!(
         "sops {a}.{b}.{c} at {}; age-keygen at {}",
@@ -191,6 +196,9 @@ fn store_config(
     };
     let sops = SopsStore {
         file,
+        format: args
+            .format
+            .or_else(|| configured_sops.and_then(|s| s.format)),
         sops_config: match &args.sops_config {
             Some(p) => Some(absolute(p)?),
             None => configured_sops.and_then(|s| s.sops_config.clone()),
@@ -224,6 +232,16 @@ fn refuse_a_differing_flag(have: &SopsStore, store: &SopsStore, name: &str) -> R
         differ.push(format!(
             "--sops-file (the config has file = {})",
             shown(Some(&have.file))
+        ));
+    }
+    // A flag that names the format the config already resolves to is not
+    // a difference.
+    if have.format != store.format
+        && SopsFormat::of_file(have.format, &have.file).ok() != store.format
+    {
+        differ.push(format!(
+            "--format (the config has format = {})",
+            have.format.map_or("(not set)", SopsFormat::name)
         ));
     }
     if have.sops_config != store.sops_config {
@@ -553,6 +571,8 @@ struct NewStore<'a> {
     backend: &'static str,
     file: &'a Path,
     #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sops_config: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     age_key_file: Option<&'a Path>,
@@ -610,6 +630,7 @@ fn new_stores<'a>(
         NewStore {
             backend: "sops",
             file: &sops.file,
+            format: args.format.map(SopsFormat::name),
             sops_config: args.sops_config.as_ref().and(sops.sops_config.as_deref()),
             age_key_file: args.age_key.as_ref().and(sops.age_key_file.as_deref()),
         },
@@ -686,5 +707,46 @@ mod tests {
         let s = rule_snippet(Path::new("/x"), Path::new("/x/it's.yaml"), &[]);
         assert!(s.contains("path_regex: '(^|/)it''s\\.yaml$'"), "{s}");
         assert!(s.contains("age: age1..."), "{s}");
+    }
+
+    /// `--format` differs from the config only when it names another
+    /// format than the one that the config resolves to.
+    #[test]
+    fn a_differing_format_flag_is_refused() {
+        let store = |file: &str, format| SopsStore {
+            file: file.into(),
+            format,
+            sops_config: None,
+            age_key_file: None,
+        };
+        let (json, yaml) = (Some(SopsFormat::Json), Some(SopsFormat::Yaml));
+        for (have, flag) in [
+            (store("/s.json", None), json),
+            (store("/s.sops", json), json),
+            (store("/s.yaml", None), yaml),
+            (store("/s.json", None), None),
+        ] {
+            let with_flag = SopsStore {
+                format: flag.or(have.format),
+                ..have.clone()
+            };
+            assert!(refuse_a_differing_flag(&have, &with_flag, "m").is_ok());
+        }
+        for (have, flag, said) in [
+            (store("/s.yaml", None), json, "format = (not set)"),
+            (store("/s.json", None), yaml, "format = (not set)"),
+            (store("/s.sops", json), yaml, "format = json"),
+        ] {
+            let with_flag = SopsStore {
+                format: flag,
+                ..have.clone()
+            };
+            let e = refuse_a_differing_flag(&have, &with_flag, "m").unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("--format (the config has {said})")),
+                "{e}"
+            );
+        }
     }
 }

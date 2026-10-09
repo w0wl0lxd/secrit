@@ -2,6 +2,7 @@
 //! makes an empty store in a temp environment and reads it back with the
 //! backend's own tool, never with secrit.
 
+use std::marker::PhantomData;
 use std::path::Path;
 
 use serde_json::Value;
@@ -62,12 +63,45 @@ pub trait Fixture: Sized {
     fn fail_tool_echoing_stdin(&self);
 }
 
-/// A sops YAML store, encrypted to two temp age keys.
-pub struct SopsFixture {
-    env: TestEnv,
+/// The sops format of a [`SopsStore`] fixture.
+pub trait SopsFormat {
+    /// The sops `--input-type` and the store file's extension.
+    const NAME: &'static str;
 }
 
-impl Fixture for SopsFixture {
+/// A sops YAML store (`main.yaml`).
+pub struct Yaml;
+
+impl SopsFormat for Yaml {
+    const NAME: &'static str = "yaml";
+}
+
+/// A sops JSON store (`main.json`).
+pub struct Json;
+
+impl SopsFormat for Json {
+    const NAME: &'static str = "json";
+}
+
+/// A sops store in the format `F`, encrypted to two temp age keys.
+pub struct SopsStore<F: SopsFormat> {
+    env: TestEnv,
+    format: PhantomData<F>,
+}
+
+/// A sops YAML store, the v0.1 store.
+pub type SopsFixture = SopsStore<Yaml>;
+/// A sops JSON store (v0.2 plan S4).
+pub type SopsJsonFixture = SopsStore<Json>;
+
+impl<F: SopsFormat> SopsStore<F> {
+    /// The [`TestEnv`] of the store, for the checks that only sops has.
+    pub fn env(&self) -> &TestEnv {
+        &self.env
+    }
+}
+
+impl<F: SopsFormat> Fixture for SopsStore<F> {
     const CAPS: Caps = Caps {
         names_without_decrypt: true,
         backups: true,
@@ -77,7 +111,8 @@ impl Fixture for SopsFixture {
 
     fn new() -> Self {
         Self {
-            env: TestEnv::new(),
+            env: TestEnv::with_format(F::NAME),
+            format: PhantomData,
         }
     }
 

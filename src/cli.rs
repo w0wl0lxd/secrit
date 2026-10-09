@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crate::backend::sops::SopsFormat;
 use crate::error::Exit;
 
 /// The fixed message for a value on the command line. It never repeats the
@@ -87,6 +88,9 @@ pub enum Command {
         /// The sops file to create [default: the store file from the config]
         #[arg(long, value_name = "PATH")]
         sops_file: Option<PathBuf>,
+        /// The sops file format [default: the config, else json for a .json file, else yaml]
+        #[arg(long, value_enum)]
+        format: Option<SopsFormat>,
         /// The .sops.yaml to use [default: the nearest one upward from the sops file]
         #[arg(long, value_name = "PATH")]
         sops_config: Option<PathBuf>,

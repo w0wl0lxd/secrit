@@ -97,6 +97,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
         }
         Command::Init {
             sops_file,
+            format,
             sops_config,
             age_key,
             write_sops_config,
@@ -107,6 +108,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             quiet,
             &cmd::init::InitArgs {
                 sops_file,
+                format,
                 sops_config,
                 age_key,
                 write_sops_config,

@@ -17,16 +17,17 @@ use std::time::Duration;
 use serde_json::Value;
 
 use self::edit::{Op, SopsEdit};
-use self::format::{REGEX_RULES, SopsFormat, has_plaintext, has_recipients, non_string_kind};
+use self::format::{REGEX_RULES, has_plaintext, has_recipients, non_string_kind};
 use self::runner::{MAX_NEW_FILE_BYTES, Runner};
 use super::atomic::{self, FileStore};
-use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WriteReport};
+use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WireSource, WriteReport};
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::name::Name;
 use crate::paths;
 use crate::report::Report;
 use crate::secret::SecretValue;
 
+pub use self::format::SopsFormat;
 pub use self::runner::MIN_SOPS;
 #[cfg(test)]
 pub use self::runner::{NEED_SOPS, PROMPT_HINT};
@@ -61,6 +62,7 @@ impl SopsBackend {
         lock_timeout: Duration,
         env: &Env,
     ) -> Result<Self, BackendError> {
+        let format = SopsFormat::of_file(store.format, &store.file)?;
         let file = FileStore::new(
             store.file.clone(),
             paths::runtime_dir(env),
@@ -85,7 +87,7 @@ impl SopsBackend {
         Ok(Self {
             location: Location::File(store.file.clone()),
             store: file,
-            format: store_format(store),
+            format,
             runner,
             age_key_file,
         })
@@ -95,6 +97,12 @@ impl SopsBackend {
     /// copies.
     pub fn temp_ignore(&self) -> TempIgnore {
         TempIgnore::new(self.file(), self.format)
+    }
+
+    /// [`SopsFormat::refuse_other_name`] for the store file: `init` runs it
+    /// before it makes any file.
+    pub fn check_file_name(&self) -> Result<(), BackendError> {
+        self.format.refuse_other_name(self.file())
     }
 
     /// The version that `sops --version` reports.
@@ -228,6 +236,14 @@ impl SopsBackend {
         Ok((snap.bytes, doc))
     }
 
+    /// [`Self::read_doc`] for a write: a file in another format is refused
+    /// (exit 3) before the parse can fail on it (v0.2 plan V14).
+    fn read_doc_to_write(&self) -> Result<format::SopsDoc, BackendError> {
+        let snap = self.store.read(false)?;
+        self.format.refuse_other(&snap.bytes, self.file())?;
+        self.format.parse(&snap.bytes, self.file())
+    }
+
     fn exists_error(&self, name: &Name) -> BackendError {
         BackendError::Exists {
             name: name.clone(),
@@ -273,8 +289,7 @@ impl Backend for SopsBackend {
     }
 
     fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
-        let (bytes, doc) = self.read_doc()?;
-        self.format.refuse_other(&bytes, self.file())?;
+        let doc = self.read_doc_to_write()?;
         if mode == PutMode::CreateOnly && doc.entries.contains_key(name.as_str()) {
             return Err(self.exists_error(name));
         }
@@ -283,8 +298,7 @@ impl Backend for SopsBackend {
     }
 
     fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
-        let (bytes, doc) = self.read_doc()?;
-        self.format.refuse_other(&bytes, self.file())?;
+        let doc = self.read_doc_to_write()?;
         if !doc.entries.contains_key(name.as_str()) {
             return Err(self.missing_error(name));
         }
@@ -339,16 +353,18 @@ impl Backend for SopsBackend {
     fn doctor(&self, report: &mut Report, ctx: &DoctorCtx<'_>) {
         doctor::rows(report, self, ctx);
     }
+
+    fn wire_source(&self, _name: &Name) -> Option<WireSource> {
+        Some(WireSource::SopsFile {
+            file: self.file().to_path_buf(),
+            format: self.format,
+        })
+    }
 }
 
-/// The format of a store's file. v0.2 starts with YAML only; S4 reads it
-/// from the store config.
-fn store_format(_store: &SopsStore) -> SopsFormat {
-    SopsFormat::Yaml
-}
-
-/// How git sees the temp copies of one store. Both parts follow the
-/// store's format, because a temp copy ends in the format's extension.
+/// How git sees the temp copies of one store. The sample follows the
+/// store's format, because a temp copy ends in the format's extension;
+/// the pattern matches the temp copies of every format (v0.2 plan 6.1.5).
 #[derive(Debug)]
 pub struct TempIgnore {
     /// A temp copy name with a fixed random part, to ask git whether it
@@ -360,16 +376,19 @@ pub struct TempIgnore {
 
 impl TempIgnore {
     fn new(file: &Path, format: SopsFormat) -> Self {
-        let ext = format.temp_ext();
         Self {
-            sample: atomic::temp_sample(file, ext),
-            pattern: atomic::temp_ignore(ext),
+            sample: atomic::temp_sample(file, format.temp_ext()),
+            pattern: atomic::temp_ignore(),
         }
     }
 
-    /// The temp copies of `store`, from its config alone.
-    pub fn of(store: &SopsStore) -> Self {
-        Self::new(&store.file, store_format(store))
+    /// The temp copies of `store`, from its config alone. Fails as
+    /// [`SopsBackend::new`] does when the store's format is not known.
+    pub fn of(store: &SopsStore) -> Result<Self, BackendError> {
+        Ok(Self::new(
+            &store.file,
+            SopsFormat::of_file(store.format, &store.file)?,
+        ))
     }
 }
 
@@ -469,25 +488,71 @@ mod tests {
             let sample = temp.sample.file_name().unwrap().to_str().unwrap();
             assert_eq!(temp.sample.parent(), Some(Path::new("/s")));
             assert!(sample.ends_with(&ext), "{sample}");
-            assert!(temp.pattern.ends_with(&ext), "{}", temp.pattern);
+            assert_eq!(temp.pattern, ".*.secrit-*");
             assert!(glob_matches(&temp.pattern, sample), "{temp:?}");
             assert!(!glob_matches(&temp.pattern, "main.yaml"), "{temp:?}");
+            // The v0.1 pattern still matches the temp copies of a YAML
+            // store, so `doctor` passes it for YAML only.
+            let old = glob_matches(".*.secrit-*.yaml", sample);
+            assert_eq!(old, format == SopsFormat::Yaml, "{sample}");
         }
-        // v0.1 printed this pattern; YAML stores keep it.
-        let yaml = TempIgnore::new(file, SopsFormat::Yaml);
-        assert_eq!(yaml.pattern, ".*.secrit-*.yaml");
 
         // The store config and the backend give the same answer.
         let tmp = tempfile::tempdir().unwrap();
         let b = backend_for(tmp.path(), BASE);
         let store = SopsStore {
             file: b.file().to_path_buf(),
+            format: None,
             sops_config: None,
             age_key_file: None,
         };
-        let (of_store, of_backend) = (TempIgnore::of(&store), b.temp_ignore());
+        let (of_store, of_backend) = (TempIgnore::of(&store).unwrap(), b.temp_ignore());
         assert_eq!(of_store.sample, of_backend.sample);
         assert_eq!(of_store.pattern, of_backend.pattern);
+
+        // A store whose format is not known has no temp copies to ignore.
+        let env = SopsStore {
+            file: tmp.path().join("main.env"),
+            ..store
+        };
+        let e = TempIgnore::of(&env).unwrap_err();
+        assert_eq!(e.exit(), Exit::Refused);
+    }
+
+    /// The format comes from the `format` key, else from the file name,
+    /// and `wire` gets it with the store file.
+    #[test]
+    fn the_backend_takes_the_format_of_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = |name: &str, format| {
+            let store = SopsStore {
+                file: tmp.path().join(name),
+                format,
+                sops_config: None,
+                age_key_file: None,
+            };
+            SopsBackend::new(&store, "/nonexistent/sops".into(), Duration::ZERO, &|_| {
+                None
+            })
+        };
+        let n = Name::parse("n").unwrap();
+        for (name, explicit, want) in [
+            ("s.yaml", None, SopsFormat::Yaml),
+            ("s.json", None, SopsFormat::Json),
+            ("s.sops", Some(SopsFormat::Json), SopsFormat::Json),
+            ("s.env", Some(SopsFormat::Yaml), SopsFormat::Yaml),
+        ] {
+            let b = open(name, explicit).unwrap();
+            assert_eq!(b.format, want, "{name}");
+            let Some(WireSource::SopsFile { file, format }) = b.wire_source(&n) else {
+                panic!("{name}: no sops file");
+            };
+            assert_eq!((file.as_path(), format), (b.file(), want), "{name}");
+        }
+        for name in ["s.env", "s.ini"] {
+            let e = open(name, None).unwrap_err();
+            assert_eq!(e.exit(), Exit::Refused, "{name}");
+        }
     }
 
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {
@@ -495,6 +560,7 @@ mod tests {
         std::fs::write(&file, yaml).unwrap();
         let store = SopsStore {
             file,
+            format: None,
             sops_config: None,
             age_key_file: None,
         };

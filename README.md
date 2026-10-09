@@ -91,6 +91,7 @@ default_store = "main"
 [stores.main]
 backend = "sops"                              # v0.1: only "sops"
 file = "/etc/nixos/secrets/secrit.yaml"       # an existing sops file
+format = "yaml"                               # optional: "yaml" or "json"; default: from the file name
 sops_config = "/etc/nixos/.sops.yaml"         # optional; default: nearest .sops.yaml upward from `file`
 age_key_file = "~/.config/sops/age/keys.txt"  # optional; default: $XDG_CONFIG_HOME/sops/age/keys.txt
 
@@ -100,6 +101,13 @@ sops = "auto"        # "auto" = baked-in path, else PATH; or an absolute path
 [lock]
 timeout_secs = 30
 ```
+
+**Format.** A sops store is YAML or JSON. With no `format`, a file name that ends in
+`.json` means JSON, and any other name means YAML. secrit refuses a file name that sops
+reads as dotenv (`.env`) or INI (`.ini`), because it does not support those formats yet.
+Every sops run names the store's format, and `store` and `rm` refuse (exit 3) a file
+whose content or name does not match it, so a write never rewrites a store in another
+format.
 
 Paths must be absolute or start with `~/`. A configured `tools.sops` and the `.sops.yaml`
 must be owned by you, root or the Nix store, and neither the file nor its directory may be
@@ -117,6 +125,7 @@ at once with a clear message; sops cannot prompt.
 ```sh
 secrit init --sops-file /etc/nixos/secrets/secrit.yaml --dry-run   # print the plan only
 secrit init --sops-file /etc/nixos/secrets/secrit.yaml
+secrit init --sops-file /etc/nixos/secrets/secrit.json                # a JSON store
 secrit doctor                                                     # check the result
 ```
 
@@ -126,7 +135,9 @@ config, and prints the `.gitignore` and `git add` steps. It never edits an exist
 `.sops.yaml`: when no rule covers the file, it prints one and exits 1. With
 `--write-sops-config` it creates a `.sops.yaml` when there is none. The example uses
 `/etc/nixos/secrets/secrit.yaml`; any directory that you own and that group and others
-cannot write works.
+cannot write works. `--format yaml|json` sets the store format and writes it to the config
+as `format`; without it, the file name picks the format. `--format` that does not match
+the file name (`--format json` for a `.yaml` file) exits 3 before init makes a file.
 
 To set up the same store by hand:
 
@@ -156,11 +167,13 @@ To set up the same store by hand:
    ```
 
 4. In a git repository, ignore secrit's temp copies, which a crash or a SIGKILL can leave
-   behind (ciphertext only), then `git add` the new file. A flake (and sops-nix) cannot see
+   behind (ciphertext only), then `git add` the new file. A temp copy ends in the format's
+   extension; the pattern matches both formats. The v0.1 pattern `.*.secrit-*.yaml` still
+   covers a YAML store, and `doctor` warns when a JSON store's temp copies are not ignored. A flake (and sops-nix) cannot see
    an untracked file.
 
    ```sh
-   echo '.*.secrit-*.yaml' >> /etc/nixos/.gitignore
+   echo '.*.secrit-*' >> /etc/nixos/.gitignore
    git -C /etc/nixos add .gitignore secrets/secrit.yaml
    ```
 
@@ -180,7 +193,8 @@ To set up the same store by hand:
    };
    ```
 
-   The value then appears at `/run/secrets/github-token`.
+   The value then appears at `/run/secrets/github-token`. For a JSON store, `wire` prints
+   `format = "json";`.
 
 ## Use
 

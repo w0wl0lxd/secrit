@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn the_temp_ignore_pattern_follows_the_format() {
         let file = Path::new("/s/main.yaml");
-        for format in [SopsFormat::Yaml] {
+        for format in SopsFormat::ALL {
             let ext = format!(".{}", format.temp_ext());
             let temp = TempIgnore::new(file, format);
             let sample = temp.sample.file_name().unwrap().to_str().unwrap();

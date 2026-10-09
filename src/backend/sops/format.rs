@@ -46,6 +46,10 @@ pub struct SopsDoc {
 }
 
 impl SopsFormat {
+    /// Every format, for the tests that must cover each one.
+    #[cfg(test)]
+    pub const ALL: [SopsFormat; 1] = [SopsFormat::Yaml];
+
     /// The sops `--input-type` and `--output-type` of the store file.
     pub fn input_type(self) -> &'static str {
         match self {

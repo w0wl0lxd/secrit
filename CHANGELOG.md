@@ -49,6 +49,17 @@ All notable changes to this project are recorded here. The format follows
   padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
   possible start of a match, so a prompt with no newline goes out at once. A value shorter
   than 4 bytes is not masked, with a warning.
+  - It also masks uppercase hex; percent-encoding with lowercase hex digits, with `+` for a
+    space (Python `quote_plus`, Go `QueryEscape`), as JavaScript `encodeURIComponent`
+    writes it, and as Python `quote` writes it; and the JSON escapes of Go `json.Marshal`
+    and Python `json.dumps`, with an escaped `/` and with uppercase hex digits.
+  - It also masks a value without its final `\n` or `\r\n`, as `--raw` can store it.
+  - Overlapping values are masked as one region, labelled `[secrit:A+B]`. Before, the
+    second value of an overlap stayed partly visible.
+  - `flush_held` releases held bytes after an idle period, so a prompt that starts like a
+    value is shown. It never shows a full match.
+  - Comparisons of secret bytes run in constant time. A small write after a large one no
+    longer wipes the whole output buffer.
 
 ### Changed
 

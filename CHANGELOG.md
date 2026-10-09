@@ -63,6 +63,9 @@ All notable changes to this project are recorded here. The format follows
   refusal for agents. `tests/backend_sops.rs` runs it on the sops store. The test
   helpers moved from `tests/common/mod.rs` into `env.rs` (directories, the secrit
   command, the pty helpers), `fixture.rs` and `conformance.rs`.
+- A config parse error names the line and column of the bad key or value, for example
+  `invalid config file PATH: line 6, column 1: unknown field ...`. The unknown-key error
+  inside `[stores.NAME]` lists `backend` among the expected keys again.
 
 ### Fixed
 
@@ -76,7 +79,8 @@ All notable changes to this project are recorded here. The format follows
   lock, and on each retry.
 - The copy validation refuses a new file in which any entry is not encrypted, also an
   entry that was cleartext before the write. `store` and `rm` find such an entry before they read a value or
-  ask, and refuse with exit 3; NAME itself may be the cleartext entry.
+  ask, and refuse with exit 3; NAME itself may be the cleartext entry. An empty string
+  or a null is not cleartext: sops never encrypts it, and it holds no secret.
 - sops errors name the step, the secret name and the store file (`sops set failed for
   'NAME' in FILE`), and so do the validation, timeout, prompt and output-size errors.
   `rm` of a missing name names the file. age-keygen run errors no longer show Debug text
@@ -86,8 +90,9 @@ All notable changes to this project are recorded here. The format follows
   table. It printed a `default_store` line too, which broke the config when appended.
 - `init` and `doctor` announce a config picked by `SECRIT_CONFIG` on stderr, like the
   other commands; `-q` hides the line.
-- `store` and `rm` refuse a store file that is sops JSON, or whose name ends in `.json`,
-  `.env` or `.ini`, with exit 3, and leave it unchanged. Before, a write turned a JSON
+- `store` and `rm` refuse a store file that is sops JSON (also after a UTF-8 byte order
+  mark), or whose name ends in `.json`, `.env` or `.ini`, with exit 3, and leave it
+  unchanged. Before, a write turned a JSON
   store into YAML, which a reader that expects JSON cannot parse. `init` refuses such a
   file too, and `doctor` shows it as a failed `file` row; `ls` and `get` still read it.
 
@@ -101,6 +106,9 @@ All notable changes to this project are recorded here. The format follows
   SSH key from `~/.ssh`.
 - Reveal mode shows control characters in a value as `\xNN` in reverse video, so a value
   cannot leave the alternate screen or send terminal commands. `ls` escapes names too.
+- Every message that names a store file, a backup or the sops binary escapes control
+  characters in the path. Before, the `stored ... in PATH` and backup lines and some errors
+  (`refusing PATH`, `could not parse PATH`) printed the path as is.
 - A signal during reveal clears the screen and restores the terminal (exit 130).
 - `get --stdout` refuses a regular file that group or others can read, or that another
   user owns, and a block device.

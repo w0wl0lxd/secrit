@@ -71,11 +71,14 @@ All notable changes to this project are recorded here. The format follows
   `no backup; the old value is gone` and ask for `y` on the terminal, even for the owner;
   with no terminal, only `--yes` confirms (exit 3 otherwise). The value is not read before
   the answer. `rm` also says that the daemon may keep the old value in its own files.
+- `store --replace` without `--yes` on a free name of a store that keeps no backup does
+  not replace an item that another process makes before the write. secrit checks again
+  under its lock, keeps that item, and exits 3.
 - `wire` exits 3 on a store that is not a sops store, for every format, and prints no
   stanza. `store` prints the `secrit wire` hint only for a sops store.
 - A key of another backend in a `[stores.NAME]` table is an error that names the key and
   the backend, for example `config key stores.desk.file does not apply to backend
-  secret-service`. A sops store with no `file` gives `config key stores.NAME.file is
+  secret-service`. `wire_hint` applies to a sops store only. A sops store with no `file` gives `config key stores.NAME.file is
   required for backend sops`.
 - Internal refactor for v0.2 backends, with no change to the config format, the messages
   or the exit codes. A `[stores.NAME]` table now parses to one settings type per
@@ -185,7 +188,8 @@ All notable changes to this project are recorded here. The format follows
   from `DBUS_SESSION_BUS_ADDRESS` or `$XDG_RUNTIME_DIR/bus`. The socket must belong to the
   user, its directory must not be writable by group or others, and the bus daemon must
   run as the user (peer credentials). Anything else exits 3. secrit connects to the
-  checked socket itself, so zbus never reads the environment.
+  checked socket itself, so zbus never reads the environment. `doctor` uses the same
+  checks, peer credentials included, and shows a refused bus as a failed row.
 - A Secret Service session is always DH-encrypted; there is no plain-session code path.
   secrit takes the value that the daemon returns without a copy and wipes it on drop,
   and wipes its own copy of a value that it sends. The `secret-service` and `zbus`

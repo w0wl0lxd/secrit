@@ -183,12 +183,16 @@ impl SecretServiceBackend {
             .runtime_dir
             .as_deref()
             .ok_or(lock::LockError::NoRuntimeDir)?;
-        let path = lock::keyed_lock_path(
-            dir,
+        Ok(lock::acquire(&self.lock_path(dir), self.lock_timeout)?)
+    }
+
+    /// The lock file of this store under `runtime_dir`.
+    fn lock_path(&self, runtime_dir: &Path) -> PathBuf {
+        lock::keyed_lock_path(
+            runtime_dir,
             BackendKind::SecretService.as_str(),
-            &self.location.to_string(),
-        );
-        Ok(lock::acquire(&path, self.lock_timeout)?)
+            &[self.collection.as_bytes(), self.store.as_bytes()],
+        )
     }
 
     fn missing(&self, name: &Name) -> BackendError {
@@ -429,18 +433,49 @@ fn peer_uid(_: &UnixStream) -> Result<u32, String> {
     Err("the Secret Service backend works on Linux only".to_owned())
 }
 
-/// Connect to the checked socket and open a DH session.
-fn connect(bus: &Path, step: &Step) -> Result<SecretService<'static>, BackendError> {
-    let refuse = |reason: String| BackendError::UnsafeBus { reason };
-    check_socket(bus).map_err(refuse)?;
+/// How secrit learns the uid of the bus daemon: [`peer_uid`], or a stub in
+/// a test.
+type PeerUid = fn(&UnixStream) -> Result<u32, String>;
+
+/// Why [`checked_stream`] gave no stream.
+#[derive(Debug)]
+enum StreamError {
+    /// A T31 rule refused the bus (exit 3).
+    Refused(String),
+    /// The connect itself failed.
+    Failed(String),
+}
+
+impl StreamError {
+    fn into_backend(self, step: &Step) -> BackendError {
+        match self {
+            StreamError::Refused(reason) => BackendError::UnsafeBus { reason },
+            StreamError::Failed(what) => step.failed(what),
+        }
+    }
+}
+
+/// Check the socket, connect to it, and check that the bus daemon runs as
+/// this user (T31). Every command and `doctor` connect through here, so
+/// `doctor` never shows a bus as good that the commands refuse.
+fn checked_stream(bus: &Path, peer: PeerUid) -> Result<UnixStream, StreamError> {
+    check_socket(bus).map_err(StreamError::Refused)?;
     let shown = crate::display::escape_path(bus);
-    let stream = UnixStream::connect(bus).map_err(|e| step.failed(format!("{shown}: {e}")))?;
-    let peer = peer_uid(&stream).map_err(|e| refuse(format!("{shown}: {e}")))?;
-    if peer != rustix::process::getuid().as_raw() {
-        return Err(refuse(format!(
+    let stream =
+        UnixStream::connect(bus).map_err(|e| StreamError::Failed(format!("{shown}: {e}")))?;
+    let uid = peer(&stream).map_err(|e| StreamError::Refused(format!("{shown}: {e}")))?;
+    if uid != rustix::process::getuid().as_raw() {
+        return Err(StreamError::Refused(format!(
             "{shown}: the bus daemon runs as another user"
         )));
     }
+    Ok(stream)
+}
+
+/// Connect to the checked socket and open a DH session.
+fn connect(bus: &Path, step: &Step) -> Result<SecretService<'static>, BackendError> {
+    let stream = checked_stream(bus, peer_uid).map_err(|e| e.into_backend(step))?;
+    let shown = crate::display::escape_path(bus);
     let conn = zbus::blocking::connection::Builder::async_io_unix_stream(stream)
         .build()
         .map_err(|e| step.failed(format!("{shown}: {}", escape(&e.to_string()))))?;
@@ -692,9 +727,21 @@ impl DoctorFacts {
 /// The doctor checks, in the worker thread. Read-only: no unlock, no
 /// value.
 fn doctor_facts(bus: &Path, collection: &str, store: &str, step: &Step) -> DoctorFacts {
+    doctor_facts_with(bus, collection, store, step, peer_uid)
+}
+
+/// [`doctor_facts`] with the peer uid lookup as a parameter, so a test can
+/// show a bus of another user.
+fn doctor_facts_with(
+    bus: &Path,
+    collection: &str,
+    store: &str,
+    step: &Step,
+    peer: PeerUid,
+) -> DoctorFacts {
     let mut facts = DoctorFacts::unknown("skipped: the check before it failed");
-    let reached = check_socket(bus)
-        .and_then(|()| UnixStream::connect(bus).map_err(|e| e.to_string()))
+    let reached = checked_stream(bus, peer)
+        .map_err(|e| e.into_backend(step).to_string())
         .and_then(|s| {
             zbus::blocking::connection::Builder::async_io_unix_stream(s)
                 .build()
@@ -766,6 +813,12 @@ fn doctor_rows(r: &mut Report, b: &SecretServiceBackend, store: &str) {
             }
         }
     };
+    facts_rows(r, b, store, facts);
+}
+
+/// The rows after the bus row, from what the worker learned.
+fn facts_rows(r: &mut Report, b: &SecretServiceBackend, store: &str, facts: DoctorFacts) {
+    let row = |what: &str| format!("store {store}: {what}");
     let fail = |r: &mut Report, what: &str, e: String| r.add(row(what), Status::Fail, e);
     match facts.reachable {
         Ok(()) => r.add(row("daemon"), Status::Ok, "the session bus answers"),
@@ -975,6 +1028,73 @@ mod tests {
         );
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(check_socket(&d.path().join("missing")).is_err());
+    }
+
+    fn backend(collection: &str) -> SecretServiceBackend {
+        let env = env_of(&[("XDG_RUNTIME_DIR", "/run/user/7")]);
+        SecretServiceBackend::new(
+            "main",
+            &SecretServiceStore {
+                collection: collection.to_owned(),
+                unlock: Unlock::Refuse,
+            },
+            Duration::from_secs(1),
+            &env,
+        )
+    }
+
+    /// T31 in `doctor`: a bus daemon of another user is a fail row, as
+    /// every other command refuses that bus. No D-Bus handshake starts.
+    #[test]
+    fn doctor_refuses_a_bus_of_another_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sock = d.path().join("bus");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // A peer that hangs up at once, so a handshake fails fast.
+        std::thread::spawn(move || drop(listener.accept()));
+        let step = Step {
+            name: "doctor",
+            location: Location::collection("default", "main"),
+        };
+        let other: PeerUid = |_| Ok(rustix::process::getuid().as_raw().wrapping_add(1));
+        let facts = doctor_facts_with(&sock, "default", "main", &step, other);
+        let reason = facts.reachable.as_ref().unwrap_err().clone();
+        assert!(
+            reason.contains("the bus daemon runs as another user"),
+            "{reason}"
+        );
+        assert!(
+            reason.starts_with("refusing the D-Bus session bus: "),
+            "{reason}"
+        );
+        assert!(facts.session.is_err());
+
+        let mut r = Report::default();
+        facts_rows(&mut r, &backend("default"), "main", facts);
+        let rows: Vec<_> = r
+            .rows()
+            .iter()
+            .map(|row| (row.check.as_str(), row.status, row.detail.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("store main: daemon", Status::Fail, reason.as_str())]
+        );
+    }
+
+    /// The lock key is the raw collection and store name, not the escaped
+    /// text: two collections that show the same text get their own locks.
+    #[test]
+    fn the_lock_key_is_the_raw_location() {
+        let control = backend("a\u{1b}");
+        let literal = backend("a\\x1b");
+        assert_eq!(control.location.to_string(), literal.location.to_string());
+        let dir = Path::new("/run/user/7");
+        assert_ne!(control.lock_path(dir), literal.lock_path(dir));
+        assert_eq!(control.lock_path(dir), backend("a\u{1b}").lock_path(dir));
+        assert_ne!(control.lock_path(dir), backend("b").lock_path(dir));
     }
 
     /// The wait gives the result, or ends at the deadline with exit 1.

@@ -87,8 +87,8 @@ struct RawStore {
     age_key_file: Option<String>,
     collection: Option<String>,
     unlock: Option<Unlock>,
-    #[serde(default)]
-    wire_hint: bool,
+    /// Only a sops store prints the hint, so only a sops store takes it.
+    wire_hint: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,7 +316,7 @@ impl Config {
             let backend = store_backend(&name, &s, home)?;
             let store = StoreConfig {
                 name: name.clone(),
-                wire_hint: s.wire_hint,
+                wire_hint: s.wire_hint.unwrap_or(false),
                 backend,
             };
             stores.insert(name, store);
@@ -404,6 +404,7 @@ fn store_backend(name: &str, s: &RawStore, home: &Path) -> Result<BackendConfig,
             refuse("file", s.file.is_some())?;
             refuse("sops_config", s.sops_config.is_some())?;
             refuse("age_key_file", s.age_key_file.is_some())?;
+            refuse("wire_hint", s.wire_hint.is_some())?;
             let collection = s
                 .collection
                 .clone()
@@ -715,10 +716,10 @@ timeout_secs = 5
         assert!(s.sops().is_none());
         assert!(matches!(s.require_sops(), Err(ConfigError::NotSops(_))));
 
-        let t = "[stores.desk]\nbackend = \"secret-service\"\ncollection = \"/org/freedesktop/secrets/collection/x\"\nunlock = \"prompt\"\nwire_hint = true\n";
+        let t = "[stores.desk]\nbackend = \"secret-service\"\ncollection = \"/org/freedesktop/secrets/collection/x\"\nunlock = \"prompt\"\n";
         let c = parse(t).unwrap();
         let s = c.store(Some("desk")).unwrap();
-        assert!(s.wire_hint);
+        assert!(!s.wire_hint);
         assert_eq!(
             s.backend,
             BackendConfig::SecretService(SecretServiceStore {
@@ -745,6 +746,14 @@ timeout_secs = 5
             assert_eq!(
                 e.to_string(),
                 format!("config key stores.a.{key} does not apply to backend secret-service")
+            );
+        }
+        // `store` prints the wire hint only for a sops store.
+        for line in ["wire_hint = true", "wire_hint = false"] {
+            let e = parse(&format!("{ss}{line}\n")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "config key stores.a.wire_hint does not apply to backend secret-service"
             );
         }
         let sops = "[stores.a]\nbackend = \"sops\"\nfile = \"/s.yaml\"\n";

@@ -38,23 +38,7 @@ fn secret_tool_reads_what_secrit_wrote() {
     );
     assert_eq!(f.item_count("n"), 1);
 
-    let mut c = Command::new(&f.tools.secret_tool);
-    c.env_clear()
-        .env("DBUS_SESSION_BUS_ADDRESS", f.address())
-        .args([
-            "store",
-            "--label=secrit: m",
-            "application",
-            "secrit",
-            "secrit-store",
-            "main",
-            "secrit-name",
-            "m",
-        ])
-        .stdin(Stdio::piped());
-    let mut child = c.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(b"from-tool").unwrap();
-    assert!(child.wait().unwrap().success());
+    f.tool_store("m", b"from-tool");
     assert_eq!(f.dirs().ls(), ["m", "n"]);
     let (out, got) = get_to_file(&f, false, "m");
     ok(&out);
@@ -364,14 +348,64 @@ fn a_signal_during_a_blocked_call_exits_130() {
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
 
+/// T55, Q37: `store --replace` on a free name asks nothing. When another
+/// program creates the name before the write, secrit refuses (exit 3) under
+/// its lock and keeps the other item: nobody confirmed a replace.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_unconfirmed_replace_keeps_an_item_made_meanwhile() {
+    let f = fixture();
+    let d = f.dirs();
+    let mut cmd = d.cmd();
+    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause")
+        .env("SECRIT_TEST_HOOK_DIR", d.hook_dir())
+        .args(["store", "n", "--replace"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"mine").unwrap();
+    d.wait_for_hook(1);
+    f.tool_store("n", b"theirs");
+    std::fs::write(d.hook_dir().join("go"), b"").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("appeared while secrit waited; nothing was replaced"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(f.item_count("n"), 1);
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"theirs"[..]),
+        "the other item changed"
+    );
+
+    // `--yes` confirms the replace before secrit looks, so it replaces.
+    let out = d.run(["store", "n", "--replace", "--yes"], Some(b"mine"));
+    ok(&out);
+    assert!(f.read_back("n").as_deref() == Some(&b"mine"[..]));
+    assert_eq!(f.item_count("n"), 1);
+}
+
 /// v0.2 plan 5.7: `wire` needs a sops file, so on a Secret Service store
 /// it prints nothing and exits 3 for every format. `store` prints no
-/// `/run/secrets` hint even with `wire_hint = true`.
+/// `/run/secrets` hint, and the config refuses `wire_hint`.
 #[test]
 fn wire_is_refused_on_a_secret_service_store() {
     let f = fixture();
     f.dirs()
         .write_store_config("backend = \"secret-service\"\nwire_hint = true\n", "", 120);
+    let out = f.dirs().run(["ls"], None);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(
+        stderr(&out)
+            .contains("config key stores.main.wire_hint does not apply to backend secret-service"),
+        "{}",
+        stderr(&out)
+    );
+    f.dirs()
+        .write_store_config("backend = \"secret-service\"\n", "", 120);
     let out = f.dirs().store_value("n", b"v");
     ok(&out);
     assert!(!stderr(&out).contains("/run/secrets"), "{}", stderr(&out));

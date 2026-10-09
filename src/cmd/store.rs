@@ -2,7 +2,7 @@
 
 use super::rm::{NO_BACKUP, confirm};
 use super::{Ctx, StoreArgs};
-use crate::backend::PutMode;
+use crate::backend::{BackendError, PutMode};
 use crate::cli::ARGV_VALUE_MESSAGE;
 use crate::display::escape_path;
 use crate::error::Error;
@@ -28,19 +28,35 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     // encrypt it), so nobody types a value that will be refused. The write
     // protocol checks again under the lock.
     ctx.backend.check_put(name, put_mode)?;
-    let no_backup = put_mode == PutMode::Replace
-        && !ctx.backend.capabilities().backups
-        && ctx.backend.exists(name)?;
-    if no_backup {
-        confirm_replace(ctx, name, args.yes)?;
+    let mut write_mode = put_mode;
+    let mut no_backup = false;
+    if put_mode == PutMode::Replace && !ctx.backend.capabilities().backups {
+        if ctx.backend.exists(name)? {
+            confirm_replace(ctx, name, args.yes)?;
+            no_backup = true;
+        } else if !args.yes {
+            // Nothing was confirmed, so the write must not replace an item
+            // that another process makes before it (T55, Q37). The backend
+            // checks again under its lock.
+            write_mode = PutMode::CreateOnly;
+        }
     }
     let mode = InputMode {
         multiline: args.multiline || args.raw,
         raw: args.raw,
     };
     let value = read_value(name, mode)?;
-    let report = ctx.backend.put(name, &value, put_mode)?;
+    let written = ctx.backend.put(name, &value, write_mode);
     drop(value);
+    let report = match written {
+        Err(BackendError::Exists { .. }) if write_mode != put_mode => {
+            return Err(Error::Refused(format!(
+                "'{name}' appeared while secrit waited; nothing was replaced. {} keeps no backup, so run the command again to confirm the replace, or pass --yes",
+                ctx.backend.location()
+            )));
+        }
+        r => r?,
+    };
     if let Some(b) = &report.backup {
         ctx.status(&format!("backup of the old file: {}", escape_path(b)));
     }

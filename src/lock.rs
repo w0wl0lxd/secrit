@@ -64,13 +64,16 @@ pub fn lock_path(runtime_dir: &Path, dir_dev: Dev, dir_ino: u64, basename: &OsSt
 }
 
 /// The lock file path of a store that is not a file (v0.2 plan 5.3): a
-/// hash of the backend kind and the location text.
+/// hash of the backend kind and the raw bytes of each part of the
+/// location. Each part goes in with its length first, so two different
+/// lists of parts never give the same input.
 #[must_use]
-pub fn keyed_lock_path(runtime_dir: &Path, kind: &str, location: &str) -> PathBuf {
+pub fn keyed_lock_path(runtime_dir: &Path, kind: &str, parts: &[&[u8]]) -> PathBuf {
     let mut h = Sha256::new();
-    h.update(kind.as_bytes());
-    h.update([0]);
-    h.update(location.as_bytes());
+    for part in std::iter::once(kind.as_bytes()).chain(parts.iter().copied()) {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
     let short = hex(&h.finalize()[..8]);
     runtime_dir
         .join("secrit")
@@ -166,10 +169,13 @@ mod tests {
     #[test]
     fn keyed_lock_path_depends_on_kind_and_location() {
         let r = Path::new("/run/user/1000");
-        let a = keyed_lock_path(r, "secret-service", "c/s");
-        assert_eq!(a, keyed_lock_path(r, "secret-service", "c/s"));
-        assert_ne!(a, keyed_lock_path(r, "secret-service", "c/t"));
-        assert_ne!(a, keyed_lock_path(r, "keychain", "c/s"));
+        let a = keyed_lock_path(r, "secret-service", &[b"c", b"s"]);
+        assert_eq!(a, keyed_lock_path(r, "secret-service", &[b"c", b"s"]));
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"c", b"t"]));
+        assert_ne!(a, keyed_lock_path(r, "keychain", &[b"c", b"s"]));
+        // The parts are framed: moving a byte across a boundary changes it.
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"cs", b""]));
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"c", b"", b"s"]));
         assert!(a.starts_with("/run/user/1000/secrit"));
         let file = a.file_stem().unwrap().to_string_lossy().into_owned();
         assert!(file.starts_with("secret-service-"), "{file}");

@@ -204,6 +204,34 @@ impl SecretServiceFixture {
         self.search_names(&["secrit-name", name]).len()
     }
 
+    /// `secret-tool store` of `value` as item `name` of store `main`, with
+    /// the attributes that secrit uses: another program that writes the
+    /// same name.
+    pub fn tool_store(&self, name: &str, value: &[u8]) {
+        let mut c = self.helper(&self.tools.secret_tool);
+        c.arg("store")
+            .arg(format!("--label=secrit: {name}"))
+            .args([
+                "application",
+                "secrit",
+                "secrit-store",
+                "main",
+                "secrit-name",
+                name,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = c.spawn().expect("run secret-tool");
+        child
+            .stdin
+            .take()
+            .expect("stdin is piped")
+            .write_all(value)
+            .expect("write the value to secret-tool");
+        assert!(child.wait().expect("wait for secret-tool").success());
+    }
+
     /// `secret-tool lookup` with `attrs`; `None` when no item matches.
     pub fn lookup(&self, attrs: &[&str]) -> Option<Vec<u8>> {
         let mut c = self.helper(&self.tools.secret_tool);

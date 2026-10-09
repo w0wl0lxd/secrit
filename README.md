@@ -122,8 +122,8 @@ collection = "default"   # optional; an alias, or an object path that starts wit
 unlock = "refuse"        # optional; "refuse" (default) or "prompt"
 ```
 
-A sops key (`file`, `sops_config`, `age_key_file`) in a Secret Service store is an error,
-and so is `collection` or `unlock` in a sops store.
+A sops key (`file`, `sops_config`, `age_key_file`) or `wire_hint` in a Secret Service
+store is an error, and so is `collection` or `unlock` in a sops store.
 
 **Keys.** secrit gives sops only an age key file (`SOPS_AGE_KEY_FILE`). sops runs with no
 usable `HOME`, so it never tries `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. Age keys from SSH
@@ -224,7 +224,7 @@ exists and is unlocked. Then it writes the config section. It creates nothing in
   when it is not set. It accepts only a `unix:path=<absolute path>` address. The socket
   must be yours, in a directory that group and others cannot write (so not `/tmp`), and
   the bus daemon must run as you. Anything else exits 3. secrit connects to the checked
-  socket itself.
+  socket itself. `doctor` uses the same checks and shows a refused bus as a failed row.
 - **Encryption.** secrit always opens a DH session, so the daemon sends values encrypted.
   It has no code path for a plain session.
 - **A locked collection** exits 3. secrit does not open the daemon's unlock prompt unless
@@ -233,7 +233,9 @@ exists and is unlocked. Then it writes the config section. It creates nothing in
   exits 3 too.
 - **No backup.** `store --replace` and `rm` print `no backup; the old value is gone` and
   ask for `y` on the terminal, even for you. `--yes` skips the question; with no terminal
-  it is the only way.
+  it is the only way. When the name is free, `store --replace` asks nothing. If another
+  process makes the name before secrit writes, secrit keeps that item and exits 3; run the
+  command again to confirm the replace.
 - **Create only.** Without `--replace`, secrit searches, creates and searches again under
   its lock, so parallel `store` runs make one item. Another program can still add an item
   with the same attributes; then `get` exits 1 and names the count.

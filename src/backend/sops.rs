@@ -26,8 +26,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, fsync, openat, renameat,
-    renameat_with, unlinkat,
+    AtFlags, Dev, FileType, Mode, OFlags, RawMode, RenameFlags, fchmod, fstat, fsync, openat,
+    renameat, renameat_with, unlinkat,
 };
 use rustix::io::Errno;
 
@@ -35,14 +35,19 @@ use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{Backend, BackendError, MAX_RETRIES, PutMode, Target, WriteReport};
+use super::{
+    Backend, BackendError, DoctorCtx, Location, MAX_RETRIES, PutMode, Target, ToolStatus,
+    WriteReport,
+};
 use crate::child::{self, ChildError, ChildOutput};
-use crate::config::{BackendKind, StoreConfig};
+use crate::config::{BackendKind, Env, SopsStore};
 use crate::display::escape;
 use crate::lock::{self, LockError};
 use crate::name::{Name, NameError};
+use crate::report::Report;
 use crate::secret::{MAX_VALUE_BYTES, SecretValue};
 use crate::signals;
+use crate::testhook;
 use crate::trust::{self, TrustError};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -60,6 +65,14 @@ pub const TEMP_IGNORE: &str = ".*.secrit-*.yaml";
 pub const MAX_BACKUPS: usize = 10;
 /// The oldest sops that has `set --value-stdin` and `unset` (PLAN 4.6).
 pub const MIN_SOPS: (u64, u64) = (3, 11);
+/// [`MIN_SOPS`] and the reason, for [`BackendError::ToolTooOld`].
+pub const NEED_SOPS: &str = "3.11 or newer (for 'set --value-stdin' and 'unset')";
+/// The tool name in [`BackendError`] messages.
+const TOOL: &str = "sops";
+/// What to do when sops stops to ask on the terminal.
+pub const PROMPT_HINT: &str = "secrit v0.1 supports only an age key file without a passphrase: set age_key_file in the config";
+/// What the store file must be, for [`BackendError::Parse`].
+const FORMAT: &str = "sops YAML file";
 /// The `HOME` that sops gets. sops looks for `~/.ssh/id_ed25519` and
 /// `~/.ssh/id_rsa` as age identities, so the real HOME is never passed (R2).
 const CHILD_HOME: &str = "/nonexistent";
@@ -77,6 +90,8 @@ const KEY_TYPES: &[&str] = &[
 #[derive(Debug)]
 pub struct SopsBackend {
     file: PathBuf,
+    /// `file` as a [`Location`], for messages and errors.
+    location: Location,
     dir: PathBuf,
     base: OsString,
     sops: PathBuf,
@@ -109,12 +124,13 @@ pub struct StoreFacts {
 }
 
 struct Snapshot {
-    dev: u64,
+    dev: Dev,
     ino: u64,
     size: u64,
-    /// Seconds and nanoseconds.
-    mtime: (i64, u64),
-    mode: u32,
+    /// Seconds and nanoseconds. `i128` holds the nanoseconds of every
+    /// platform (`u64` on Linux, `i64` on macOS).
+    mtime: (i64, i128),
+    mode: RawMode,
     hash: [u8; 32],
     bytes: Vec<u8>,
 }
@@ -154,10 +170,10 @@ impl SopsBackend {
     /// `env` supplies `HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and
     /// `XDG_RUNTIME_DIR`.
     pub fn new(
-        store: &StoreConfig,
+        store: &SopsStore,
         sops: PathBuf,
         lock_timeout: Duration,
-        env: &dyn Fn(&str) -> Option<OsString>,
+        env: &Env,
     ) -> Result<Self, BackendError> {
         let file = store.file.clone();
         let (Some(dir), Some(base)) = (file.parent(), file.file_name()) else {
@@ -186,6 +202,7 @@ impl SopsBackend {
                         .join("backups")
                         .join(backup_key(&file, base))
                 }),
+            location: Location::File(file.clone()),
             file,
             sops,
             child_env,
@@ -225,20 +242,26 @@ impl SopsBackend {
             return Ok(());
         }
         self.check_sops_config()?;
-        self.check_version()?;
+        self.checked_version()?;
         let _ = self.checked.set(());
         Ok(())
     }
 
-    fn check_version(&self) -> Result<(), BackendError> {
-        let found = self.sops_version();
-        match found {
-            Ok(v) if (v.0, v.1) >= MIN_SOPS => Ok(()),
-            Ok((a, b, c)) => Err(BackendError::SopsTooOld {
-                found: format!("{a}.{b}.{c}"),
-                path: self.sops.clone(),
-            }),
-            Err(e) => Err(e),
+    /// [`Self::sops_version`], refused when it is older than [`MIN_SOPS`].
+    pub fn checked_version(&self) -> Result<(u64, u64, u64), BackendError> {
+        let (a, b, c) = self.sops_version()?;
+        if (a, b) < MIN_SOPS {
+            return Err(self.too_old(format!("{a}.{b}.{c}")));
+        }
+        Ok((a, b, c))
+    }
+
+    fn too_old(&self, found: String) -> BackendError {
+        BackendError::ToolTooOld {
+            tool: TOOL,
+            found,
+            path: self.sops.clone(),
+            need: NEED_SOPS,
         }
     }
 
@@ -254,17 +277,14 @@ impl SopsBackend {
             .stderr(Stdio::piped())
             .process_group(0);
         let target = Target {
-            path: self.sops.clone(),
+            location: Location::File(self.sops.clone()),
             name: None,
         };
         let out = self.run_unchecked(cmd, None, 4096, "--version", target)?;
         let text = String::from_utf8_lossy(&out.stdout);
         match parse_sops_version(&text) {
             Some(v) if out.status.success() => Ok(v),
-            _ => Err(BackendError::SopsTooOld {
-                found: "an unknown version".into(),
-                path: self.sops.clone(),
-            }),
+            _ => Err(self.too_old("an unknown version".into())),
         }
     }
 
@@ -377,7 +397,7 @@ impl SopsBackend {
     /// The store file, and `name` when the step is about one.
     fn target(&self, name: Option<&Name>) -> Target {
         Target {
-            path: self.file.clone(),
+            location: self.location.clone(),
             name: name.cloned(),
         }
     }
@@ -518,7 +538,7 @@ impl SopsBackend {
             dev: st.st_dev,
             ino: st.st_ino,
             size: u64::try_from(st.st_size).unwrap_or(0),
-            mtime: (st.st_mtime, st.st_mtime_nsec),
+            mtime: (st.st_mtime, i128::from(st.st_mtime_nsec)),
             mode: st.st_mode & 0o7777,
             hash: Sha256::digest(&bytes).into(),
             bytes,
@@ -546,7 +566,7 @@ impl SopsBackend {
         // flag that the lock wait, the sops wait and the protocol poll.
         let _critical = signals::Critical::enter();
         let _lock = lock::acquire(&lock_path, self.lock_timeout)?;
-        hook("after-lock");
+        testhook::hook("after-lock");
         // The first try, then at most MAX_RETRIES more (PLAN 8.1, step 11).
         for _ in 0..=MAX_RETRIES {
             if let Some(report) = self.attempt(&dir, name, op)? {
@@ -581,12 +601,12 @@ impl SopsBackend {
         }
 
         let tmp = TempCopy::create(dir, &self.dir, &self.base, &snap.bytes)?;
-        hook("after-copy");
+        testhook::hook("after-copy");
         match op {
             Op::Put(value, _) => self.sops_set(&tmp.path, name, value)?,
             Op::Remove => self.sops_unset(&tmp.path, name)?,
         }
-        hook("after-sops");
+        testhook::hook("after-sops");
 
         let (copy_fd, copy_bytes) = read_entry(dir, &tmp.name, &tmp.path, true)?;
         let copy = parse_doc(&copy_bytes, &tmp.path)?;
@@ -601,7 +621,7 @@ impl SopsBackend {
         if !self.snapshot(dir, true)?.same_as(&snap) {
             return Ok(None);
         }
-        hook("before-rename");
+        testhook::hook("before-rename");
         if signals::pending() {
             return Err(BackendError::Interrupted);
         }
@@ -628,14 +648,14 @@ impl SopsBackend {
     fn exists_error(&self, name: &Name) -> BackendError {
         BackendError::Exists {
             name: name.clone(),
-            path: self.file.clone(),
+            location: self.location.clone(),
         }
     }
 
     fn missing_error(&self, name: &Name) -> BackendError {
         BackendError::Missing {
             name: name.clone(),
-            path: self.file.clone(),
+            location: self.location.clone(),
         }
     }
 
@@ -870,13 +890,23 @@ impl SopsBackend {
                 source,
             },
             ChildError::Interrupted => BackendError::Interrupted,
-            ChildError::Stopped => BackendError::SopsPrompt { step, target },
-            ChildError::Timeout => BackendError::SopsTimeout {
+            ChildError::Stopped => BackendError::ToolPrompt {
+                tool: TOOL,
+                step,
+                target,
+                hint: PROMPT_HINT.into(),
+            },
+            ChildError::Timeout => BackendError::ToolTimeout {
+                tool: TOOL,
                 step,
                 target,
                 after: timeout,
             },
-            ChildError::Overflow => BackendError::SopsOutputTooLarge { step, target },
+            ChildError::Overflow => BackendError::ToolOutputTooLarge {
+                tool: TOOL,
+                step,
+                target,
+            },
         })
     }
 }
@@ -884,6 +914,10 @@ impl SopsBackend {
 impl Backend for SopsBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Sops
+    }
+
+    fn location(&self) -> &Location {
+        &self.location
     }
 
     fn list(&self) -> Result<Vec<String>, BackendError> {
@@ -950,6 +984,12 @@ impl Backend for SopsBackend {
 
     fn remove(&self, name: &Name) -> Result<WriteReport, BackendError> {
         self.write(name, Op::Remove)
+    }
+
+    fn doctor(&self, report: &mut Report, ctx: &DoctorCtx<'_>) {
+        // The rows stay in cmd/doctor.rs until the sops module split
+        // (v0.2 plan S3) moves them next to this backend.
+        crate::cmd::doctor::sops_rows(report, self, ctx);
     }
 }
 
@@ -1178,7 +1218,8 @@ fn refuse_non_yaml_name(path: &Path) -> Result<(), BackendError> {
 
 fn parse_doc(bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
     let parse_err = |what: &str| BackendError::Parse {
-        path: path.to_path_buf(),
+        location: Location::File(path.to_path_buf()),
+        format: FORMAT,
         what: what.into(),
     };
     // The parser's own message can quote file content; it is not shown.
@@ -1351,13 +1392,11 @@ fn sops_failed(
     out: &ChildOutput,
     secrets: &[&[u8]],
 ) -> BackendError {
-    BackendError::Sops {
+    BackendError::Tool {
+        tool: TOOL,
         step,
         target,
-        status: match out.status.code() {
-            Some(c) => format!("exit {c}"),
-            None => "killed by a signal".into(),
-        },
+        status: ToolStatus(out.status.code()),
         stderr: redact(&out.stderr, secrets),
     }
 }
@@ -1442,58 +1481,6 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let y = yoe + era * 400 + i64::from(m <= 2);
     (y, m, d)
 }
-
-/// Test hooks: `SECRIT_TEST_HOOK=step=action[,step=action]`. Actions:
-/// `abort`, `sigint`, `sigterm`, `sigquit`, `sleep-<ms>`, and `pause`. A
-/// pause appends the step to `$SECRIT_TEST_HOOK_DIR/log`, then waits (at
-/// most 60 s, or until a signal) for the file `$SECRIT_TEST_HOOK_DIR/go`.
-#[cfg(feature = "test-hooks")]
-fn hook(step: &str) {
-    use rustix::process::{Signal, getpid, kill_process};
-    let Ok(spec) = std::env::var("SECRIT_TEST_HOOK") else {
-        return;
-    };
-    let actions = spec
-        .split(',')
-        .filter_map(|item| item.split_once('='))
-        .filter(|(at, _)| *at == step)
-        .map(|(_, a)| a);
-    for action in actions {
-        match action {
-            "abort" => std::process::abort(),
-            "sigint" => drop(kill_process(getpid(), Signal::INT)),
-            "sigterm" => drop(kill_process(getpid(), Signal::TERM)),
-            "sigquit" => drop(kill_process(getpid(), Signal::QUIT)),
-            "pause" => pause(step),
-            a => {
-                if let Some(ms) = a.strip_prefix("sleep-").and_then(|m| m.parse().ok()) {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "test-hooks")]
-fn pause(step: &str) {
-    let Some(dir) = std::env::var_os("SECRIT_TEST_HOOK_DIR").map(PathBuf::from) else {
-        return;
-    };
-    if let Ok(mut log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("log"))
-    {
-        let _ = writeln!(log, "{step}");
-    }
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while !dir.join("go").exists() && !signals::pending() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-#[cfg(not(feature = "test-hooks"))]
-fn hook(_: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -1783,13 +1770,10 @@ mod tests {
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {
         let file = dir.join("main.yaml");
         std::fs::write(&file, yaml).unwrap();
-        let store = StoreConfig {
-            name: "main".into(),
-            backend: BackendKind::Sops,
+        let store = SopsStore {
             file,
             sops_config: None,
             age_key_file: None,
-            wire_hint: false,
         };
         SopsBackend::new(&store, "/nonexistent/sops".into(), Duration::ZERO, &|_| {
             None

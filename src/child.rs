@@ -25,14 +25,7 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 /// [`TIMEOUT`], or a shorter one from the test hook.
 #[must_use]
 pub fn timeout() -> Duration {
-    #[cfg(feature = "test-hooks")]
-    if let Some(ms) = std::env::var("SECRIT_TEST_CHILD_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        return Duration::from_millis(ms);
-    }
-    TIMEOUT
+    crate::testhook::child_timeout().unwrap_or(TIMEOUT)
 }
 
 /// What a finished child left.

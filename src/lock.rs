@@ -12,7 +12,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{FlockOperation, Mode, OFlags, flock, openat};
+use rustix::fs::{Dev, FlockOperation, Mode, OFlags, flock, openat};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
@@ -55,7 +55,7 @@ pub fn hex(bytes: &[u8]) -> String {
 
 /// The lock file path for `basename` in the directory `(dir_dev, dir_ino)`.
 #[must_use]
-pub fn lock_path(runtime_dir: &Path, dir_dev: u64, dir_ino: u64, basename: &OsStr) -> PathBuf {
+pub fn lock_path(runtime_dir: &Path, dir_dev: Dev, dir_ino: u64, basename: &OsStr) -> PathBuf {
     let digest = Sha256::digest(basename.as_bytes());
     let short = hex(&digest[..8]);
     runtime_dir

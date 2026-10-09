@@ -3,6 +3,7 @@
 use super::{Ctx, StoreArgs};
 use crate::backend::PutMode;
 use crate::cli::ARGV_VALUE_MESSAGE;
+use crate::display::escape_path;
 use crate::error::Error;
 use crate::name::Name;
 use crate::secret::{InputMode, read_value};
@@ -34,12 +35,12 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     let report = ctx.backend.put(name, &value, put_mode)?;
     drop(value);
     if let Some(b) = &report.backup {
-        ctx.status(&format!("backup of the old file: {}", b.display()));
+        ctx.status(&format!("backup of the old file: {}", escape_path(b)));
     }
     ctx.status(&format!(
         "stored {name} in {} ({})",
         ctx.store.name,
-        ctx.store.file.display()
+        ctx.backend.location()
     ));
     if ctx.store.wire_hint {
         ctx.status(&format!(

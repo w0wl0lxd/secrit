@@ -1,7 +1,7 @@
 //! `secrit rm NAME` (PLAN section 4.4).
 
 use super::Ctx;
-use crate::display::escape;
+use crate::display::escape_path;
 use crate::error::Error;
 use crate::name::Name;
 use crate::tty::{self, LineEnd, ReadError};
@@ -9,17 +9,14 @@ use crate::tty::{self, LineEnd, ReadError};
 pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     ctx.backend.check_remove(name)?;
     if !yes {
-        let question = format!(
-            "remove {name} from {}? [y/N] ",
-            escape(&ctx.store.file.display().to_string())
-        );
+        let question = format!("remove {name} from {}? [y/N] ", ctx.backend.location());
         if !confirm(&question)? {
             return Err(Error::Failed("not removed".into()));
         }
     }
     let report = ctx.backend.remove(name)?;
     if let Some(b) = &report.backup {
-        ctx.status(&format!("backup of the old file: {}", b.display()));
+        ctx.status(&format!("backup of the old file: {}", escape_path(b)));
     }
     ctx.status(&format!(
         "removed {name}. git history, backups and any rendered /run/secrets copy still hold the old value; rotate it at its source if it leaked."

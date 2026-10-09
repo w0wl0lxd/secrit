@@ -45,6 +45,23 @@ All notable changes to this project are recorded here. The format follows
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
 
+### Changed
+
+- Internal refactor for v0.2 backends, with no change to the config format or the exit
+  codes. Messages change only as the entries below say (config parse errors, escaped
+  paths). A `[stores.NAME]` table now parses to one settings type per
+  `backend` value, and each type refuses unknown keys. Every command and `doctor` build a
+  store through one backend factory. The sops error variants are generic tool errors
+  that print the v0.1 text for sops. The test hooks moved into one module.
+- The code type-checks for `aarch64-apple-darwin`; it is not built or run there yet. On
+  macOS, `harden` skips `PR_SET_DUMPABLE` and prints its existing warning. Linux behaviour
+  is unchanged.
+- CI: a `darwin-clippy` job runs clippy for `aarch64-apple-darwin` on Linux, to catch
+  macOS cfg errors without a Mac.
+- A config parse error names the line and column of the bad key or value, for example
+  `invalid config file PATH: line 6, column 1: unknown field ...`. The unknown-key error
+  inside `[stores.NAME]` lists `backend` among the expected keys again.
+
 ### Fixed
 
 - `store` checks the store file's own cleartext rules (`unencrypted_suffix`,
@@ -84,6 +101,9 @@ All notable changes to this project are recorded here. The format follows
   SSH key from `~/.ssh`.
 - Reveal mode shows control characters in a value as `\xNN` in reverse video, so a value
   cannot leave the alternate screen or send terminal commands. `ls` escapes names too.
+- Every message that names a store file, a backup or the sops binary escapes control
+  characters in the path. Before, the `stored ... in PATH` and backup lines and some errors
+  (`refusing PATH`, `could not parse PATH`) printed the path as is.
 - A signal during reveal clears the screen and restores the terminal (exit 130).
 - `get --stdout` refuses a regular file that group or others can read, or that another
   user owns, and a block device.

@@ -57,7 +57,8 @@ All notable changes to this project are recorded here. The format follows
   (Linux). secrit exits with CMD's exit code, or ends by the signal that ended CMD. CMD
   gets the umask that secrit started with.
   Held output goes out after 100 ms with no new output, so a prompt with no newline is
-  shown.
+  shown. When that output is the start of a value and the rest follows later, the rest is
+  masked.
 - Internal: the output masker for `secrit run` (v0.2).
   It replaces a value and its base64 (both alphabets, three byte offsets, with and without
   padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
@@ -71,7 +72,9 @@ All notable changes to this project are recorded here. The format follows
   - Overlapping values are masked as one region, labelled `[secrit:A+B]`. Before, the
     second value of an overlap stayed partly visible.
   - `flush_held` releases held bytes after an idle period, so a prompt that starts like a
-    value is shown. It never shows a full match.
+    value is shown. It never shows a full match. The masker keeps the last released
+    bytes, so the rest of a value that follows later becomes the label; the released
+    prefix stays shown.
   - Comparisons of secret bytes run in constant time. A small write after a large one no
     longer wipes the whole output buffer.
   - A constant-time compare of the first 8 bytes of each pattern runs before the full

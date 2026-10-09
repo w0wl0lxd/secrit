@@ -719,3 +719,33 @@ fn an_ignored_hup_does_not_end_the_command() {
     assert!(text.contains("survived"), "{text}");
     assert!(text.contains("rc=0"), "{text}");
 }
+
+/// v0.2 plan 7.1 step 4: after an idle flush releases a prefix of a value,
+/// the rest of the value that follows later is still masked. Only the
+/// released prefix is shown.
+#[test]
+fn the_rest_of_a_value_after_an_idle_flush_is_masked() {
+    let env = env_with_value();
+    let child = env.script(
+        "slow",
+        &format!(
+            "printf 'run-can'\n{sleep} 0.4\nprintf 'ary-7f3e2a91\\n'",
+            sleep = tool("sleep"),
+        ),
+    );
+    let out = env.run(
+        ["run", "--file", "V=n", "--", child.to_str().unwrap()],
+        None,
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains(VALUE),
+        "the value reached the output: {text:?}"
+    );
+    assert!(
+        !text.contains("ary-7f3e2a91"),
+        "the rest of the value reached the output: {text:?}"
+    );
+    assert!(text.contains("[secrit:n]"), "{text:?}");
+}

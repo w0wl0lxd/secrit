@@ -32,8 +32,9 @@ Read this first.
 - **`secrit run` hands values to another program.** Masking of its output prevents
   accidents only. A program can print a value in a form that secrit does not know (T44),
   and base64 that is wrapped into lines is not matched. Masking covers stdout and stderr
-  only, and the command sees pipes, not a terminal. A prefix of a value that secrit
-  shows after 100 ms of idle output is not masked when the rest follows later. Any
+  only, and the command sees pipes, not a terminal. After 100 ms of idle output secrit
+  shows the bytes that it holds, so a prefix of a value can show. When the rest of the
+  value follows later, the rest is masked; the prefix stays shown. Any
   process of your user can read an `--env` value in `/proc/PID/environ` (also `ps eww`
   and `docker inspect`), and a `--file` value through `/proc/PID/fd/N` (T42, T57); masking
   covers neither. The memfd and `VAR` pass to grandchildren; `sudo` and other programs

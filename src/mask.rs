@@ -57,8 +57,11 @@
 //!   MiB/s to about 120 MiB/s, and to about 90 MiB/s when every byte is the
 //!   first byte, in a release build). The prefilter result shows in the
 //!   time, as the hold-back does: whether output starts like a pattern.
-//! - A prefix that [`Masker::flush_held`] releases is not masked when the
-//!   rest of the value follows.
+//! - A prefix that [`Masker::flush_held`] releases is shown. When the rest
+//!   of the value follows, the rest is replaced by the label; the prefix
+//!   cannot be taken back. To match that rest, the masker keeps the last
+//!   released bytes (at most the longest pattern length minus one) in a
+//!   `Zeroizing` buffer.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -84,8 +87,12 @@ pub struct Masker {
     /// The names with a form that is too short to mask.
     short: Vec<(Name, Short)>,
     /// Input that is not decided yet: a proper prefix of some pattern, or a
-    /// region that can still grow.
+    /// region that can still grow. After [`Masker::flush_held`] it starts
+    /// with the bytes that call released.
     pending: Zeroizing<Vec<u8>>,
+    /// How many bytes at the start of `pending` are already out. They can
+    /// still start a match whose rest follows; they never go out again.
+    released: usize,
     /// The output of the last call. Bytes past its length are always zero.
     out: Zeroizing<Vec<u8>>,
 }
@@ -134,15 +141,18 @@ impl Masker {
         // unwiped copy behind.
         let mut heads = Zeroizing::new(Vec::with_capacity(list.len()));
         heads.extend(list.iter().map(|p| head_word(&p.bytes)));
+        let longest = list.iter().map(|p| p.bytes.len()).max().unwrap_or(0);
         Self {
             patterns: Patterns {
                 list,
                 heads,
                 by_first,
                 names,
+                longest,
             },
             short,
             pending: Zeroizing::new(Vec::new()),
+            released: 0,
             out: Zeroizing::new(Vec::new()),
         }
     }
@@ -176,9 +186,10 @@ impl Masker {
     ///
     /// `secrit run` (v0.2 plan S13) calls this when the child writes nothing
     /// for a short idle period, 100 ms by default, so that a prompt with no
-    /// newline is shown even when it starts like a pattern. A released
-    /// prefix is not masked later: when the rest of the value follows, only
-    /// a form that matches by itself is masked.
+    /// newline is shown even when it starts like a pattern. The masker keeps
+    /// the last released bytes, at most one byte fewer than the longest
+    /// pattern. When the rest of a value follows, the match completes and
+    /// the rest becomes the label. The released prefix cannot be taken back.
     pub fn flush_held(&mut self) -> &[u8] {
         wipe(&mut self.out);
         self.scan(true);
@@ -191,27 +202,41 @@ impl Masker {
     }
 
     /// Move the decided part of `pending` to `out`. At the end of the stream
-    /// nothing is held.
+    /// nothing is held back: all of it goes out, and its last bytes stay in
+    /// `pending` as released bytes.
     fn scan(&mut self, eof: bool) {
+        let released = self.released;
         let mut i = 0;
         // The start of the bytes that pass through unchanged.
-        let mut run = 0;
+        let mut run = released;
         while i < self.pending.len() {
             match self.patterns.step(&self.pending, i, eof) {
                 Step::Hold => break,
-                Step::Pass => i += 1,
-                Step::Replace { end, labels } => {
-                    append(&mut self.out, &self.pending[run..i]);
+                Step::Replace { end, labels } if end > released => {
+                    append(&mut self.out, &self.pending[run..i.max(run)]);
                     append(&mut self.out, self.patterns.label(&labels).as_bytes());
                     i = end;
                     run = i;
                 }
+                // A match inside the released bytes is already out.
+                Step::Pass | Step::Replace { .. } => i += 1,
             }
         }
-        append(&mut self.out, &self.pending[run..i]);
-        // Move the held bytes to the front and wipe the rest.
-        let held = self.pending.len() - i;
-        self.pending.copy_within(i.., 0);
+        append(&mut self.out, &self.pending[run..i.max(run)]);
+        let keep = if eof {
+            let tail = self.patterns.longest.saturating_sub(1);
+            self.pending.len().saturating_sub(tail)
+        } else {
+            i
+        };
+        self.released = if eof {
+            self.pending.len() - keep
+        } else {
+            released.saturating_sub(i)
+        };
+        // Move the kept bytes to the front and wipe the rest.
+        let held = self.pending.len() - keep;
+        self.pending.copy_within(keep.., 0);
         self.pending[held..].zeroize();
         self.pending.truncate(held);
     }
@@ -242,6 +267,8 @@ struct Patterns {
     by_first: Vec<Vec<usize>>,
     /// The name of each masked value.
     names: Vec<String>,
+    /// The length of the longest pattern.
+    longest: usize,
 }
 
 enum Step {
@@ -954,9 +981,32 @@ mod tests {
         assert_eq!(m.feed(b"Name: ab"), b"Name: ");
         assert_eq!(m.flush_held(), b"ab");
         assert_eq!(m.flush_held(), b"");
-        assert_eq!(m.feed(b"cd x abcd"), b"cd x ");
+        assert_eq!(m.feed(b"cd x abcd"), b"[secrit:C] x ");
         assert_eq!(m.flush_held(), b"[secrit:C]");
-        assert_eq!(m.feed(b"ef"), b"ef");
+        assert_eq!(m.feed(b"ef"), b"[secrit:A]");
+        assert_eq!(m.finish(), b"");
+    }
+
+    /// v0.2 plan 7.1 step 4: a prefix that `flush_held` releases stays a
+    /// possible start of a match. When the rest of the value follows, the
+    /// rest becomes the label; only the released prefix was shown.
+    #[test]
+    fn the_rest_of_a_released_prefix_is_masked() {
+        let values: [(&str, &[u8]); 1] = [("V", b"run-canary-7f3e2a91")];
+        let mut m = masker(&values);
+        assert_eq!(m.feed(b"x run-can"), b"x ");
+        assert_eq!(m.flush_held(), b"run-can");
+        assert_eq!(m.flush_held(), b"");
+        assert_eq!(m.feed(b"a"), b"", "still a prefix, so held");
+        assert_eq!(m.flush_held(), b"a");
+        assert_eq!(m.feed(b"ry-7f3e2a91\n"), b"[secrit:V]\n");
+        assert_eq!(m.finish(), b"");
+
+        let mut m = masker(&values);
+        assert_eq!(m.feed(b"run-c"), b"");
+        assert_eq!(m.flush_held(), b"run-c");
+        assert_eq!(m.feed(b"!!"), b"!!", "no longer a prefix, so out at once");
+        assert_eq!(m.feed(b"ry-7f3e2a91"), b"ry-7f3e2a91");
         assert_eq!(m.finish(), b"");
     }
 

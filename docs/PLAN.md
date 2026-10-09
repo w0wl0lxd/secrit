@@ -560,8 +560,9 @@ the readback and `get` give sops the bytes on stdin instead (SEC-11).
 9. Validate the copy:
    - it parses, and the `sops` block with `mac` and at least one recipient is present;
    - the recipient list equals the original's;
-   - every top-level leaf outside `sops` is encrypted: each string starts with `ENC[`, and
-     no number or boolean is left (sops leaves `null` as it is); NAME itself must be an
+   - every top-level leaf outside `sops` is encrypted: each non-empty string starts with
+     `ENC[`, and no number or boolean is left (sops leaves `null` and an empty string as
+     they are); NAME itself must be an
      `ENC[AES256_GCM,...,type:str]` string. `store` and `rm` check the other entries before
      they read a value or ask (exit 3);
    - the set of names equals the old set plus NAME (`store`) or minus NAME (`rm`);

@@ -242,7 +242,7 @@ impl Runner {
             .arg("--value-stdin")
             .arg(path)
             .arg(name.sops_path());
-        self.keys.touch("set", &target)?;
+        self.touch("set", &target)?;
         let out = self.run(cmd, Some(&json), 0, "set", target.clone())?;
         if !out.status.success() {
             let inner = &json[1..json.len() - 1];
@@ -266,7 +266,7 @@ impl Runner {
             .arg(format.input_type())
             .arg(path)
             .arg(name.sops_path());
-        self.keys.touch("unset", &target)?;
+        self.touch("unset", &target)?;
         let out = self.run(cmd, None, 0, "unset", target.clone())?;
         if !out.status.success() {
             return Err(self.failed("unset", target, &out, &[]));
@@ -293,13 +293,20 @@ impl Runner {
             .args(["--output-type", "json", "--extract"])
             .arg(name.sops_path())
             .arg("/dev/stdin");
-        self.keys.touch(step, &target)?;
+        self.touch(step, &target)?;
         let out = self.run(cmd, Some(bytes), MAX_VALUE_BYTES, step, target.clone())?;
         if !out.status.success() {
             return Err(self.failed(step, target, &out, secrets));
         }
         let mut stdout = out.stdout;
         Ok(SecretValue::new(std::mem::take(&mut *stdout)))
+    }
+
+    /// The touch line of a plugin identity, after the once-only checks: a
+    /// run that secrit refuses asks for no touch.
+    fn touch(&self, step: &str, target: &Target) -> Result<(), BackendError> {
+        self.check_once()?;
+        self.keys.touch(step, target)
     }
 
     /// [`Self::run_unchecked`] after the once-only checks. `step` and

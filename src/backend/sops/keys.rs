@@ -18,8 +18,9 @@
 //! - The key command runs once per sops run that needs an identity, with
 //!   sops's own environment: no `PATH` and `HOME=/nonexistent`. A command
 //!   that needs `PATH` fails with "failed to execute command".
-//! - A key command that reads `/dev/tty` stops in the background group, but
-//!   sops waits, so only the deadline ends the run.
+//! - A key command that reads `/dev/tty` gets SIGTTIN, which the kernel
+//!   sends to the whole sops process group. So sops stops too, and secrit
+//!   ends the run at once.
 //! - A passphrase SSH key fails at once with no terminal, and stops sops on
 //!   one.
 //! - One decrypt through an age plugin is one plugin run in identity mode.
@@ -69,8 +70,8 @@ const MAX_LEVEL: Level = Level::Touch;
 /// The deadline of `age-plugin-yubikey --list`.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIST_BYTES: usize = 64 * 1024;
-/// The most bytes secrit reads of a stub file or a key header.
-const MAX_STUB_BYTES: u64 = 16 * 1024;
+/// The most bytes secrit reads of a stub file or a plain key source.
+const MAX_STUB_BYTES: usize = 16 * 1024;
 const PLUGIN_PREFIX: &str = "age-plugin-";
 const FIDO2_HMAC_HRP: &str = "age1fido2-hmac";
 
@@ -93,6 +94,8 @@ pub struct KeySources {
 #[derive(Debug)]
 pub struct Plugin {
     stub: PathBuf,
+    /// The directory of the plugin program.
+    dir: PathBuf,
     /// The level from the config, if any.
     configured: Option<Level>,
     /// The store name in the touch line.
@@ -160,6 +163,7 @@ impl KeySources {
                 }
                 s.plugin = Some(Plugin {
                     stub: stub.clone(),
+                    dir: dir.clone(),
                     configured: *level,
                     label,
                     planned: AtomicUsize::new(0),
@@ -320,15 +324,11 @@ impl KeySources {
             return Ok(());
         };
         if tty::open().is_err() {
-            return Err(unsafe_(
-                &p.stub,
-                "a plugin identity needs /dev/tty to ask for the touch, and this process has no terminal".into(),
-            ));
+            return Err(p.no_terminal());
         }
         p.check_recipients(meta)?;
         if p.level_ok.get().is_none() {
-            let dir = self.plugin_dir.as_deref().unwrap_or(Path::new("/"));
-            p.check_level(dir)?;
+            p.check_level()?;
             let _ = p.level_ok.set(());
         }
         Ok(())
@@ -350,10 +350,7 @@ impl KeySources {
             return Ok(());
         };
         let Ok(tty) = tty::open() else {
-            return Err(unsafe_(
-                &p.stub,
-                "a plugin identity needs /dev/tty to ask for the touch, and this process has no terminal".into(),
-            ));
+            return Err(p.no_terminal());
         };
         let k = p.done.fetch_add(1, Ordering::Relaxed) + 1;
         let n = p.planned.load(Ordering::Relaxed).max(k);
@@ -366,8 +363,10 @@ impl KeySources {
     }
 }
 
-/// `secrit: touch your key to read 'NAME' from STORE (k of n)`.
+/// `secrit: touch your key to read 'NAME' from STORE (k of n)`. The store
+/// name is a config key with no grammar, so it is escaped.
 fn touch_line(step: &str, target: &Target, store: &str, k: usize, n: usize) -> String {
+    let store = crate::display::escape(store);
     let (verb, prep) = match step {
         "set" => ("write", "to"),
         "unset" => ("remove", "from"),
@@ -498,18 +497,46 @@ const OPENSSH_NONE: &str = "b3BlbnNzaC1rZXktdjEAAAAABG5vbmU";
 /// Base64 of `openssh-key-v1\0`, which every OpenSSH key starts with.
 const OPENSSH_MAGIC: &str = "b3BlbnNzaC1rZXktdjEAAAAA";
 
-/// Read the header of the SSH key at `path` (doctor, v0.2 plan 6.2).
-pub fn ssh_key_header(path: &Path) -> std::io::Result<SshKeyHeader> {
-    let mut buf = Zeroizing::new(vec![0u8; OPENSSH_ARMOUR.len() + 1 + OPENSSH_NONE.len()]);
+/// The first bytes of a file that can hold a key.
+struct Head {
+    /// One fixed buffer, wiped on drop. It never grows, so no copy of a
+    /// key stays in freed memory.
+    buf: Zeroizing<Vec<u8>>,
+    len: usize,
+    /// Whether the file holds more than the bytes asked for.
+    more: bool,
+}
+
+impl Head {
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// Read at most `cap` bytes of the file at `path`.
+fn read_head(path: &Path, cap: usize) -> std::io::Result<Head> {
+    let mut buf = Zeroizing::new(vec![0u8; cap + 1]);
     let mut f = std::fs::File::open(path)?;
     let mut len = 0;
     while len < buf.len() {
-        match f.read(&mut buf[len..])? {
-            0 => break,
-            n => len += n,
+        match f.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
-    Ok(classify_ssh_header(&buf[..len]))
+    Ok(Head {
+        buf,
+        len: len.min(cap),
+        more: len > cap,
+    })
+}
+
+/// Read the header of the SSH key at `path` (doctor, v0.2 plan 6.2).
+pub fn ssh_key_header(path: &Path) -> std::io::Result<SshKeyHeader> {
+    let head = read_head(path, OPENSSH_ARMOUR.len() + 1 + OPENSSH_NONE.len())?;
+    Ok(classify_ssh_header(head.bytes()))
 }
 
 fn classify_ssh_header(head: &[u8]) -> SshKeyHeader {
@@ -792,19 +819,35 @@ impl Plugin {
         self.configured.unwrap_or(DEFAULT_PLUGIN_LEVEL)
     }
 
-    /// The stub under the trust rule, parsed.
+    fn no_terminal(&self) -> BackendError {
+        unsafe_(
+            &self.stub,
+            "a plugin identity needs /dev/tty to ask for the touch, and this process has no terminal".into(),
+        )
+    }
+
+    /// The stub under the trust rule, parsed. sops reads all of the file,
+    /// so a stub that is larger than the part that secrit checks is
+    /// refused.
     pub fn read_stub(&self) -> Result<Stub, BackendError> {
         let stub = &self.stub;
         trust::check_file(stub).map_err(|e| trust_error(stub, "check the identity stub", e))?;
-        let mut text = Zeroizing::new(String::new());
-        std::fs::File::open(stub)
-            .and_then(|f| f.take(MAX_STUB_BYTES).read_to_string(&mut text))
-            .map_err(|source| BackendError::Io {
-                step: "read the identity stub",
-                path: stub.clone(),
-                source,
-            })?;
-        parse_stub(&text).map_err(|reason| unsafe_(stub, reason))
+        let head = read_head(stub, MAX_STUB_BYTES).map_err(|source| BackendError::Io {
+            step: "read the identity stub",
+            path: stub.clone(),
+            source,
+        })?;
+        if head.more {
+            return Err(unsafe_(
+                stub,
+                format!(
+                    "it is larger than {MAX_STUB_BYTES} bytes; a stub holds one identity line and its comments"
+                ),
+            ));
+        }
+        let text = std::str::from_utf8(head.bytes())
+            .map_err(|_| unsafe_(stub, "it is not UTF-8 text".into()))?;
+        parse_stub(text).map_err(|reason| unsafe_(stub, reason))
     }
 
     /// 6.7.2 rule 4 on the file's recipients: a fido2-hmac v2 recipient, a
@@ -862,14 +905,11 @@ impl Plugin {
     fn plain_recipients(&self) -> Vec<String> {
         let mut out = Vec::new();
         for p in &self.plain_sources {
-            let Ok(f) = std::fs::File::open(p) else {
+            let Ok(head) = read_head(p, MAX_STUB_BYTES) else {
                 continue;
             };
-            let mut text = Zeroizing::new(String::new());
-            if f.take(MAX_STUB_BYTES).read_to_string(&mut text).is_err() {
-                continue;
-            }
-            for line in text.lines() {
+            let lines = head.bytes().split(|b| *b == b'\n');
+            for line in lines.filter_map(|l| std::str::from_utf8(l).ok()) {
                 let line = line.trim();
                 if let Some(pk) = line.strip_prefix("# public key:") {
                     out.push(pk.trim().to_owned());
@@ -884,11 +924,11 @@ impl Plugin {
     /// The slot level check through `age-plugin-yubikey --list` (6.7.8
     /// rule 4), then the levels that this build cannot serve. Other plugins
     /// report no policy, so their level is not checked.
-    pub fn check_level(&self, dir: &Path) -> Result<(), BackendError> {
+    pub fn check_level(&self) -> Result<(), BackendError> {
         let stub = self.read_stub()?;
         let level = self.level();
         if stub.plugin == "yubikey" {
-            let slot = self.find_slot(dir, &stub)?;
+            let slot = self.find_slot(&stub)?;
             check_slot(level, &slot).map_err(|reason| unsafe_(&self.stub, reason))?;
         }
         if level > MAX_LEVEL {
@@ -904,8 +944,8 @@ impl Plugin {
     }
 
     /// The slot of `stub` in `age-plugin-yubikey --list`.
-    pub fn find_slot(&self, dir: &Path, stub: &Stub) -> Result<Slot, BackendError> {
-        let text = list_slots(dir)?;
+    fn find_slot(&self, stub: &Stub) -> Result<Slot, BackendError> {
+        let text = list_slots(&self.dir)?;
         let slots = parse_list(&text);
         slots
             .into_iter()
@@ -924,8 +964,10 @@ impl Plugin {
 }
 
 /// Run `age-plugin-yubikey --list` from `dir`, bounded, with the cleared
-/// environment and `PATH=<dir>`.
+/// environment and `PATH=<dir>`. Each caller gets the check of the plugin
+/// directory first (T48): `doctor` comes here with no preflight.
 fn list_slots(dir: &Path) -> Result<String, BackendError> {
+    check_plugin_dir(dir)?;
     let program = dir.join("age-plugin-yubikey");
     let mut cmd = Command::new(&program);
     cmd.env_clear()
@@ -1235,6 +1277,20 @@ mod tests {
         );
     }
 
+    /// A store name is a config key with no grammar, so the touch line
+    /// shows its control characters as escapes.
+    #[test]
+    fn a_touch_line_escapes_the_store_name() {
+        let target = Target {
+            location: crate::backend::Location::File("/s/main.yaml".into()),
+            name: None,
+        };
+        let line = touch_line("decrypt", &target, "va\u{1b}[2Jult\nx", 1, 1);
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with(" (1 of 1)\n"), "{line:?}");
+    }
+
     #[test]
     fn key_command_paths_that_sops_would_split_are_refused() {
         for p in ["/a b/cmd", "/a\tb", "/it's", "/a\"b", "/a\\b", "/a#b"] {
@@ -1306,6 +1362,37 @@ mod tests {
         assert!(parse_stub("AGE-PLUGIN-A-1X\nAGE-PLUGIN-B-1Y\n").is_err());
     }
 
+    /// sops reads all of the stub file. So a stub that is larger than the
+    /// part that secrit checks is refused, with a plain key after that part
+    /// or without one.
+    #[test]
+    fn a_stub_larger_than_the_cap_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("stub");
+        let write = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        let mut p = plugin_with(Vec::new());
+        p.stub.clone_from(&path);
+        let cap = MAX_STUB_BYTES;
+        let line = "AGE-PLUGIN-X-1Q\n";
+
+        write(&format!("{line}{}", "#".repeat(cap - line.len())));
+        assert_eq!(p.read_stub().unwrap().plugin, "x");
+
+        for tail in ["#\n", "AGE-SECRET-KEY-1DUMMY\n"] {
+            write(&format!(
+                "{line}{}\n{tail}",
+                "#".repeat(cap - line.len() - 1)
+            ));
+            let e = p.read_stub().unwrap_err();
+            assert!(e.to_string().contains("larger than"), "{e}");
+            assert_eq!(e.exit(), crate::error::Exit::Refused);
+        }
+    }
+
     #[test]
     fn the_yubikey_list_parses_and_levels_are_checked() {
         let list = "#       Serial: 5555555, Slot: 1\n#         Name: a\n#      Created: x\n#   PIN policy: Once   (A PIN is required once per session, if set)\n# Touch policy: Always (A physical touch is required for every decryption)\nage1yubikey1qone\n\n#       Serial: 5555555, Slot: 2\n#   PIN policy: Never  (A PIN is NOT required to decrypt)\n# Touch policy: Cached (A physical touch is required for decryption, and is cached for 15 seconds)\nage1yubikey1qtwo\n";
@@ -1367,6 +1454,7 @@ mod tests {
     fn plugin_with(plain_sources: Vec<PathBuf>) -> Plugin {
         Plugin {
             stub: "/k/stub".into(),
+            dir: "/k/plugins".into(),
             configured: None,
             label: "vault".into(),
             planned: AtomicUsize::new(0),

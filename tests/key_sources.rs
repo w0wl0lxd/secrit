@@ -473,17 +473,20 @@ impl PluginEnv {
         let _ = std::fs::remove_file(&self.log);
     }
 
+    /// The store section with a plugin identity; `extra` goes into its
+    /// table.
+    fn section(&self, extra: &str) -> String {
+        format!(
+            "{}\n[stores.main.identity]\nkind = \"plugin\"\nstub = \"{}\"\nplugin_dir = \"{}\"\n{extra}",
+            bare_section(&self.env),
+            self.stub.display(),
+            self.dir.display()
+        )
+    }
+
     /// The config with a plugin identity; `extra` goes into its table.
     fn write_config(&self, extra: &str) {
-        write_section(
-            &self.env,
-            &format!(
-                "{}\n[stores.main.identity]\nkind = \"plugin\"\nstub = \"{}\"\nplugin_dir = \"{}\"\n{extra}",
-                bare_section(&self.env),
-                self.stub.display(),
-                self.dir.display()
-            ),
-        );
+        write_section(&self.env, &self.section(extra));
     }
 
     /// How often the plugin ran as an identity, that is, unwrapped.
@@ -549,6 +552,16 @@ fn a_plugin_identity_needs_a_terminal() {
         assert!(stderr(&out).contains("/dev/tty"), "{}", stderr(&out));
     }
     assert_eq!(p.unwraps(), 0);
+
+    // A read of a name that exists is refused in the same way.
+    let out = pipe_under_tty(&p.env, "v", "store n");
+    assert_eq!(code(&out), 0, "{}", pty_text(&out));
+    let unwraps = p.unwraps();
+    let out = run_cmd(no_tty(&p.env.cmd()), ["get", "n", "--stdout"], None);
+    assert_eq!(code(&out), 3, "{}", stderr(&out));
+    assert!(stderr(&out).contains("/dev/tty"), "{}", stderr(&out));
+    assert!(out.stdout.is_empty(), "get wrote to stdout");
+    assert_eq!(p.unwraps(), unwraps, "the refused read unwrapped");
 }
 
 /// 6.7.2 rule 4: a plain age key that this user can read (the default age
@@ -588,8 +601,21 @@ fn a_fido2_hmac_v2_recipient_is_refused() {
     assert_eq!(p.unwraps(), 0);
 }
 
+/// The file where the fake `age-plugin-yubikey` logs each `--list` run.
+fn list_log(p: &PluginEnv) -> PathBuf {
+    p.env.root.path().join("list.log")
+}
+
+/// How often the fake `age-plugin-yubikey` ran with `--list`.
+fn list_runs(p: &PluginEnv) -> usize {
+    std::fs::read_to_string(list_log(p))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
 /// A `YubiKey` stub and a fake `age-plugin-yubikey` that answers `--list`
-/// with one slot of the given policies and logs any other run.
+/// with one slot of the given policies and logs every run.
 fn fake_yubikey(p: &PluginEnv, pin: &str, touch: &str) -> PathBuf {
     let meta = format!(
         "#       Serial: 5555555, Slot: 1\n#         Name: age identity 1a2b3c4d\n#      Created: Thu, 08 Oct 2026 00:00:00 +0000\n#   PIN policy: {pin}\n# Touch policy: {touch}\n"
@@ -601,7 +627,8 @@ fn fake_yubikey(p: &PluginEnv, pin: &str, touch: &str) -> PathBuf {
         &p.dir.join("age-plugin-yubikey"),
         "#!/bin/sh",
         &format!(
-            "if [ \"$1\" = --list ]; then exec {} {}; fi\nprintf '%s\\n' \"identity-v1 yubikey $*\" >> {}\nexit 1",
+            "if [ \"$1\" = --list ]; then echo list >> {}; exec {} {}; fi\nprintf '%s\\n' \"identity-v1 yubikey $*\" >> {}\nexit 1",
+            sh_quote(&list_log(p)),
             sh_quote(&bin("cat")),
             sh_quote(&list),
             sh_quote(&p.log)
@@ -705,4 +732,214 @@ fn an_unsafe_plugin_dir_is_refused() {
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(stderr(&out).contains("age-plugin-"), "{}", stderr(&out));
     assert_eq!(p.env.ls(), ["a"]);
+}
+
+/// T48 in `doctor`: the identity row runs `age-plugin-yubikey --list` only
+/// from a plugin directory that passes the trust rule.
+#[test]
+fn doctor_runs_no_plugin_from_an_unsafe_directory() {
+    let p = PluginEnv::new();
+    let stub = fake_yubikey(
+        &p,
+        "Never  (A PIN is NOT required to decrypt)",
+        "Always (A physical touch is required for every decryption)",
+    );
+    write_yubikey_config(&p, &stub, "touch");
+    let row = doctor_row(&p.env, "identity").expect("no identity row");
+    assert!(row.starts_with("ok"), "{row}");
+    let safe_runs = list_runs(&p);
+    assert!(safe_runs >= 1, "doctor did not read the slot policy");
+
+    let plugin = p.dir.join("age-plugin-yubikey");
+    for (path, unsafe_mode) in [(&plugin, 0o720), (&p.dir, 0o770)] {
+        chmod(path, unsafe_mode);
+        let out = p.env.run(["doctor"], None);
+        chmod(path, 0o700);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let row = |check: &str| {
+            let want = format!("store main: {check}:");
+            text.lines()
+                .find(|l| l.contains(&want))
+                .unwrap_or_else(|| panic!("no {check} row: {text}"))
+        };
+        assert!(row("age plugin directory").starts_with("fail"), "{text}");
+        assert!(row("identity").starts_with("fail"), "{text}");
+        assert!(
+            row("identity").contains("writable by group or others"),
+            "{text}"
+        );
+        assert_eq!(
+            list_runs(&p),
+            safe_runs,
+            "doctor ran a plugin from an unsafe directory"
+        );
+    }
+}
+
+/// The environment that the parent of a `/bin/sh` script gave it, which the
+/// script copied from `/proc/$$/environ` into `dump`.
+fn environ_of(dump: &Path) -> Vec<(String, String)> {
+    let bytes = std::fs::read(dump).unwrap_or_else(|e| panic!("{}: {e}", dump.display()));
+    bytes
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let text = String::from_utf8_lossy(e);
+            let (k, v) = text.split_once('=').unwrap_or((&text, ""));
+            (k.to_owned(), v.to_owned())
+        })
+        .collect()
+}
+
+/// Variables that secrit gets in these tests and that no key source may see.
+const NOT_FOR_A_KEY_SOURCE: [&str; 7] = [
+    "SECRIT_TEST_CANARY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "GNUPGHOME",
+    "SSH_AUTH_SOCK",
+    "SECRIT_CONFIG",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+];
+const CANARIES: [&str; 4] = [
+    "SECRIT_TEST_CANARY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "GNUPGHOME",
+    "SSH_AUTH_SOCK",
+];
+
+fn assert_cleared(environ: &[(String, String)], path: Option<&Path>) {
+    let value = |name: &str| {
+        environ
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let names: Vec<&str> = environ.iter().map(|(k, _)| k.as_str()).collect();
+    for k in NOT_FOR_A_KEY_SOURCE {
+        assert_eq!(value(k), None, "{k} reached a key source: {names:?}");
+    }
+    assert_eq!(value("HOME"), Some("/nonexistent"), "{names:?}");
+    assert_eq!(value("PATH"), path.and_then(Path::to_str), "{names:?}");
+}
+
+/// Plan 6.2: a key command gets the cleared environment of sops. Nothing of
+/// secrit's own environment reaches it, and it has no `PATH`.
+#[test]
+fn a_key_command_runs_in_the_cleared_environment() {
+    let env = TestEnv::new();
+    let dump = env.root.path().join("key-cmd.environ");
+    let dir = env.root.path().join("bin");
+    let cmd = dir.join("age-key");
+    let cat = sh_quote(&bin("cat"));
+    script_at(
+        &cmd,
+        "#!/bin/sh",
+        &format!(
+            "{cat} /proc/$$/environ > {}\nexec {cat} {}",
+            sh_quote(&dump),
+            sh_quote(&env.key_file)
+        ),
+    );
+    chmod(&dir, 0o700);
+    write_section(
+        &env,
+        &format!(
+            "{}age_key_cmd = \"{}\"\n",
+            bare_section(&env),
+            cmd.display()
+        ),
+    );
+    let mut c = env.cmd();
+    for k in CANARIES {
+        c.env(k, "/canary");
+    }
+    let out = run_cmd(c, ["store", "a"], Some(b"v"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let environ = environ_of(&dump);
+    assert_cleared(&environ, None);
+    assert!(
+        environ
+            .iter()
+            .any(|(k, v)| k == "SOPS_AGE_KEY_CMD" && Path::new(v) == cmd),
+        "the key command variable is not its path"
+    );
+}
+
+/// Plan 6.2: an age plugin gets the cleared environment of sops, and its
+/// `PATH` is the plugin directory only.
+#[test]
+fn a_plugin_runs_in_the_cleared_environment() {
+    let p = PluginEnv::new();
+    let dump = p.env.root.path().join("plugin.environ");
+    let real = tool(
+        "SECRIT_TEST_AGE_PLUGIN_UNENCRYPTED",
+        "age-plugin-unencrypted",
+    );
+    script_at(
+        &p.dir.join("age-plugin-unencrypted"),
+        "#!/bin/sh",
+        &format!(
+            "{} /proc/$$/environ > {}\nexec {} \"$@\"",
+            sh_quote(&bin("cat")),
+            sh_quote(&dump),
+            sh_quote(&real)
+        ),
+    );
+    let mut vars: Vec<(&str, &OsStr)> = vec![("S_VALUE", OsStr::new("v"))];
+    vars.extend(CANARIES.iter().map(|k| (*k, OsStr::new("/canary"))));
+    let out = under_tty(&p.env, "printf %s \"$S_VALUE\" | \"$S_BIN\" store n", &vars);
+    assert_eq!(code(&out), 0, "{}", pty_text(&out));
+    assert_cleared(&environ_of(&dump), Some(&p.dir));
+}
+
+/// Plan S8: `touch_timeout_secs` is the deadline of a sops run through a
+/// plugin identity. A plugin that gets no touch ends there, and the store
+/// file is unchanged.
+#[test]
+fn a_plugin_that_waits_ends_at_the_touch_timeout() {
+    let p = PluginEnv::new();
+    let out = pipe_under_tty(&p.env, "v", "store n");
+    assert_eq!(code(&out), 0, "{}", pty_text(&out));
+    p.write_config("touch_timeout_secs = 2\n");
+    script_at(
+        &p.dir.join("age-plugin-unencrypted"),
+        "#!/bin/sh",
+        &format!("exec {} 60", sh_quote(&bin("sleep"))),
+    );
+    let before = p.env.store_bytes();
+    let started = Instant::now();
+    let out = pipe_under_tty(&p.env, "w", "store m");
+    let took = started.elapsed();
+    assert_ne!(code(&out), 0, "{}", pty_text(&out));
+    assert!(
+        took >= Duration::from_secs(2),
+        "{took:?}: {}",
+        pty_text(&out)
+    );
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    let text = pty_text(&out);
+    assert!(text.contains("did not finish within 2000 ms"), "{text}");
+    assert!(text.contains("touch_timeout_secs"), "{text}");
+    assert!(p.env.store_bytes() == before, "the store file changed");
+    assert_eq!(p.env.ls(), ["n"]);
+}
+
+/// The touch line comes after the once-only checks of a sops run. A run
+/// that secrit refuses, here for a sops that is too old, asks for no touch.
+#[test]
+fn a_refused_sops_run_asks_for_no_touch() {
+    let p = PluginEnv::new();
+    let old = p.env.script(
+        "old-sops",
+        "for a in \"$@\"; do [ \"$a\" = --version ] && { echo 'sops 3.9.0'; exit 0; }; done\nexit 1",
+    );
+    p.env
+        .write_store_config(&p.section(""), &format!("sops = \"{}\"", old.display()), 30);
+    let out = pipe_under_tty(&p.env, "v", "store n");
+    assert_ne!(code(&out), 0, "{}", pty_text(&out));
+    let text = pty_text(&out);
+    assert!(text.contains("3.9.0"), "{text}");
+    assert!(!text.contains("touch your key"), "{text}");
+    assert_eq!(p.unwraps(), 0);
 }

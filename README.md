@@ -168,6 +168,7 @@ touch_timeout_secs = 30                     # the default
 For a plugin identity, secrit:
 
 - refuses each command that decrypts when there is no `/dev/tty` (exit 3);
+- refuses (exit 3) a stub file that holds a plain age key or that is larger than 16 KiB;
 - writes one line to `/dev/tty` before each sops run that decrypts, for example
   `secrit: touch your key to read 'db_password' from vault (1 of 1)`;
 - ends a sops run that waits longer than `touch_timeout_secs`;

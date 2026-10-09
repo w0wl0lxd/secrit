@@ -156,7 +156,7 @@ fn key_source_rows(r: &mut Report, name: &dyn Fn(&str) -> String, backend: &Sops
         }
     }
     if let Some(p) = keys.plugin() {
-        let (status, detail) = plugin_identity(p, keys.plugin_dir());
+        let (status, detail) = plugin_identity(p);
         r.add(name("identity"), status, detail);
     }
 }
@@ -208,14 +208,14 @@ fn key_cmd_shebang(c: &Path) -> (Status, String) {
 
 /// The stub and the level of a plugin identity. Only age-plugin-yubikey
 /// reports a slot policy (6.7.8 rule 4).
-fn plugin_identity(p: &keys::Plugin, dir: Option<&Path>) -> (Status, String) {
+fn plugin_identity(p: &keys::Plugin) -> (Status, String) {
     let stub = match p.read_stub() {
         Ok(s) => s,
         Err(e) => return (Status::Fail, e.to_string()),
     };
     let level = p.level().as_str();
     let shown = p.stub_path().display();
-    match p.check_level(dir.unwrap_or(Path::new("/"))) {
+    match p.check_level() {
         Err(e) => (Status::Fail, e.to_string()),
         Ok(()) if stub.plugin == "yubikey" => (
             Status::Ok,

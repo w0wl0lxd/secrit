@@ -64,9 +64,14 @@ All notable changes to this project are recorded here. The format follows
   touch line per decrypting sops run, and uses `touch_timeout_secs` (default 30) as the
   sops deadline. It refuses a fido2-hmac v2 recipient, a plain key that the user can
   read, a non-age key type, a YubiKey slot with touch policy `cached`, and a `level`
-  stricter than the slot. This build serves levels up to `touch`.
+  stricter than the slot. This build serves levels up to `touch`. A stub file that holds
+  a plain age key, or that is larger than 16 KiB, exits 3. A store name shows in the
+  touch line with its control characters escaped, and a run that secrit refuses before
+  sops starts writes no touch line.
 - `doctor` rows for the SSH key (owner, mode and passphrase, from the key header only),
   the key command (trust rule and shebang), the plugin directory and the plugin identity.
+  `doctor` runs `age-plugin-yubikey --list` only from a plugin directory that passes the
+  trust rule.
 
 ### Changed
 

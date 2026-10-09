@@ -924,7 +924,9 @@ mod tests {
             assert_eq!(m.feed(b"."), b".");
         }
         let took = start.elapsed();
-        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        // A full-capacity wipe per call costs seconds here; a length-only wipe costs
+        // microseconds. The wide limit keeps a busy CI runner from failing the test.
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

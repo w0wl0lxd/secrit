@@ -45,6 +45,26 @@ All notable changes to this project are recorded here. The format follows
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
 
+- pass layout backend (`backend = "pass"`, v0.2 plan 6.4): one gpg file per name in a
+  password-store directory, read and written with `gpg`; secrit never runs `pass` or
+  `gopass`. Store keys `dir`, `prefix`, `gnupg_home`, `value` (`whole` or `first-line`)
+  and `pinentry` (`error` or `agent`), and `tools.gpg` (config or baked-in path only, no
+  `PATH`). Recipients come from the nearest `.gpg-id`; `encrypt-to` in `gpg.conf` adds
+  none. secrit lists the packets of each new file and checks its recipients before the
+  rename. A `.gpg-id.sig` refuses writes. `get` uses `--pinentry-mode error`, so a needed
+  passphrase fails at once. Values reach gpg on stdin only, and gpg gets only
+  `GNUPGHOME`. Exact-byte interop with pass 1.7.4 and gopass (`gpgcli`, `fs`) is tested
+  both ways.
+- `store` and `rm` on a pass store in a git repository print the `git add` and
+  `git commit` commands; secrit never commits.
+- `init --backend pass --pass-dir DIR` checks a pass store and its recipient keys, then
+  writes the config or prints the store section. It never creates the store.
+- `doctor` rows for pass stores: the gpg version, the store directory, the `GNUPGHOME`
+  mode, the `.gpg-id`, each recipient key, a `.gpg-id.sig` (warn), the entry count and
+  the git state. The tool rows show only the tools of the backends in use.
+- `secrit --version` prints the baked-in `gpg` path. The Nix package bakes in `gpg`, and
+  the devShell and checks add `gnupg`, `pass` and `gopass`.
+
 ### Changed
 
 - Internal refactor for v0.2 backends, with no change to the config format, the messages

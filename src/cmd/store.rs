@@ -42,6 +42,7 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
         ctx.store.name,
         ctx.backend.location()
     ));
+    ctx.commit_hint(name, "Store");
     if ctx.store.wire_hint {
         ctx.status(&format!(
             "run 'secrit wire {name}' to expose it at /run/secrets/{name}"

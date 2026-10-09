@@ -55,6 +55,24 @@ impl Ctx {
             eprintln!("{msg}");
         }
     }
+
+    /// After a write to a store in a git repository, the git commands that
+    /// record it. secrit never commits and never runs them (Q25).
+    pub fn commit_hint(&self, name: &Name, what: &str) {
+        let Some(file) = self.backend.commit_hint(name) else {
+            return;
+        };
+        let Some(root) = file.parent().and_then(crate::git::find_root) else {
+            return;
+        };
+        let rel = file.strip_prefix(&root).unwrap_or(&file);
+        let git = format!("git -C {}", shell_path(&root));
+        self.status(&format!(
+            "secrit never commits; to record the change, run: {git} add -A -- {} && {git} commit -m {}",
+            shell_path(rel),
+            shell_word(&format!("{what} {name}"))
+        ));
+    }
 }
 
 impl std::fmt::Debug for Ctx {

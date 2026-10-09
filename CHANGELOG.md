@@ -58,6 +58,12 @@ All notable changes to this project are recorded here. The format follows
   is unchanged.
 - CI: a `darwin-clippy` job runs clippy for `aarch64-apple-darwin` on Linux, to catch
   macOS cfg errors without a Mac.
+- Tests: a backend conformance suite. Each backend gets the same cases: the round trip,
+  create-only, replace with a backup when the backend keeps backups, `rm`, `ls` with no
+  key, `get` to a pipe, no value on a child argv or in child stderr, and the `get`
+  refusal for agents. `tests/backend_sops.rs` runs it on the sops store. The test
+  helpers moved from `tests/common/mod.rs` into `env.rs` (directories, the secrit
+  command, the pty helpers), `fixture.rs` and `conformance.rs`.
 - A config parse error names the line and column of the bad key or value, for example
   `invalid config file PATH: line 6, column 1: unknown field ...`. The unknown-key error
   inside `[stores.NAME]` lists `backend` among the expected keys again.

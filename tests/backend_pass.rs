@@ -420,6 +420,79 @@ fn recipients_must_resolve_before_the_value() {
     assert_eq!(f.names(), Vec::<String>::new());
 }
 
+/// A gpg wrapper that logs each run as one line of its arguments.
+fn gpg_run_log(f: &PassFixture, log: &Path) {
+    let wrapper = f.script(
+        "gpg-runs",
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"",
+            log.display(),
+            f.gpg.display()
+        ),
+    );
+    f.write_config_with(&wrapper, "");
+}
+
+/// The number of `gpg --list-keys` runs in the log, and then a clear log.
+fn list_key_runs(log: &Path) -> usize {
+    let n = std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("--list-keys"))
+        .count();
+    let _ = std::fs::remove_file(log);
+    n
+}
+
+/// One `store` resolves each `.gpg-id` recipient once: the check before
+/// the value and the write share one `gpg --list-keys` run.
+#[test]
+fn a_write_resolves_each_recipient_once() {
+    let f = PassFixture::new();
+    let log = f.root.path().join("gpg-runs.log");
+    gpg_run_log(&f, &log);
+    let out = f.store_value("n", b"v");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(list_key_runs(&log), 1, "store n");
+    let out = f.run(["store", "n", "--replace"], Some(b"w"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(list_key_runs(&log), 1, "store n --replace");
+    assert!(get(&f, "n") == b"w", "replaced value differs");
+}
+
+/// A `.gpg-id` that changes while `store` waits for the value is read
+/// again, and the write goes to the keys that it names now.
+#[test]
+fn a_gpg_id_change_during_the_prompt_is_resolved_again() {
+    let f = PassFixture::new();
+    let b = f.gen_key("b@secrit.test", None);
+    let log = f.root.path().join("gpg-runs.log");
+    gpg_run_log(&f, &log);
+    let mut cmd = f.cmd();
+    cmd.args(["store", "n"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("--list-keys")
+    {
+        assert!(Instant::now() < deadline, "no recipient check ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(f.store_dir.join(".gpg-id"), format!("{}\n", b.fpr)).unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"v").unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(list_key_runs(&log), 2);
+    assert_eq!(f.packet_ids(&f.entry("n")), b.enc_ids);
+}
+
 /// gpg runs with a cleared environment: `GNUPGHOME` only, no `HOME` and
 /// no `GPG_TTY`.
 #[test]

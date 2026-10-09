@@ -13,6 +13,7 @@
 mod doctor;
 mod gpg;
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::fs::OpenOptions;
@@ -59,6 +60,16 @@ pub struct PassBackend {
     runtime_dir: Option<PathBuf>,
     backup_root: Option<PathBuf>,
     lock_timeout: Duration,
+    /// The recipients that `check_put` resolved, for the `put` that follows.
+    resolved: RefCell<Option<Resolved>>,
+}
+
+/// The keys of one `.gpg-id`, as its lines named them when they resolved.
+#[derive(Debug)]
+struct Resolved {
+    gpg_id: PathBuf,
+    lines: Vec<String>,
+    keys: Vec<Recipient>,
 }
 
 /// The recipient packets of an entry.
@@ -95,6 +106,7 @@ impl PassBackend {
             runtime_dir: paths::runtime_dir(env),
             backup_root: paths::backup_dir(env),
             lock_timeout,
+            resolved: RefCell::new(None),
         })
     }
 
@@ -235,20 +247,35 @@ impl PassBackend {
     }
 
     /// The keys that the entry of `name` is encrypted to. Runs before the
-    /// value is read, and decrypts nothing.
-    fn recipients(&self, name: &Name) -> Result<Vec<Recipient>, BackendError> {
+    /// value is read, and decrypts nothing. The `.gpg-id` is read on each
+    /// call; the keys that `check_put` resolved are used once more only
+    /// when the same `.gpg-id` still has the same lines, so gpg looks up
+    /// each recipient once per `store`.
+    fn recipients(&self, name: &Name) -> Result<Resolved, BackendError> {
         self.check_root()?;
         let gpg_id = self.gpg_id(&self.entry_dir(name))?;
         Self::refuse_signed(&gpg_id)?;
+        let lines = read_gpg_id(&gpg_id)?;
+        if let Some(r) = self
+            .resolved
+            .take()
+            .filter(|r| r.gpg_id == gpg_id && r.lines == lines)
+        {
+            return Ok(r);
+        }
         let target = self.target(Some(name));
         let mut keys: Vec<Recipient> = Vec::new();
-        for line in read_gpg_id(&gpg_id)? {
-            let r = self.resolve_line(&gpg_id, &line, &target)?;
+        for line in &lines {
+            let r = self.resolve_line(&gpg_id, line, &target)?;
             if !keys.iter().any(|k| k.fpr == r.fpr) {
                 keys.push(r);
             }
         }
-        Ok(keys)
+        Ok(Resolved {
+            gpg_id,
+            lines,
+            keys,
+        })
     }
 
     /// The packet check of an entry copy (T35): every packet names an
@@ -413,13 +440,14 @@ impl Backend for PassBackend {
     }
 
     fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
-        self.recipients(name)?;
+        let resolved = self.recipients(name)?;
         if mode == PutMode::CreateOnly && self.entry_exists(name)? {
             return Err(BackendError::Exists {
                 name: name.clone(),
                 location: self.location.clone(),
             });
         }
+        self.resolved.replace(Some(resolved));
         Ok(())
     }
 
@@ -466,7 +494,7 @@ impl Backend for PassBackend {
                 reason: FIRST_LINE_RULE,
             });
         }
-        let recipients = self.recipients(name)?;
+        let recipients = self.recipients(name)?.keys;
         let mut plaintext = Zeroizing::new(Vec::with_capacity(bytes.len() + 1));
         plaintext.extend_from_slice(bytes);
         plaintext.push(b'\n');

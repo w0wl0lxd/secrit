@@ -61,13 +61,10 @@ impl SopsBackend {
         lock_timeout: Duration,
         env: &Env,
     ) -> Result<Self, BackendError> {
-        let backups = paths::abs_var(env, "XDG_STATE_HOME")
-            .or_else(|| paths::abs_var(env, "HOME").map(|h| h.join(".local").join("state")))
-            .map(|s| s.join("secrit").join("backups"));
         let file = FileStore::new(
             store.file.clone(),
-            paths::abs_var(env, "XDG_RUNTIME_DIR"),
-            backups.as_deref(),
+            paths::runtime_dir(env),
+            paths::backup_dir(env).as_deref(),
             lock_timeout,
         )?;
         let sops_config = store

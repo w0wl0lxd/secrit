@@ -34,11 +34,14 @@ Read this first.
   and base64 that is wrapped into lines is not matched. Masking covers stdout and stderr
   only, and the command sees pipes, not a terminal. After 100 ms of idle output secrit
   shows the bytes that it holds, so a prefix of a value can show. When the rest of the
-  value follows later, the rest is masked; the prefix stays shown. Any
-  process of your user can read an `--env` value in `/proc/PID/environ` (also `ps eww`
-  and `docker inspect`), and a `--file` value through `/proc/PID/fd/N` (T42, T57); masking
-  covers neither. The memfd and `VAR` pass to grandchildren; `sudo` and other programs
-  that close every fd above 2 lose `--file` values; memfd pages can reach swap.
+  value follows later, the rest is masked; the prefix stays shown. While secrit masks,
+  it stops the copy of the output when CMD has exited and the output stays idle for
+  100 ms. A background process that CMD leaves running and that writes later gets `EPIPE`
+  or `SIGPIPE`, and its output is lost. Any process of your user can read an `--env`
+  value in `/proc/PID/environ` (also `ps eww` and `docker inspect`), and a `--file` value
+  through `/proc/PID/fd/N` (T42, T57); masking covers neither. The memfd and `VAR` pass
+  to grandchildren; `sudo` and other programs that close every fd above 2 lose `--file`
+  values; memfd pages can reach swap.
 - **Old values.** `rm` and `store --replace` keep a ciphertext backup in
   `$XDG_STATE_HOME/secrit/backups/` (default `~/.local/state/secrit/backups/`), the newest
   10 per store. Git history, backups and rendered `/run/secrets` copies keep old values.
@@ -243,6 +246,8 @@ usual; TERM and HUP are forwarded to it. A signal that the caller ignores (`nohu
 `trap '' HUP`) stays ignored in secrit and in CMD, and secrit does not forward it (Linux;
 on other systems CMD starts with the default action). `run` exits with CMD's exit code,
 or ends by the signal that ended CMD. CMD runs with the umask that secrit started with.
+CMD keeps `RLIMIT_CORE=0` on purpose: it holds the values too, so it writes no core dump.
+The hard limit is 0 too, so an unprivileged CMD cannot raise it.
 
 `get --stdout` writes to a pipe, a socket or a character device. It writes to a regular
 file only when the file is yours and group and others cannot read it (for example after

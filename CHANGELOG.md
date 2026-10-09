@@ -58,7 +58,9 @@ All notable changes to this project are recorded here. The format follows
   gets the umask that secrit started with.
   Held output goes out after 100 ms with no new output, so a prompt with no newline is
   shown. When that output is the start of a value and the rest follows later, the rest is
-  masked.
+  masked. While secrit masks, the copy of the output stops when CMD has exited and the
+  output stays idle for 100 ms, so a background process that CMD leaves running gets
+  `EPIPE` or `SIGPIPE` when it writes later. CMD keeps `RLIMIT_CORE=0` on purpose.
 - Internal: the output masker for `secrit run` (v0.2).
   It replaces a value and its base64 (both alphabets, three byte offsets, with and without
   padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a

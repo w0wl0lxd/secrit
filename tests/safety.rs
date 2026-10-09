@@ -316,12 +316,12 @@ fn a_store_in_another_format_is_refused_and_unchanged() {
     }
 }
 
-/// v0.2 plan 5.8: with no `format`, sops reads a `.env` file as dotenv and
-/// an `.ini` file as INI, which this secrit does not support yet. Every
-/// command on such a store exits 3 and leaves the file unchanged.
+/// v0.2 plan 5.8: with no `format`, sops reads an `.ini` file as INI,
+/// which this secrit does not support yet. Every command on such a store
+/// exits 3 and leaves the file unchanged.
 #[test]
-fn a_dotenv_or_ini_store_is_refused() {
-    for (file, said) in [("main.env", "dotenv"), ("MAIN.INI", "INI")] {
+fn an_ini_store_is_refused() {
+    for (file, said) in [("main.ini", "INI"), ("MAIN.INI", "INI")] {
         let mut env = TestEnv::new();
         env.store_file = env.store_dir.join(file);
         std::fs::write(&env.store_file, "old=ENC[x]\n").unwrap();

@@ -1,7 +1,7 @@
 //! `secrit store NAME` (PLAN section 4.1).
 
 use super::{Ctx, StoreArgs};
-use crate::backend::PutMode;
+use crate::backend::{PutMode, WireSource};
 use crate::cli::ARGV_VALUE_MESSAGE;
 use crate::display::escape_path;
 use crate::error::Error;
@@ -42,7 +42,12 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
         ctx.store.name,
         ctx.backend.location()
     ));
-    if ctx.store.wire_hint {
+    // The hint is for a name that `wire` can expose.
+    let wired = matches!(
+        ctx.backend.wire_source(name),
+        Some(WireSource::SopsFile { .. })
+    );
+    if ctx.store.wire_hint && wired {
         ctx.status(&format!(
             "run 'secrit wire {name}' to expose it at /run/secrets/{name}"
         ));

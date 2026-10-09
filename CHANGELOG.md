@@ -62,7 +62,17 @@ All notable changes to this project are recorded here. The format follows
 - `secrit wire a/b/c` prints `key = "a/b/c";` in the sops-nix stanza, so sops-nix reads
   the nested key; the value appears at `/run/secrets/a/b/c`.
 - A store whose backend cannot hold a nested name refuses one with exit 3 (the
-  `nested_names` capability). Both sops formats hold nested names.
+  `nested_names` capability). The sops YAML and JSON formats hold nested names.
+- sops dotenv stores (v0.2 plan S6). `format = "dotenv"`, or a file name that ends in
+  `.env`, gives a store of `NAME=value` lines. A name is a variable name with no `sops_`
+  prefix; any other name, and a nested name, is refused with exit 3 before the value is
+  read. `store` and `rm` refuse a file that is not strict dotenv lines (a line with no
+  `=`, an empty key, a key twice) or whose `sops_` lines do not form the sops metadata
+  tree. The copy validation reads that flat metadata as it reads the `sops` map of a
+  YAML store. `secrit init --format dotenv` creates the store.
+- `secrit wire` refuses a dotenv store with exit 3, because sops-nix gives a dotenv file
+  to a consumer only as one whole file. The message names `sops exec-env`. `store`
+  prints no `wire` hint for a dotenv store.
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.

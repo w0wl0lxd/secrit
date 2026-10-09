@@ -37,8 +37,13 @@ pub const MAX_ANCESTORS: usize = 64;
 /// The most bytes read from the environment of one ancestor. The kernel
 /// keeps the arguments and the environment in at most a quarter of the
 /// stack limit, so a larger read is rare.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const MAX_ENVIRON_BYTES: u64 = 4 << 20;
+
+/// The size of the one buffer that the environment of an ancestor is read
+/// into.
+#[cfg(any(target_os = "linux", test))]
+const ENVIRON_CHUNK: usize = 64 << 10;
 
 /// The text of every write refusal with no terminal (Q19).
 pub const NO_TTY_REFUSAL: &str = "refused: no terminal to confirm on. CI or a remote job: use 'secrit seal'. A scheduled job: run it as its own system service. Over ssh: use ssh -t.";
@@ -246,21 +251,88 @@ pub fn parse_stat(stat: &[u8]) -> Option<(Comm, u32)> {
     Some((comm, ppid))
 }
 
-/// The first agent variable that is set and not empty in a
-/// `/proc/PID/environ` block (`NAME=value` entries, each ended by a NUL).
-#[must_use]
-pub fn environ_var(environ: &[u8]) -> Option<&'static str> {
-    let set: Vec<&[u8]> = environ
-        .split(|&b| b == 0)
-        .filter_map(|entry| {
-            let eq = entry.iter().position(|&b| b == b'=')?;
-            (eq + 1 < entry.len()).then(|| &entry[..eq])
-        })
-        .collect();
-    AGENT_VARS
-        .iter()
-        .copied()
-        .find(|var| set.contains(&var.as_bytes()))
+/// One bit for each entry of [`AGENT_VARS`].
+#[cfg(any(target_os = "linux", test))]
+const ALL_AGENT_VARS: u32 = (1 << AGENT_VARS.len()) - 1;
+#[cfg(any(target_os = "linux", test))]
+const _: () = assert!(AGENT_VARS.len() < 32);
+
+/// Finds the first agent variable (in [`AGENT_VARS`] order) that is set and
+/// not empty in a `/proc/PID/environ` block (`NAME=value` entries, each
+/// ended by a NUL) that comes in pieces. It keeps no byte of the block: only
+/// the agent names that still match the current name, and the name length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
+struct EnvironScan {
+    state: ScanState,
+    found: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", test))]
+enum ScanState {
+    /// In a name: the bits of the agent variables that the name matches so
+    /// far, and the name length.
+    Name { candidates: u32, len: usize },
+    /// After `NAME=` for this index of [`AGENT_VARS`]: the next byte tells
+    /// whether the value is empty.
+    Value(usize),
+    /// In an entry that cannot match, up to its NUL.
+    Skip,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl EnvironScan {
+    const ENTRY_START: ScanState = ScanState::Name {
+        candidates: ALL_AGENT_VARS,
+        len: 0,
+    };
+
+    fn new() -> Self {
+        Self {
+            state: Self::ENTRY_START,
+            found: None,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.state = match self.state {
+                _ if b == 0 => Self::ENTRY_START,
+                ScanState::Name { candidates, len } if b == b'=' => AGENT_VARS
+                    .iter()
+                    .enumerate()
+                    .find(|&(i, var)| candidates & (1 << i) != 0 && var.len() == len)
+                    .map_or(ScanState::Skip, |(i, _)| ScanState::Value(i)),
+                ScanState::Name { candidates, len } => {
+                    let candidates = AGENT_VARS
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, var)| {
+                            candidates & (1 << i) != 0 && var.as_bytes().get(len) == Some(&b)
+                        })
+                        .fold(0, |bits, (i, _)| bits | (1 << i));
+                    if candidates == 0 {
+                        ScanState::Skip
+                    } else {
+                        ScanState::Name {
+                            candidates,
+                            len: len + 1,
+                        }
+                    }
+                }
+                ScanState::Value(i) => {
+                    self.found = Some(self.found.map_or(i, |f| f.min(i)));
+                    ScanState::Skip
+                }
+                ScanState::Skip => ScanState::Skip,
+            };
+        }
+    }
+
+    fn finish(self) -> Option<&'static str> {
+        self.found.and_then(|i| AGENT_VARS.get(i).copied())
+    }
 }
 
 /// The ancestor walk over `/proc` (PLAN-v0.2 4.1).
@@ -277,21 +349,47 @@ fn ancestor_agent() -> Option<Agent> {
 
 #[cfg(target_os = "linux")]
 fn read_proc(pid: u32) -> Option<ProcInfo> {
-    use std::io::Read;
     let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
     let (comm, parent) = parse_stat(&stat)?;
-    // The environment of another process can hold secrets of its own, so
-    // the copy is wiped. A process that secrit cannot read has no variable.
-    let mut environ = zeroize::Zeroizing::new(Vec::new());
+    // A process that secrit cannot read has no variable.
     let var = std::fs::File::open(format!("/proc/{pid}/environ"))
-        .and_then(|f| f.take(MAX_ENVIRON_BYTES).read_to_end(&mut environ))
+        .and_then(read_environ_var)
         .ok()
-        .and_then(|_| environ_var(&environ));
+        .flatten();
     Some(ProcInfo {
         ppid: parent,
         comm,
         var,
     })
+}
+
+/// The first agent variable in an environment block read from `reader`, at
+/// most [`MAX_ENVIRON_BYTES`]. The environment of another process can hold
+/// secrets of its own, so it goes through one fixed buffer that is wiped,
+/// never a buffer that grows (and frees old copies).
+#[cfg(any(target_os = "linux", test))]
+fn read_environ_var(reader: impl std::io::Read) -> std::io::Result<Option<&'static str>> {
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; ENVIRON_CHUNK]);
+    scan_environ(reader, &mut buf)
+}
+
+/// [`read_environ_var`] with the caller's buffer.
+#[cfg(any(target_os = "linux", test))]
+fn scan_environ(
+    reader: impl std::io::Read,
+    buf: &mut [u8],
+) -> std::io::Result<Option<&'static str>> {
+    use std::io::Read;
+    let mut reader = reader.take(MAX_ENVIRON_BYTES);
+    let mut scan = EnvironScan::new();
+    loop {
+        match reader.read(buf) {
+            Ok(0) => return Ok(scan.finish()),
+            Ok(n) => scan.feed(buf.get(..n).unwrap_or(buf)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +521,78 @@ mod tests {
         assert_eq!(Comm::new(b"a\x1bb").to_string(), "a\\x1bb");
     }
 
+    fn environ_var(environ: &[u8]) -> Option<&'static str> {
+        let mut scan = EnvironScan::new();
+        scan.feed(environ);
+        scan.finish()
+    }
+
+    /// The scan in pieces of every size gives the same result as in one
+    /// piece: a name, the `=` or the first value byte can be split across
+    /// pieces.
+    #[test]
+    fn the_environ_scan_does_not_depend_on_the_chunks() {
+        let cases: &[(&[u8], Option<&str>)] = &[
+            (b"HOME=/h\0CLAUDECODE=1\0", Some("CLAUDECODE")),
+            (b"CLAUDECODE=\0AGENT=\0", None),
+            (b"CLAUDECODEX=1\0XCLAUDECODE=1\0CLAUDE=1\0", None),
+            (b"X=CLAUDECODE=1\0=AGENT=1\0", None),
+            (b"OPENCODE_CLIENT=x\0OPENCODE=1", Some("OPENCODE")),
+            (b"COPILOT_CLI=1\0AI_AGENT=1\0", Some("AI_AGENT")),
+            (b"AGENT=", None),
+            (b"AGENT\0CLAUDECODE\0", None),
+        ];
+        for &(environ, want) in cases {
+            for size in 1..=environ.len().max(1) {
+                let mut scan = EnvironScan::new();
+                for chunk in environ.chunks(size) {
+                    scan.feed(chunk);
+                }
+                assert_eq!(scan.finish(), want, "{environ:?} in pieces of {size}");
+                let mut buf = vec![0u8; size];
+                assert_eq!(scan_environ(environ, &mut buf).unwrap(), want);
+            }
+        }
+    }
+
+    /// An entry longer than the buffer: a long name that starts like an
+    /// agent name, a long value of an agent variable, and a long entry before
+    /// an agent variable.
+    #[test]
+    fn an_environ_entry_can_be_longer_than_the_buffer() {
+        let long = [b'x'; 100];
+        let mut buf = [0u8; 4];
+        let with = |parts: &[&[u8]]| parts.concat();
+        let name = with(&[b"CLAUDECODE", &long, b"=1\0"]);
+        assert_eq!(scan_environ(name.as_slice(), &mut buf).unwrap(), None);
+        let value = with(&[b"AGENT=", &long, b"\0"]);
+        assert_eq!(
+            scan_environ(value.as_slice(), &mut buf).unwrap(),
+            Some("AGENT")
+        );
+        let before = with(&[b"A=", &long, b"\0", b"GEMINI_CLI=1\0"]);
+        assert_eq!(
+            scan_environ(before.as_slice(), &mut buf).unwrap(),
+            Some("GEMINI_CLI")
+        );
+    }
+
+    /// The read stops at [`MAX_ENVIRON_BYTES`].
+    #[test]
+    fn the_environ_read_is_capped() {
+        let entry = b"CLAUDECODE=1\0";
+        let cap = usize::try_from(MAX_ENVIRON_BYTES).unwrap();
+        let mut data = vec![0u8; cap - entry.len()];
+        data.extend_from_slice(entry);
+        assert_eq!(
+            read_environ_var(data.as_slice()).unwrap(),
+            Some("CLAUDECODE")
+        );
+        let mut over = vec![0u8; entry.len()];
+        over.extend_from_slice(&data);
+        assert_eq!(read_environ_var(over.as_slice()).unwrap(), None);
+    }
+
     #[test]
     fn environ_names_match_exactly() {
         assert_eq!(environ_var(b"HOME=/h\0CLAUDECODE=1\0"), Some("CLAUDECODE"));
@@ -508,6 +678,45 @@ mod tests {
         };
         assert_eq!(walk(2, None, &counting), None);
         assert_eq!(calls.get(), MAX_ANCESTORS);
+    }
+
+    /// A reader that records the address and the length of every buffer it
+    /// is given.
+    struct Recording<'a> {
+        data: &'a [u8],
+        bufs: Vec<(usize, usize)>,
+    }
+
+    impl std::io::Read for Recording<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.bufs.push((buf.as_ptr().addr(), buf.len()));
+            let n = buf.len().min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// Review S1b-1: a buffer that grows frees its old copy without a wipe.
+    /// The environment of an ancestor is read into one fixed buffer, so
+    /// every read gets the same address and at most [`ENVIRON_CHUNK`] bytes.
+    #[test]
+    fn the_environ_read_uses_one_fixed_buffer() {
+        let mut data = Vec::new();
+        while data.len() < 3 * ENVIRON_CHUNK {
+            data.extend_from_slice(b"SOME_SECRET=0123456789abcdef0123456789abcdef\0");
+        }
+        data.extend_from_slice(b"CLAUDECODE=1\0");
+        let mut reader = Recording {
+            data: &data,
+            bufs: Vec::new(),
+        };
+        assert_eq!(read_environ_var(&mut reader).unwrap(), Some("CLAUDECODE"));
+        let first = reader.bufs[0].0;
+        for &(addr, len) in &reader.bufs {
+            assert_eq!(addr, first, "a read used a second buffer");
+            assert!(len <= ENVIRON_CHUNK, "a read of {len} bytes");
+        }
     }
 
     /// PLAN 8.3: the README lists every variable, so it cannot drift.

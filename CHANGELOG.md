@@ -65,7 +65,11 @@ All notable changes to this project are recorded here. The format follows
 - Agent detection adds `OPENCODE` and `COPILOT_CLI`, and reads the environment of the
   ancestor processes through `/proc` (at most 64 levels). A variable that an agent removes
   only for secrit (`env -u CLAUDECODE secrit ...`) is still found in its shell; the
-  question then names that process. `get` uses the same detection.
+  question then names that process. `get` uses the same detection. Each environment
+  goes through one fixed 64 KiB buffer that is wiped, at most 4 MiB per process. A
+  process reports the environment it had at start, so a long-lived process that started
+  in an agent session (for example a terminal multiplexer server) makes every shell under
+  it an agent. The README says how to find and restart it.
 - `rm` with no terminal and no `--yes` prints the Q19 text above instead of `pass --yes to
   remove without asking`.
 - The `doctor` agent row says what the gate does: `get` and `run --env` are off; every

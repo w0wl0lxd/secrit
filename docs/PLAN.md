@@ -282,7 +282,8 @@ secrit init [--sops-file PATH] [--sops-config PATH] [--age-key PATH] [--write-so
    config does not use. When it does not name the store, print the store's section for the
    user to add.
 6. **Next steps.** On stderr: the `.gitignore` line when the repository does not ignore temp
-   copies, `git -C <repo> add <file>` when the file is untracked (F14), the home-manager hint
+   copies, `git -C <repo> add <file>` when the file is untracked (F14) followed by the
+   reminder to exclude the file from a pre-commit spell checker (Q1), the home-manager hint
    (section 10.3), and `secrit store` then `secrit wire`.
 
 `--dry-run` prints each step as `would: ...` and changes nothing. A signal between steps, or
@@ -356,9 +357,11 @@ bidirectional control in that string is written as `${builtins.fromJSON ''"\uNNN
 never reaches the terminal raw, and Nix still evaluates the string to the same path. The owner must be a plain user name (`a-z`, `0-9`, `_`,
 `-`, at most 32 bytes); the default is `$USER`, then `$LOGNAME`.
 
-The stanza goes to stdout. On stderr, secrit then prints `git -C <repo> add <file>` when the
-file is untracked, and `sudo nixos-rebuild switch --flake <flake>#<host>` with `<flake>` and
-`<host>` from config, each shell-quoted. secrit does not run either command. A name that is
+The stanza goes to stdout. On stderr, secrit then prints the `.gitignore` line (`echo
+'.*.secrit-*.yaml' >> <repo>/.gitignore`) when the repository does not ignore temp copies,
+`git -C <repo> add <file>` when the file is untracked followed by the spell-checker reminder
+(Q1), and `sudo nixos-rebuild switch --flake <flake>#<host>` with `<flake>` and `<host>`
+from config, each shell-quoted. secrit does not run either command. A name that is
 not in the store yet gives a warning, not an error. A signal during the git query exits 130.
 
 `--format env` prints `NAME_FILE=/run/secrets/NAME` instead, with `NAME` upper-cased and
@@ -505,9 +508,12 @@ pub enum PutMode { CreateOnly, Replace }
 - Regex: `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`. This keeps quotes and brackets out of the sops
   path expression `["NAME"]`, so a name cannot address a nested key.
 - Refuse `sops` (reserved by the file format).
-- Refuse names that end with `_unencrypted`, or with any `unencrypted_suffix` from
-  `.sops.yaml`. Refuse names that match its `unencrypted_regex`, or that do not match its
-  `encrypted_regex` when one is set. sops would store such a value in cleartext.
+- Refuse names that end with `_unencrypted`. The file rules come from the store file's own
+  sops metadata, which `sops set` applies, not from `.sops.yaml`: refuse a name that ends
+  with its `unencrypted_suffix`, or that does not end with its `encrypted_suffix` when one is
+  set. sops would store such a value in cleartext. secrit v0.1 does not write a file whose
+  metadata sets `unencrypted_regex` or `encrypted_regex`. `store` checks these rules before
+  it reads the value, and the write protocol checks them again under the lock.
 
 ## 8. Write, read and output rules
 
@@ -554,7 +560,11 @@ the readback and `get` give sops the bytes on stdin instead (SEC-11).
 9. Validate the copy:
    - it parses, and the `sops` block with `mac` and at least one recipient is present;
    - the recipient list equals the original's;
-   - every top-level leaf outside `sops` starts with `ENC[AES256_GCM,`;
+   - every top-level leaf outside `sops` is encrypted: each non-empty string starts with
+     `ENC[`, and no number or boolean is left (sops leaves `null` and an empty string as
+     they are); NAME itself must be an
+     `ENC[AES256_GCM,...,type:str]` string. `store` and `rm` check the other entries before
+     they read a value or ask (exit 3);
    - the set of names equals the old set plus NAME (`store`) or minus NAME (`rm`);
    - every other entry has the same parsed value as before (not a byte compare);
    - for `store`, decrypt only NAME from the copy's bytes (`decrypt --extract '["NAME"]'
@@ -794,7 +804,8 @@ caret requirements at these versions; `Cargo.lock` is committed.
 | thiserror | 2.0.21 | error types |
 
 Later, with the command that needs it: `base64` (masking patterns for `run`), the rustix `mm`
-feature (memfd for `run`; `mlock` waits on Q14), `insta` (snapshots for `wire` and `doctor`).
+feature (memfd for `run`; `mlock` waits on Q14). `insta` is not used: the `wire` and
+`doctor` tests assert exact lines and `--json` rows instead (section 15.3).
 
 Dev: tempfile 3.27.0. The integration tests drive the binary with `std::process::Command`,
 so `assert_cmd`, `assert_fs` and `predicates` are not used.
@@ -832,7 +843,7 @@ A4 concurrent writers; A5 the stuck-process reaper and the OOM killer.
 | T10 | Torn file after a kill mid-write (A5) | Edit a copy; defer signals; sops in its own process group; bounded child runs; rename (8.1) | SIGKILL secrit at a test hook between steps 8 and 12: original byte-identical |
 | T11 | Symlink or hard-link swap of the target (A1, A2) | `O_NOFOLLOW`, owner and mode checks, link count 1, dir-fd relative ops (8.1) | Symlinked target refused; hard-linked target refused |
 | T12 | Accidental overwrite | `--replace` required; ciphertext backup (4.1) | Second `store` of a name exits 3; `--replace` makes a 0600 backup |
-| T13 | Value stored in cleartext by `.sops.yaml` rules | Name rules (7.3); validation that every leaf is `ENC[` (8.1) | Name `x_unencrypted` refused; `.sops.yaml` with `unencrypted_regex` that matches refused |
+| T13 | Value stored in cleartext by `.sops.yaml` rules | Name rules (7.3); validation that every leaf is `ENC[` (8.1) | Name `x_unencrypted` refused; a store file whose metadata sets `unencrypted_regex` refuses every store; a cleartext entry already in the file fails validation |
 | T14 | Wrong recipients (for example the otherhost key in a myhost file) | Always `--config`; recipient list compared before rename (8.1, F10) | Copy run from a directory with a different `.sops.yaml`: recipients unchanged |
 | T15 | Name injection into the sops path expression | Name regex excludes quotes and brackets (7.3) | `a"]["b` refused |
 | T16 | Value stored as a non-string type | Always a JSON string (7.2, F5) | Store `123`, decrypt in the test: type is string |
@@ -849,7 +860,8 @@ A4 concurrent writers; A5 the stuck-process reaper and the OOM killer.
 
 ## 14. Error handling
 
-- `thiserror` enums per module; `anyhow` only in `main`.
+- `thiserror` enums per module; `main` maps the typed errors to exit codes (no `anyhow`,
+  section 12).
 - Every error message names the file, the name and the step. None holds a value.
 - Exit codes as in section 4.
 
@@ -900,8 +912,11 @@ Each row of the threat table with a test, plus:
 - `store`, `ls`, `rm` round trip; `ls` works with no key present (proves no decryption).
 - `run --file` and `run --env`, exit-code passthrough, signal forwarding.
 - `get --stdout` to a pipe returns the exact bytes; `get` with no TTY is refused.
-- `wire` output snapshot (`insta`).
-- `doctor` on a broken setup reports each failure (`insta` snapshot with paths filtered).
+- `wire` output: an exact compare of stdout with no Nix setup, and an assertion on each
+  stderr hint line.
+- `doctor` on a broken setup reports each failure: one sub-case per failing check, across
+  the doctor tests, with assertions
+  on the `--json` rows (status and check name) instead of an `insta` snapshot.
 
 ### 15.4 Fault injection
 

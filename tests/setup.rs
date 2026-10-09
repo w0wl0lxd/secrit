@@ -461,6 +461,31 @@ fn wire_prints_the_stanza_and_the_commands() {
         )),
         "{err}"
     );
+    // A-6 and B-4: the ignore line and the spell-checker reminder.
+    let ignore_line = format!(
+        "then run: echo '.*.secrit-*.yaml' >> {}\n",
+        repo.join(".gitignore").display()
+    );
+    assert!(err.contains(&ignore_line), "{err}");
+    assert!(
+        err.contains(&format!(
+            "then: if a pre-commit spell checker (such as typos) runs in {}, exclude secrets/main.yaml from it; ciphertext can fail it",
+            repo.display()
+        )),
+        "{err}"
+    );
+
+    std::fs::write(repo.join(".gitignore"), ".*.secrit-*.yaml\n").unwrap();
+    git(&env, repo, &["add", ".gitignore", "secrets/main.yaml"]);
+    let mut cmd = with_git(&env);
+    cmd.env("USER", "bob");
+    let out = run_cmd(cmd, ["wire", "gh-token"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(!err.contains("then run: echo"), "{err}");
+    assert!(!err.contains("git -C"), "{err}");
+    assert!(!err.contains("spell checker"), "{err}");
+    assert!(err.contains("then run: sudo nixos-rebuild"), "{err}");
 }
 
 #[test]
@@ -568,7 +593,8 @@ fn init_sets_up_a_fresh_machine_once() {
     let out = f.secrit(&env, &["ls"], None);
     assert_eq!(stdout(&out), "first\n");
 
-    // A second run changes nothing.
+    // A second run changes nothing, not even a key mode the user set (T23).
+    std::fs::set_permissions(&f.key, std::fs::Permissions::from_mode(0o400)).unwrap();
     let before: Vec<Vec<u8>> = [&f.key, &f.file, &f.config, &rule]
         .iter()
         .map(|p| std::fs::read(p).unwrap())
@@ -581,6 +607,7 @@ fn init_sets_up_a_fresh_machine_once() {
         .map(|p| std::fs::read(p).unwrap())
         .collect();
     assert!(before == after, "a second init changed a file");
+    assert_eq!(std::fs::metadata(&f.key).unwrap().mode() & 0o7777, 0o400);
 }
 
 #[test]
@@ -635,12 +662,256 @@ fn init_in_a_repository_prints_the_git_steps() {
         "the rule goes to the repository root"
     );
     let err = stderr(&out);
-    assert!(err.contains("next: ignore temp copies"), "{err}");
     assert!(
         err.contains(&format!(
-            "next: git -C {} add secrets/s.yaml",
+            "next: ignore temp copies: echo '.*.secrit-*.yaml' >> {}\n",
+            repo.join(".gitignore").display()
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "next: git -C {} add secrets/s.yaml\n",
             repo.display()
         )),
         "{err}"
     );
+    assert!(
+        err.contains(&format!(
+            "next: if a pre-commit spell checker (such as typos) runs in {}, exclude secrets/s.yaml from it; ciphertext can fail it\n",
+            repo.display()
+        )),
+        "{err}"
+    );
+}
+
+/// B-1: with a config that does not name the store, init prints only the
+/// store's table. Appended to the config as told, it loads.
+#[test]
+fn init_prints_a_section_that_loads() {
+    let env = TestEnv::new();
+    let other = env.store_dir.join("other.yaml");
+    let out = env.run(
+        [
+            "init",
+            "--store",
+            "other",
+            "--sops-file",
+            other.to_str().unwrap(),
+            "--age-key",
+            env.key_file.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(other.is_file(), "init creates the store file");
+    let section = stdout(&out);
+    assert!(section.starts_with("[stores.other]\n"), "{section}");
+    assert!(!section.contains("default_store"), "{section}");
+    let mut config = std::fs::read_to_string(&env.config_file).unwrap();
+    config.push('\n');
+    config.push_str(&section);
+    std::fs::write(&env.config_file, config).unwrap();
+    assert_eq!(code(&env.store_value("n", b"v\n")), 0);
+    let out = env.run(["ls", "--store", "other"], None);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let out = env.run(["store", "--store", "other", "x"], Some(b"v\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(env.ls(), ["n"], "the default store is still main");
+}
+
+/// C-3 and D-4 (T23): init keeps a key that the user made, with its bytes
+/// and its mode, and makes no other file next to it.
+#[test]
+fn init_keeps_an_existing_key() {
+    let env = TestEnv::new();
+    let f = Fresh::new(&env, "ownkey");
+    std::fs::create_dir_all(f.key.parent().unwrap()).unwrap();
+    let st = Command::new(&env.age_keygen)
+        .env_clear()
+        .arg("-o")
+        .arg(&f.key)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(st.success());
+    std::fs::set_permissions(&f.key, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let bytes = std::fs::read(&f.key).unwrap();
+
+    let out = f.run(&env, &["--write-sops-config"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("exists; unchanged"), "{err}");
+    assert!(!err.contains("back up"), "{err}");
+    assert_eq!(std::fs::read(&f.key).unwrap(), bytes);
+    assert_eq!(std::fs::metadata(&f.key).unwrap().mode() & 0o7777, 0o400);
+    let names: Vec<_> = std::fs::read_dir(f.key.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [std::ffi::OsString::from("keys.txt")]);
+    assert!(f.file.is_file());
+}
+
+/// D-3: `secrit init --sops-file ...` with no `--age-key` and no
+/// `SECRIT_CONFIG` uses the default paths under `XDG_CONFIG_HOME`.
+#[test]
+fn init_uses_the_default_paths_on_an_empty_home() {
+    let env = TestEnv::new();
+    let home = env.root.path().join("empty-home");
+    let xdg = home.join(".config");
+    std::fs::create_dir_all(&home).unwrap();
+    let file = env
+        .root
+        .path()
+        .join("fresh")
+        .join("repo")
+        .join("secrets")
+        .join("s.yaml");
+    let cmd = || {
+        let mut c = with_git(&env);
+        c.env_remove("SECRIT_CONFIG")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg);
+        c
+    };
+    let init = || {
+        run_cmd(
+            cmd(),
+            [
+                "init",
+                "--sops-file",
+                file.to_str().unwrap(),
+                "--write-sops-config",
+            ],
+            None,
+        )
+    };
+    let out = init();
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let key = xdg.join("sops").join("age").join("keys.txt");
+    let config = xdg.join("secrit").join("config.toml");
+    for p in [&key, &config] {
+        assert_eq!(std::fs::metadata(p).unwrap().mode() & 0o777, 0o600, "{p:?}");
+    }
+    assert!(file.is_file());
+    assert!(file.parent().unwrap().join(".sops.yaml").is_file());
+    assert!(
+        !stderr(&out).contains("using config"),
+        "no variable picked the config: {}",
+        stderr(&out)
+    );
+
+    let out = run_cmd(cmd(), ["store", "first"], Some(b"value\n"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = run_cmd(cmd(), ["ls"], None);
+    assert_eq!(stdout(&out), "first\n", "{}", stderr(&out));
+
+    let before: Vec<Vec<u8>> = [&key, &config, &file]
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    let again = init();
+    assert_eq!(code(&again), 0, "{}", stderr(&again));
+    let after: Vec<Vec<u8>> = [&key, &config, &file]
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert!(before == after, "a second init changed a file");
+}
+
+/// `doctor --json` and its rows.
+fn doctor_rows(env: &TestEnv) -> (Output, Vec<(String, String)>) {
+    let out = env.run(["doctor", "--json"], None);
+    let r = rows(&out);
+    (out, r)
+}
+
+/// B-3 and D-5: the directory, file, .sops.yaml, backups and sops checks of
+/// PLAN 4.7 each fail on their own broken item, and doctor exits 1. No value
+/// reaches the output. `doctor_reports_each_problem` covers the age key,
+/// plaintext, temp file and cleartext rule rows.
+#[test]
+fn doctor_fails_each_store_check() {
+    let mode = |p: &Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    let expect_fail = |env: &TestEnv, check: &str, what: &str| {
+        let (out, r) = doctor_rows(env);
+        assert_eq!(code(&out), 1, "{what}: {}{}", stdout(&out), stderr(&out));
+        assert!(
+            status_of(&r, check).contains(&"fail"),
+            "{what}: {check}: {r:?}"
+        );
+        assert!(!stdout(&out).contains("secret-value"), "{what}");
+        assert!(!stderr(&out).contains("secret-value"), "{what}");
+    };
+    let fresh = || {
+        let env = TestEnv::new();
+        assert_eq!(code(&env.store_value("n", b"secret-value\n")), 0);
+        env
+    };
+
+    let env = fresh();
+    mode(&env.store_dir, 0o775);
+    expect_fail(&env, "store main: directory", "group-writable directory");
+    mode(&env.store_dir, 0o755);
+
+    let env = fresh();
+    let real = env.root.path().join("real.yaml");
+    std::fs::rename(&env.store_file, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &env.store_file).unwrap();
+    expect_fail(&env, "store main: file", "symlinked store file");
+
+    let env = fresh();
+    std::fs::hard_link(&env.store_file, env.root.path().join("link.yaml")).unwrap();
+    expect_fail(&env, "store main: file", "hard-linked store file");
+
+    let env = fresh();
+    mode(&env.store_file, 0o666);
+    expect_fail(&env, "store main: file", "store file mode 0666");
+
+    let env = fresh();
+    std::fs::write(&env.store_file, "a: b\n").unwrap();
+    expect_fail(&env, "store main: file", "not sops YAML");
+
+    let env = fresh();
+    std::fs::remove_file(&env.store_file).unwrap();
+    expect_fail(&env, "store main: file", "missing store file");
+
+    let env = fresh();
+    mode(&env.sops_config, 0o666);
+    expect_fail(&env, "store main: .sops.yaml", ".sops.yaml mode 0666");
+
+    // The first store made a backup directory only on a replace.
+    let env = fresh();
+    assert_eq!(
+        code(&env.run(["store", "--replace", "n"], Some(b"secret-value2\n"))),
+        0
+    );
+    let dirs: Vec<PathBuf> = std::fs::read_dir(env.backup_root())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(dirs.len(), 1);
+    mode(&dirs[0], 0o755);
+    expect_fail(&env, "store main: backups", "backup directory mode 0755");
+    mode(&dirs[0], 0o700);
+    let moved = env.root.path().join("moved-backups");
+    std::fs::rename(&dirs[0], &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &dirs[0]).unwrap();
+    expect_fail(&env, "store main: backups", "symlinked backup directory");
+
+    let env = fresh();
+    let old = env.script(
+        "sops-old",
+        "for a in \"$@\"; do [ \"$a\" = --version ] && { echo 'sops 3.10.0'; exit 0; }; done\nexit 1",
+    );
+    env.write_config_with(&old, "");
+    expect_fail(&env, "sops version", "sops 3.10");
+
+    let env = fresh();
+    env.write_config_with(&env.root.path().join("no-such-sops"), "");
+    expect_fail(&env, "sops", "missing configured sops");
 }

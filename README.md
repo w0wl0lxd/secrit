@@ -19,9 +19,15 @@ Read this first.
 - **Secret names are not secret.** sops keeps key names in cleartext, in the file and in
   git history. `secrit ls` prints them without a key.
 - **Copies outside secrit.** sops (a Go program) holds the value in memory that secrit
-  cannot wipe. A value that a program prints, logs or sends is out of secrit's control.
-  secrit does not lock its own buffers into memory (`mlock`) in v0.1, so a value can reach
-  swap; it keeps values small and wipes its buffers.
+  cannot wipe. sops runs as a separate program: after exec it is dumpable again, so
+  `PR_SET_DUMPABLE=0` covers secrit, not sops, and a process of your user can read the
+  memory of sops while it runs. A value that a program prints, logs or sends is out of
+  secrit's control. secrit does not lock its own buffers into memory (`mlock`) in v0.1, so
+  a value can reach swap; it keeps values small and wipes its buffers.
+- **The screen.** While `secrit get` shows a value, any program that can read the screen
+  can read it too: for example Kitty remote control, a screen recorder or a screen share.
+- **No clipboard in v0.1.** secrit has no clipboard support: clipboard history daemons
+  keep values on disk. Use `get --stdout` into a pipe instead.
 - **Old values.** `rm` and `store --replace` keep a ciphertext backup in
   `$XDG_STATE_HOME/secrit/backups/` (default `~/.local/state/secrit/backups/`), the newest
   10 per store. Git history, backups and rendered `/run/secrets` copies keep old values.
@@ -189,6 +195,7 @@ secrit ls                              # names only; decrypts nothing
 secrit ls --json
 
 secrit get github-token                # shows it on the alternate screen; any key clears it
+                                       # (a screen reader or recorder can see it too)
 secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused on a terminal
 
 secrit rm github-token                 # asks on the terminal; --yes to skip
@@ -229,8 +236,9 @@ keeps the files of the steps it finished; run it again to finish the setup.
   file whose sops metadata has `unencrypted_regex` or `encrypted_regex`.
 - **Values** are UTF-8 text up to 64 KiB, with no control characters except tab (and
   newline with `--multiline` or `--raw`). They are always stored as strings.
-- **Agents.** When a coding-agent variable is set (`CLAUDECODE`, `CODEX_SANDBOX`, and
-  others in `src/agent.rs`), `get` is refused. There is no override: an agent can set any
+- **Agents.** When a coding-agent variable is set and not empty (`CLAUDECODE`,
+  `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`,
+  `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE` or `OPENCODE_CLIENT`), `get` is refused. There is no override: an agent can set any
   variable. With no terminal at all (`/dev/tty` cannot be opened, as in cron or
   `ssh -T`), `get` is also refused. `store`, `ls` and `rm --yes` work.
 - **Terminal output.** `get` never writes a control character from the value to the
@@ -238,15 +246,17 @@ keeps the files of the steps it finished; run it again to finish the setup.
 - **The write protocol.** secrit takes a lock in `$XDG_RUNTIME_DIR/secrit/`, copies the
   ciphertext to a temp file in the same directory, runs `sops set` on the copy, checks
   the copy (recipients and sops settings unchanged, every other entry unchanged (same
-  parsed value), the new entry an encrypted string, the value decrypts back equal), and
+  parsed value), every entry encrypted, the new entry an encrypted string, the value
+  decrypts back equal), and
   renames the copy over the file. A crash leaves the original intact. A symlinked or
   hard-linked store file, a store file writable by group or others, and a store directory
   writable by group or others (unless sticky) are refused.
 - **sops runs are bounded.** sops runs in its own process group with a cleared
   environment. secrit stops it when it waits for a terminal, after 120 seconds, or on
   SIGINT, SIGTERM, SIGHUP or SIGQUIT, and never leaves it running.
-- **Process hardening.** No core dumps, not dumpable (`PR_SET_DUMPABLE=0`), umask 077, a
-  panic hook that prints no payload, and `panic = "abort"` in release builds.
+- **Process hardening.** No core dumps, secrit itself is not dumpable
+  (`PR_SET_DUMPABLE=0`), umask 077, a panic hook that prints no payload, and
+  `panic = "abort"` in release builds. This covers secrit only, not the sops child.
 
 Known limit: a raw `sops set` or `sops edit` on the same file does not take secrit's lock.
 secrit detects a change that lands before its rename and retries (at most 3 times), but
@@ -262,6 +272,7 @@ not one that lands after it.
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
 | `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
+| `--clip` (clipboard) | Not in v0.1 | v0.2, optional (Q4) |
 
 ## Develop
 

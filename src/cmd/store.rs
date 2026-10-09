@@ -1,7 +1,7 @@
 //! `secrit store NAME` (PLAN section 4.1).
 
 use super::{Ctx, StoreArgs};
-use crate::backend::{BackendError, PutMode};
+use crate::backend::PutMode;
 use crate::cli::ARGV_VALUE_MESSAGE;
 use crate::error::Error;
 use crate::name::Name;
@@ -17,21 +17,20 @@ pub fn check_argv(args: &StoreArgs) -> Result<(), Error> {
 }
 
 pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
-    // Check before the prompt, so nobody types a value that will be refused.
-    // The write protocol checks again under the lock.
-    if !args.replace && ctx.backend.exists(name)? {
-        return Err(BackendError::Exists(name.clone()).into());
-    }
-    let mode = InputMode {
-        multiline: args.multiline || args.raw,
-        raw: args.raw,
-    };
-    let value = read_value(name, mode)?;
     let put_mode = if args.replace {
         PutMode::Replace
     } else {
         PutMode::CreateOnly
     };
+    // Check before the prompt (the name is free, and the file's rules would
+    // encrypt it), so nobody types a value that will be refused. The write
+    // protocol checks again under the lock.
+    ctx.backend.check_put(name, put_mode)?;
+    let mode = InputMode {
+        multiline: args.multiline || args.raw,
+        raw: args.raw,
+    };
+    let value = read_value(name, mode)?;
     let report = ctx.backend.put(name, &value, put_mode)?;
     drop(value);
     if let Some(b) = &report.backup {

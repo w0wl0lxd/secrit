@@ -203,9 +203,14 @@ pub fn check(args: RunArgs) -> Result<Plan, Error> {
 }
 
 fn refusal(r: Refusal) -> Error {
-    let why = |a: Agent| match a {
-        Agent::NoTty => "there is no terminal (/dev/tty cannot be opened)".to_owned(),
-        a @ Agent::Variable(_) => format!("an agent was detected ({a})"),
+    // No `match` on `Agent`: a new way to detect an agent needs no change
+    // here, and its `Display` text gives the reason.
+    let why = |a: Agent| {
+        if a == Agent::NoTty {
+            "there is no terminal (/dev/tty cannot be opened)".to_owned()
+        } else {
+            format!("an agent was detected ({a})")
+        }
     };
     Error::Refused(match r {
         Refusal::Env(a) => format!(
@@ -378,5 +383,23 @@ mod tests {
         assert!(e.to_string().contains("--file"), "{e}");
         assert!(e.to_string().contains("CLAUDECODE is set"), "{e}");
         assert!(matches!(e, Error::Refused(_)));
+    }
+
+    /// With no terminal the refusal says so. Every other reason is an
+    /// agent, named by its `Display` text.
+    #[test]
+    fn the_refusal_names_the_reason() {
+        for r in [Refusal::Env(Agent::NoTty), Refusal::NoMask(Agent::NoTty)] {
+            let text = refusal(r).to_string();
+            assert!(text.contains("there is no terminal"), "{text}");
+            assert!(!text.contains("an agent was detected"), "{text}");
+        }
+        let agent = Agent::Variable("CODEX_THREAD_ID");
+        let text = refusal(Refusal::NoMask(agent)).to_string();
+        assert!(
+            text.contains(&format!("an agent was detected ({agent})")),
+            "{text}"
+        );
+        assert!(text.contains("--no-mask"), "{text}");
     }
 }

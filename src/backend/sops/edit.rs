@@ -104,13 +104,18 @@ impl SopsBackend {
     /// A name that holds other names is refused: a write or a remove of it
     /// would replace or drop them all. For a put (`put`), a path through a
     /// value that is not a map is refused too (T49); for a remove, that
-    /// name does not exist. Must not decrypt.
+    /// name does not exist. A put first refuses a name that the format
+    /// cannot hold: that rule does not depend on the file. Must not
+    /// decrypt.
     pub(super) fn check_path(
         &self,
         name: &Name,
         entries: &Map<String, Value>,
         put: bool,
     ) -> Result<bool, BackendError> {
+        if put {
+            self.format.check_name(name)?;
+        }
         let path: Vec<&str> = name.segments().collect();
         match lookup(entries, &path) {
             Slot::Missing => Ok(false),

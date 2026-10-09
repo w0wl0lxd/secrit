@@ -11,7 +11,8 @@
 //! The rules of a store format (the reserved `sops` key, the suffix rules)
 //! are not here: each backend checks them in `check_put` (v0.2 plan 5.4).
 //! The grammar of a format that is narrower than a key path is here, as
-//! [`Name::check_dotenv`]; the backend still decides when it applies.
+//! [`Name::check_dotenv`] and [`Name::check_ini`]; the backend still
+//! decides when it applies.
 
 use std::fmt;
 
@@ -73,6 +74,14 @@ pub enum NameError {
         "NAME starts with '{DOTENV_METADATA_PREFIX}', and sops reads each '{DOTENV_METADATA_PREFIX}' line of a dotenv file as its own metadata"
     )]
     MetadataPrefix,
+    #[error(
+        "NAME must be 'section/key' in an INI store: two segments, and each one starts with a letter or '_' and has only A-Z, a-z, 0-9 and '_'"
+    )]
+    NotSectionKey,
+    #[error(
+        "NAME is in the section '{RESERVED}', and sops keeps its own metadata in that section of an INI file"
+    )]
+    ReservedSection,
 }
 
 /// Whether `s` is a variable name: `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, the
@@ -170,6 +179,26 @@ impl Name {
         }
         if !is_variable(&self.0) {
             return Err(NameError::NotVariable);
+        }
+        Ok(())
+    }
+
+    /// The INI rule (v0.2 plan 5.4): exactly two segments, `section/key`,
+    /// each one a variable name. The section is not `sops`: sops reads
+    /// that section as its metadata. sops 3.13.3 refuses a `set` of one
+    /// segment, and a `set` of three writes a value that it cannot read
+    /// back (S6b lab).
+    pub fn check_ini(&self) -> Result<(), NameError> {
+        let mut segments = self.segments();
+        let (Some(section), Some(key), None) = (segments.next(), segments.next(), segments.next())
+        else {
+            return Err(NameError::NotSectionKey);
+        };
+        if section == RESERVED {
+            return Err(NameError::ReservedSection);
+        }
+        if !is_variable(section) || !is_variable(key) {
+            return Err(NameError::NotSectionKey);
         }
         Ok(())
     }
@@ -355,6 +384,32 @@ mod tests {
             assert_eq!(e, NameError::NotVariable, "{bad}");
             assert!(!e.to_string().contains(bad), "{e}");
         }
+    }
+
+    /// v0.2 plan 5.4: an INI name is `section/key`, each one a variable
+    /// name, and the section is not `sops`. The error never repeats the
+    /// name.
+    #[test]
+    fn the_ini_rule_takes_a_section_and_a_key() {
+        let check = |s: &str| Name::parse(s).unwrap().check_ini();
+        for ok in [
+            "s/k",
+            "DEFAULT/k",
+            "app/sops",
+            "SOPS/k",
+            "sops_x/k",
+            "A1/b_2",
+        ] {
+            assert_eq!(check(ok), Ok(()), "{ok}");
+        }
+        for bad in ["Zq9", "a/b/c", "a.b/k", "s/a-b", "0s/k", "s/0k", "s/a.b"] {
+            let e = check(bad).unwrap_err();
+            assert_eq!(e, NameError::NotSectionKey, "{bad}");
+            assert!(!e.to_string().contains(bad), "{e}");
+        }
+        assert_eq!(check("sops/k"), Err(NameError::ReservedSection));
+        assert_eq!(check("sops/mac"), Err(NameError::ReservedSection));
+        assert_eq!(check("sops"), Err(NameError::NotSectionKey));
     }
 
     #[test]

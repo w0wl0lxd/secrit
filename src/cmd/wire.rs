@@ -66,11 +66,21 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
 fn sops_file(ctx: &Ctx, name: &Name) -> Result<(PathBuf, SopsFormat, Option<Name>), Error> {
     match ctx.backend.wire_source(name) {
         Some(WireSource::SopsFile { file, format, key }) => Ok((file, format, key)),
-        Some(WireSource::WholeSopsFile { file, format }) => Err(Error::Refused(format!(
-            "sops-nix gives a {} file to a consumer only as one whole file, so it cannot put '{name}' alone at /run/secrets/{name}. A program can read the store with: sops exec-env {} 'COMMAND'",
-            format.name(),
-            shell_path(&file)
-        ))),
+        Some(WireSource::WholeSopsFile { file, format }) => {
+            let file = shell_path(&file);
+            // The S6b lab did not confirm `sops exec-env` on an INI file,
+            // so the message for that format names `sops decrypt`.
+            let read = match format {
+                SopsFormat::Ini => format!("sops decrypt {file}"),
+                SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Dotenv => {
+                    format!("sops exec-env {file} 'COMMAND'")
+                }
+            };
+            Err(Error::Refused(format!(
+                "sops-nix gives a {} file to a consumer only as one whole file, so it cannot put '{name}' alone at /run/secrets/{name}. A program can read the store with: {read}",
+                format.name()
+            )))
+        }
         None => Err(Error::Refused(format!(
             "store '{}' has no sops file for sops-nix to read, and every wire format needs one",
             ctx.store.name

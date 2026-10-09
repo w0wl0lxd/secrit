@@ -316,32 +316,45 @@ fn a_store_in_another_format_is_refused_and_unchanged() {
     }
 }
 
-/// v0.2 plan 5.8: with no `format`, sops reads an `.ini` file as INI,
-/// which this secrit does not support yet. Every command on such a store
-/// exits 3 and leaves the file unchanged.
+/// v0.2 plan 5.8: with no `format`, sops reads an `.ini` file as INI, and
+/// so does secrit. A file with that name that is not a sops INI file is
+/// not rewritten: `store` and `rm` exit 3, `ls` exits 1, and the file is
+/// unchanged.
 #[test]
-fn an_ini_store_is_refused() {
-    for (file, said) in [("main.ini", "INI"), ("MAIN.INI", "INI")] {
+fn an_ini_name_that_holds_no_sops_ini_file_is_refused() {
+    for file in ["main.ini", "MAIN.INI"] {
         let mut env = TestEnv::new();
         env.store_file = env.store_dir.join(file);
         std::fs::write(&env.store_file, "old=ENC[x]\n").unwrap();
         chmod(&env.store_file, 0o600);
         env.write_config("");
-        for args in [&["store", "n"][..], &["ls"], &["rm", "--yes", "old"]] {
-            let out = env.run(args, Some(b"v"));
+        for args in [&["store", "s/n"][..], &["rm", "--yes", "DEFAULT/old"]] {
+            let out = env.run(args, Some(b"canary-ini-1"));
             assert_eq!(code(&out), 3, "{file} {args:?}: {}", stderr(&out));
-            assert!(stderr(&out).contains(said), "{file}: {}", stderr(&out));
+            assert!(
+                stderr(&out).contains("it is not a sops INI file"),
+                "{file}: {}",
+                stderr(&out)
+            );
+            common::assert_absent(&out, "canary-ini-1");
         }
-        // doctor shows the refusal as a fail row of the store.
+        let out = env.run(["ls"], None);
+        assert_eq!(code(&out), 1, "{file}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("sops INI file"),
+            "{file}: {}",
+            stderr(&out)
+        );
+        // doctor shows the store as a fail row.
         let out = env.run(["doctor"], None);
         let text = String::from_utf8_lossy(&out.stdout);
         assert_ne!(code(&out), 0, "{text}");
         assert!(
-            text.lines()
-                .any(|l| l.starts_with("fail  store main") && l.contains(said)),
+            text.lines().any(|l| l.starts_with("fail  store main")),
             "{file}: {text}"
         );
         assert_eq!(env.store_bytes(), b"old=ENC[x]\n");
+        assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
     }
 }
 

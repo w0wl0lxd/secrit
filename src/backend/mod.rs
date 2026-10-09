@@ -102,7 +102,7 @@ pub enum WireSource {
         key: Option<Name>,
     },
     /// A sops file that sops-nix gives to a consumer only as one whole
-    /// file (dotenv), so `wire` cannot expose one name of it.
+    /// file (dotenv, INI), so `wire` cannot expose one name of it.
     WholeSopsFile { file: PathBuf, format: SopsFormat },
 }
 

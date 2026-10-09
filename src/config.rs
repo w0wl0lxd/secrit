@@ -605,9 +605,8 @@ timeout_secs = 5
         }
     }
 
-    /// The `format` key of a sops store takes `yaml`, `json` or `dotenv`
-    /// (v0.2 plan 5.8). A format that secrit does not support yet is
-    /// refused at its own line.
+    /// The `format` key of a sops store takes `yaml`, `json`, `dotenv` or
+    /// `ini` (v0.2 plan 5.8). Any other value is refused at its own line.
     #[test]
     fn the_sops_format_key_is_checked() {
         let head = "[stores.a]\nbackend = \"sops\"\nfile = \"/s.sops\"\n";
@@ -615,13 +614,14 @@ timeout_secs = 5
             ("yaml", Some(SopsFormat::Yaml)),
             ("json", Some(SopsFormat::Json)),
             ("dotenv", Some(SopsFormat::Dotenv)),
+            ("ini", Some(SopsFormat::Ini)),
         ] {
             let c = parse(&format!("{head}format = \"{value}\"\n")).unwrap();
             assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, want);
         }
         let c = parse(head).unwrap();
         assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, None);
-        for value in ["\"env\"", "\"ini\"", "\"JSON\"", "5"] {
+        for value in ["\"env\"", "\"binary\"", "\"INI\"", "\"JSON\"", "5"] {
             let e = parse(&format!("{head}format = {value}\n")).unwrap_err();
             assert!(matches!(e, ConfigError::Parse { .. }), "{value}");
             assert!(e.to_string().contains("line 4, column 10"), "{value}: {e}");

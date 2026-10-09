@@ -91,7 +91,7 @@ default_store = "main"
 [stores.main]
 backend = "sops"                              # v0.1: only "sops"
 file = "/etc/nixos/secrets/secrit.yaml"       # an existing sops file
-format = "yaml"                               # optional: "yaml", "json" or "dotenv"; default: from the file name
+format = "yaml"                               # optional: "yaml", "json", "dotenv" or "ini"; default: from the file name
 sops_config = "/etc/nixos/.sops.yaml"         # optional; default: nearest .sops.yaml upward from `file`
 age_key_file = "~/.config/sops/age/keys.txt"  # optional; default: $XDG_CONFIG_HOME/sops/age/keys.txt
 
@@ -102,12 +102,11 @@ sops = "auto"        # "auto" = baked-in path, else PATH; or an absolute path
 timeout_secs = 30
 ```
 
-**Format.** A sops store is YAML, JSON or dotenv. With no `format`, a file name that ends
-in `.json` means JSON, a name that ends in `.env` means dotenv, and any other name means
-YAML. secrit refuses a file name that sops reads as INI (`.ini`), because it does not
-support that format yet. Every sops run names the store's format, and `store` and `rm`
-refuse (exit 3) a file whose content or name does not match it, so a write never rewrites
-a store in another format.
+**Format.** A sops store is YAML, JSON, dotenv or INI. With no `format`, a file name that
+ends in `.json` means JSON, a name that ends in `.env` means dotenv, a name that ends in
+`.ini` means INI, and any other name means YAML. Every sops run names the store's format,
+and `store` and `rm` refuse (exit 3) a file whose content or name does not match it, so a
+write never rewrites a store in another format.
 
 **Dotenv stores.** A dotenv store holds one `NAME=value` line for each name. A name is a
 variable name: a letter, then letters, digits and `_`. It has no `/`, `.` or `-`, and it
@@ -116,6 +115,19 @@ refuses any other name with exit 3 before it reads a value. A value keeps its ex
 bytes, and a newline in it is stored as `\n` on one line. `sops exec-env FILE 'COMMAND'`
 runs a command with the values as environment variables. sops-nix gives a dotenv file to
 a consumer only as one whole file, so `secrit wire` refuses a dotenv store.
+
+**INI stores.** An INI store holds `[section]` headers and one `KEY = value` line for each
+name. A name is `section/key`: exactly two segments, and each one is a variable name as in
+a dotenv store. The section cannot be `sops`, because sops keeps its own data in that
+section. secrit refuses any other name with exit 3 before it reads a value. The keys
+before the first header are in the section `DEFAULT`. `rm` of the last key of a section
+removes the section. sops aligns the `=` signs of a section again when a longer key
+arrives, so those lines change; their encrypted values do not. `store` and `rm` refuse a
+file with a line that the INI reader of sops reads in a special way: a quoted value, a
+`:` separator, an inline comment, a line that ends in `\`, an indented line, a `[DEFAULT]`
+header, a section twice or a key twice. `sops decrypt --extract '["section"]["key"]' FILE`
+prints one value. sops-nix gives an INI file to a consumer only as one whole file, so
+`secrit wire` refuses an INI store.
 
 Paths must be absolute or start with `~/`. A configured `tools.sops` and the `.sops.yaml`
 must be owned by you, root or the Nix store, and neither the file nor its directory may be
@@ -143,7 +155,7 @@ config, and prints the `.gitignore` and `git add` steps. It never edits an exist
 `.sops.yaml`: when no rule covers the file, it prints one and exits 1. With
 `--write-sops-config` it creates a `.sops.yaml` when there is none. The example uses
 `/etc/nixos/secrets/secrit.yaml`; any directory that you own and that group and others
-cannot write works. `--format yaml|json|dotenv` sets the store format and writes it to the config
+cannot write works. `--format yaml|json|dotenv|ini` sets the store format and writes it to the config
 as `format`; without it, the file name picks the format. `--format` that does not match
 the file name (`--format json` for a `.yaml` file) exits 3 before init makes a file.
 
@@ -263,7 +275,8 @@ keeps the files of the steps it finished; run it again to finish the setup.
   `encrypted_suffix`, a name with no segment that ends with it. sops tests each key on
   the path, and secrit does the same. secrit does not write a file whose sops metadata
   has `unencrypted_regex` or `encrypted_regex`.
-- **Nested names** (YAML and JSON stores; a dotenv store refuses them). `secrit store
+- **Nested names** (YAML and JSON stores; a dotenv store refuses them, and an INI store
+  takes `section/key` only). `secrit store
   a/b/c` writes the key `c` in the
   map `b` in the map `a`, and creates the maps that are missing. `store` refuses (exit 3,
   before it reads a value) a path through a value that is not a map, such as `a/b` when

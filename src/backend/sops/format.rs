@@ -6,6 +6,13 @@
 //! `stores/flatten.go`, checked in the S6 lab): one `KEY=VALUE` per line,
 //! split at the first `=` with no trimming, `#` in the first column for a
 //! comment, and every `sops_` line as flat metadata.
+//!
+//! An INI file is read with a strict line parser (S6b lab on sops 3.13.3
+//! and its `gopkg.in/ini.v1` reader): `[section]` headers, `KEY = VALUE`
+//! lines and `;` or `#` comment lines, as sops writes them. That reader
+//! also takes quotes, `:` separators, inline comments, line continuations,
+//! leading spaces, a section twice and a key twice; secrit refuses each of
+//! those, because any of them lets a line mean other text than it shows.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -18,7 +25,7 @@ use serde_json::{Map, Number, Value};
 use super::edit::Op;
 use crate::backend::{BackendError, Location};
 use crate::display::escape;
-use crate::name::{DOTENV_METADATA_PREFIX, Name, NameError};
+use crate::name::{DOTENV_METADATA_PREFIX, Name, NameError, RESERVED};
 
 /// The recipient keys of the sops metadata.
 const KEY_TYPES: &[&str] = &[
@@ -43,15 +50,19 @@ const YAML_ENDINGS: [&str; 2] = [".yaml", ".yml"];
 const JSON_ENDING: &str = ".json";
 /// The file name ending that sops reads as dotenv.
 const DOTENV_ENDING: &str = ".env";
-/// The file name endings that sops reads as a format that secrit does not
-/// support yet, with that format's name (v0.2 plan S6b).
-const UNSUPPORTED_ENDINGS: [(&str, &str); 1] = [(".ini", "INI")];
+/// The file name ending that sops reads as INI.
+const INI_ENDING: &str = ".ini";
+/// The section of the keys that come before the first header of an INI
+/// file. sops writes its keys with no header.
+const INI_DEFAULT_SECTION: &str = "DEFAULT";
 /// The separators of a flat metadata key (sops `stores/flatten.go`):
 /// `age__list_0__map_enc` is `age[0].enc`.
 const MAP_SEPARATOR: &str = "__map_";
 const LIST_SEPARATOR: &str = "__list_";
 /// What a write says about a file that is not dotenv lines.
 const NOT_DOTENV: &str = "it is not a sops dotenv file";
+/// What a write says about a file that is not INI lines.
+const NOT_INI: &str = "it is not a sops INI file";
 
 /// The format of a sops store file: the `format` key of a sops store
 /// (v0.2 plan 5.8).
@@ -64,6 +75,8 @@ pub enum SopsFormat {
     Json,
     /// A sops dotenv file
     Dotenv,
+    /// A sops INI file
+    Ini,
 }
 
 /// A parsed sops file: the entries, and the sops metadata apart.
@@ -76,33 +89,26 @@ pub struct SopsDoc {
 impl SopsFormat {
     /// Every format: for the tests that must cover each one, and for the
     /// temp copies that `doctor` lists.
-    pub const ALL: [SopsFormat; 3] = [SopsFormat::Yaml, SopsFormat::Json, SopsFormat::Dotenv];
+    pub const ALL: [SopsFormat; 4] = [
+        SopsFormat::Yaml,
+        SopsFormat::Json,
+        SopsFormat::Dotenv,
+        SopsFormat::Ini,
+    ];
 
     /// The format of the store `file`: `explicit` (the `format` key), else
     /// the one that sops picks from the file name. A `.json` name means
-    /// JSON, a `.env` name means dotenv, and any other name means YAML, as
-    /// in v0.1. A name that sops reads as INI is refused until secrit
-    /// supports that format (v0.2 plan 5.8).
-    pub fn of_file(explicit: Option<SopsFormat>, file: &Path) -> Result<Self, BackendError> {
-        if let Some(format) = explicit {
-            return Ok(format);
-        }
+    /// JSON, a `.env` name means dotenv, an `.ini` name means INI, and any
+    /// other name means YAML, as in v0.1 (v0.2 plan 5.8).
+    pub fn of_file(explicit: Option<SopsFormat>, file: &Path) -> Self {
         let name = lower_file_name(file);
-        if let Some(format) = [SopsFormat::Json, SopsFormat::Dotenv]
-            .into_iter()
-            .find(|f| f.endings().iter().any(|e| name.ends_with(e)))
-        {
-            return Ok(format);
-        }
-        match UNSUPPORTED_ENDINGS.iter().find(|(e, _)| name.ends_with(e)) {
-            Some((ending, format)) => Err(BackendError::Unsafe {
-                path: file.to_path_buf(),
-                reason: format!(
-                    "sops reads a {ending} file as {format}, and secrit does not support the {format} format yet"
-                ),
-            }),
-            None => Ok(SopsFormat::Yaml),
-        }
+        explicit
+            .or_else(|| {
+                [SopsFormat::Json, SopsFormat::Dotenv, SopsFormat::Ini]
+                    .into_iter()
+                    .find(|f| f.endings().iter().any(|e| name.ends_with(e)))
+            })
+            .unwrap_or(SopsFormat::Yaml)
     }
 
     /// The value of the `format` key, and the `format` of a sops-nix
@@ -112,6 +118,7 @@ impl SopsFormat {
             SopsFormat::Yaml => "yaml",
             SopsFormat::Json => "json",
             SopsFormat::Dotenv => "dotenv",
+            SopsFormat::Ini => "ini",
         }
     }
 
@@ -123,17 +130,29 @@ impl SopsFormat {
     /// The extension of a temp copy, so sops reads it in this format.
     pub fn temp_ext(self) -> &'static str {
         match self {
-            SopsFormat::Yaml | SopsFormat::Json => self.name(),
+            SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Ini => self.name(),
             SopsFormat::Dotenv => "env",
         }
     }
 
     /// Whether a name with more than one segment addresses a nested key.
     /// A dotenv file is flat: sops refuses a nested `set` on it (S6 lab).
+    /// An INI file takes `section/key` only; [`Self::check_name`] holds
+    /// that rule.
     pub fn nested_names(self) -> bool {
         match self {
-            SopsFormat::Yaml | SopsFormat::Json => true,
+            SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Ini => true,
             SopsFormat::Dotenv => false,
+        }
+    }
+
+    /// Whether sops-nix can give one name of the file to a consumer. It
+    /// gives a dotenv or an INI file out only as one whole file (sops-nix
+    /// `sops-install-secrets`, read in the S6 lab).
+    pub fn one_name_out(self) -> bool {
+        match self {
+            SopsFormat::Yaml | SopsFormat::Json => true,
+            SopsFormat::Dotenv | SopsFormat::Ini => false,
         }
     }
 
@@ -143,6 +162,7 @@ impl SopsFormat {
         match self {
             SopsFormat::Yaml | SopsFormat::Json => Ok(()),
             SopsFormat::Dotenv => name.check_dotenv(),
+            SopsFormat::Ini => name.check_ini(),
         }
     }
 
@@ -157,7 +177,7 @@ impl SopsFormat {
     /// input of `sops encrypt`, whatever the output format.
     pub fn empty_doc(self) -> &'static [u8] {
         match self {
-            SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Dotenv => b"{}\n",
+            SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Dotenv | SopsFormat::Ini => b"{}\n",
         }
     }
 
@@ -167,6 +187,7 @@ impl SopsFormat {
             SopsFormat::Yaml => "YAML",
             SopsFormat::Json => "JSON",
             SopsFormat::Dotenv => "dotenv",
+            SopsFormat::Ini => "INI",
         }
     }
 
@@ -176,6 +197,7 @@ impl SopsFormat {
             SopsFormat::Yaml => "sops YAML file",
             SopsFormat::Json => "sops JSON file",
             SopsFormat::Dotenv => "sops dotenv file",
+            SopsFormat::Ini => "sops INI file",
         }
     }
 
@@ -185,6 +207,7 @@ impl SopsFormat {
             SopsFormat::Yaml => &YAML_ENDINGS,
             SopsFormat::Json => &[JSON_ENDING],
             SopsFormat::Dotenv => &[DOTENV_ENDING],
+            SopsFormat::Ini => &[INI_ENDING],
         }
     }
 
@@ -194,7 +217,6 @@ impl SopsFormat {
             .into_iter()
             .filter(|f| *f != self)
             .flat_map(|f| f.endings().iter().copied())
-            .chain(UNSUPPORTED_ENDINGS.iter().map(|(e, _)| *e))
             .collect()
     }
 
@@ -207,6 +229,10 @@ impl SopsFormat {
             SopsFormat::Dotenv => {
                 let lines = dotenv_lines(bytes).map_err(|what| self.parse_error(path, what))?;
                 return self.dotenv_doc(lines, path);
+            }
+            SopsFormat::Ini => {
+                let lines = ini_lines(bytes).map_err(|what| self.parse_error(path, what))?;
+                return self.ini_doc(lines, path);
             }
         };
         self.doc(value, path)
@@ -252,6 +278,23 @@ impl SopsFormat {
         })
     }
 
+    /// The entries and the sops metadata of the lines of an INI file.
+    fn ini_doc(self, lines: IniLines, path: &Path) -> Result<SopsDoc, BackendError> {
+        let parse_err = |what: &str| self.parse_error(path, what);
+        let flat = lines
+            .meta
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| parse_err("there is no sops metadata section"))?;
+        let meta = unflatten(flat).map_err(parse_err)?;
+        if !has_mac(&meta) {
+            return Err(parse_err("the sops metadata section has no MAC"));
+        }
+        Ok(SopsDoc {
+            entries: lines.entries,
+            meta,
+        })
+    }
+
     /// [`Self::parse`] for the write path. Every sops run names the
     /// store's format, so a write would rewrite a file of another format in
     /// the store's format (v0.2 plan V14, T50). The write path refuses such
@@ -261,7 +304,9 @@ impl SopsFormat {
     /// UTF-8 BOM does not hide a JSON file. A JSON store refuses a file
     /// that is not strict JSON, and parses the file only once. A dotenv
     /// store refuses a file that is not `KEY=VALUE` lines: a sops YAML,
-    /// JSON or INI file has a line with no `=`.
+    /// JSON or INI file has a line with no `=`. An INI store refuses a
+    /// file that is not strict INI lines, and a file with no `[sops]`
+    /// section: each line of a sops dotenv file is an INI line too.
     pub fn parse_to_write(self, bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
         self.refuse_other_name(path)?;
         match self {
@@ -284,6 +329,13 @@ impl SopsFormat {
             SopsFormat::Dotenv => {
                 let lines = dotenv_lines(bytes).map_err(|_| self.other_format(path, NOT_DOTENV))?;
                 self.dotenv_doc(lines, path)
+            }
+            SopsFormat::Ini => {
+                let lines = ini_lines(bytes)
+                    .ok()
+                    .filter(|l| l.meta.is_some())
+                    .ok_or_else(|| self.other_format(path, NOT_INI))?;
+                self.ini_doc(lines, path)
             }
         }
     }
@@ -383,6 +435,121 @@ fn dotenv_lines(bytes: &[u8]) -> Result<DotenvLines, &'static str> {
     Ok(DotenvLines { entries, meta })
 }
 
+/// The lines of an INI file: the sections as maps of the entries, and the
+/// lines of the `[sops]` section apart.
+struct IniLines {
+    entries: Map<String, Value>,
+    meta: Option<BTreeMap<String, String>>,
+}
+
+/// Where the next key line of an INI file goes.
+enum IniSection {
+    /// Before the first header.
+    Default,
+    /// The `[sops]` section.
+    Meta,
+    Named(String),
+}
+
+/// Whether `s` is a section name or a key that reads the same way for
+/// sops and for secrit: printable ASCII with no space and with none of
+/// the characters that the INI reader of sops gives a meaning to.
+fn ini_word(s: &str) -> bool {
+    !s.is_empty()
+        && s != "-"
+        && s.bytes()
+            .all(|b| b.is_ascii_graphic() && !b"=:\"'`#;[]\\".contains(&b))
+}
+
+/// The value of a `KEY = VALUE` line: the text after the `=` and one
+/// space. `None` for text that the INI reader of sops does not take as
+/// written: a space at either end, a quote at the start, an inline
+/// comment, and a `\` at the end (a line continuation).
+fn ini_value(after_equals: &str) -> Option<&str> {
+    let v = after_equals.strip_prefix(' ').unwrap_or(after_equals);
+    let plain = !v.starts_with([' ', '"', '\'', '`'])
+        && !v.ends_with([' ', '\\'])
+        && !v.contains(['#', ';']);
+    plain.then_some(v)
+}
+
+/// `bytes` as the lines of an INI file, as sops 3.13.3 writes it (S6b
+/// lab): `[section]`, `KEY = VALUE` with the keys of a section padded to
+/// one width, an empty line after each section, and `;` comment lines.
+/// The keys before the first header are the section `DEFAULT`; sops never
+/// writes that header, so secrit refuses it. An entry value stays as
+/// written, because the copy validation compares the raw `ENC[...]`
+/// strings. The error is fixed text: it must not quote file content.
+fn ini_lines(bytes: &[u8]) -> Result<IniLines, &'static str> {
+    const TWICE: &str = "a key appears twice in one section";
+    let text = std::str::from_utf8(bytes).map_err(|_| "the file is not UTF-8")?;
+    let mut entries = Map::new();
+    let mut meta: Option<BTreeMap<String, String>> = None;
+    let mut section = IniSection::Default;
+    for line in text.split('\n') {
+        if line.is_empty() || line.starts_with([';', '#']) {
+            continue;
+        }
+        if line.chars().any(char::is_control) {
+            return Err("a line has a control character");
+        }
+        if line.starts_with(|c: char| c.is_whitespace() || c == '\u{feff}') {
+            return Err("a line starts with a space or a byte order mark");
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest
+                .strip_suffix(']')
+                .filter(|n| ini_word(n) && *n != INI_DEFAULT_SECTION)
+                .ok_or("a section header is not [NAME]")?;
+            let repeated = if name == RESERVED {
+                meta.replace(BTreeMap::new()).is_some()
+            } else {
+                entries
+                    .insert(name.to_owned(), Value::Object(Map::new()))
+                    .is_some()
+            };
+            if repeated {
+                return Err("a section appears twice");
+            }
+            section = if name == RESERVED {
+                IniSection::Meta
+            } else {
+                IniSection::Named(name.to_owned())
+            };
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .and_then(|(k, v)| Some((k.trim_end_matches(' '), ini_value(v)?)))
+            .filter(|(k, _)| ini_word(k))
+            .ok_or("a line is not KEY = VALUE")?;
+        let repeated = match &section {
+            // sops writes a newline in a metadata value as `\n`.
+            IniSection::Meta => meta
+                .get_or_insert_default()
+                .insert(key.to_owned(), value.replace("\\n", "\n"))
+                .is_some(),
+            IniSection::Default | IniSection::Named(_) => {
+                let name = match &section {
+                    IniSection::Named(n) => n.as_str(),
+                    _ => INI_DEFAULT_SECTION,
+                };
+                entries
+                    .entry(name)
+                    .or_insert_with(|| Value::Object(Map::new()))
+                    .as_object_mut()
+                    .ok_or(TWICE)?
+                    .insert(key.to_owned(), Value::String(value.to_owned()))
+                    .is_some()
+            }
+        };
+        if repeated {
+            return Err(TWICE);
+        }
+    }
+    Ok(IniLines { entries, meta })
+}
+
 /// One step of a flat metadata key.
 enum Step<'a> {
     Key(&'a str),
@@ -480,7 +647,8 @@ fn has_hole(v: &Value) -> bool {
     }
 }
 
-/// The metadata tree of the flat `sops_` lines of a dotenv file (v0.2 plan
+/// The metadata tree of the flat `sops_` lines of a dotenv file, or of the
+/// flat lines of the `[sops]` section of an INI file (v0.2 plan
 /// 6.1.2), as sops builds it: `__map_` opens a map and `__list_N` a list.
 /// sops refuses a value and a map under one key, and a list with a missing
 /// index; so does this.
@@ -916,6 +1084,7 @@ pub(super) mod tests {
             (SopsFormat::Yaml, BASE, "/s/main.yaml"),
             (SopsFormat::Json, JSON_BASE, "/s/main.json"),
             (SopsFormat::Dotenv, DOTENV_BASE, "/s/main.env"),
+            (SopsFormat::Ini, INI_BASE, INI_PATH),
         ] {
             let path = Path::new(path);
             let read = f.parse(text.as_bytes(), path).unwrap();
@@ -1023,7 +1192,7 @@ pub(super) mod tests {
     }
 
     /// v0.2 plan 5.8: the `format` key wins; with none, `.json` means JSON,
-    /// `.env` means dotenv, `.ini` is refused, and any other name means
+    /// `.env` means dotenv, `.ini` means INI, and any other name means
     /// YAML.
     #[test]
     fn the_format_comes_from_the_key_or_the_file_name() {
@@ -1039,19 +1208,23 @@ pub(super) mod tests {
             (".env", SopsFormat::Dotenv),
             ("PROD.ENV", SopsFormat::Dotenv),
             ("a.env.yaml", SopsFormat::Yaml),
+            ("a.ini", SopsFormat::Ini),
+            ("A.INI", SopsFormat::Ini),
+            ("a.ini.json", SopsFormat::Json),
         ] {
-            assert_eq!(of(None, name).unwrap(), want, "{name}");
-        }
-        for (name, said) in [("a.ini", "INI"), ("a.INI", "INI")] {
-            let e = of(None, name).unwrap_err();
-            assert!(e.to_string().contains(said), "{name}: {e}");
-            assert_eq!(e.exit(), Exit::Refused);
+            assert_eq!(of(None, name), want, "{name}");
         }
         for format in SopsFormat::ALL {
-            for name in ["main.yaml", "main.json", "a.env", "secrets"] {
-                assert_eq!(of(Some(format), name).unwrap(), format, "{name}");
+            for name in ["main.yaml", "main.json", "a.env", "a.ini", "secrets"] {
+                assert_eq!(of(Some(format), name), format, "{name}");
             }
         }
+        assert_eq!(SopsFormat::Ini.name(), "ini");
+        assert_eq!(SopsFormat::Ini.input_type(), "ini");
+        assert_eq!(SopsFormat::Ini.temp_ext(), "ini");
+        assert!(SopsFormat::Ini.nested_names() && !SopsFormat::Ini.one_name_out());
+        assert!(!SopsFormat::Dotenv.nested_names() && !SopsFormat::Dotenv.one_name_out());
+        assert!(SopsFormat::Yaml.one_name_out() && SopsFormat::Json.one_name_out());
         assert_eq!(SopsFormat::Json.input_type(), "json");
         assert_eq!(SopsFormat::Json.temp_ext(), "json");
         assert_eq!(SopsFormat::Yaml.name(), "yaml");
@@ -1275,6 +1448,272 @@ sops_version=3.13.3\n";
             parse(&DOTENV_BASE.replace("A=ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n", ""));
         assert!(validate(&orig, &removed, &a, Op::Remove).is_ok());
         assert!(validate(&orig, &orig, &a, Op::Remove).is_err());
+    }
+
+    /// An INI file as sops 3.13.3 writes it (S6b lab): a key before the
+    /// first header, an encrypted comment, padded keys, an empty value
+    /// that sops leaves in clear, an empty section, and the `[sops]`
+    /// section with the flat metadata of two recipients.
+    pub const INI_BASE: &str = "bare = ENC[AES256_GCM,data:b,iv:y,tag:z,type:str]\n\
+\n\
+; ENC[AES256_GCM,data:c,iv:y,tag:z,type:comment]\n\
+[s]\n\
+k               = ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n\
+longer_key_name = ENC[AES256_GCM,data:l,iv:y,tag:z,type:str]\n\
+EMPTY           = \n\
+\n\
+[empty]\n\
+\n\
+[sops]\n\
+age__list_0__map_enc       = -----BEGIN AGE ENCRYPTED FILE-----\\nblob0\\n-----END AGE ENCRYPTED FILE-----\\n\n\
+age__list_0__map_recipient = age1x\n\
+age__list_1__map_enc       = blob1\n\
+age__list_1__map_recipient = age1y\n\
+lastmodified               = 1\n\
+mac                        = ENC[AES256_GCM,data:m,type:str]\n\
+unencrypted_suffix         = _pub\n\
+version                    = 3.13.3\n";
+
+    const INI_PATH: &str = "/s/main.ini";
+
+    /// v0.2 plan 6.1.2: an INI file gives one map for each section, and
+    /// the `[sops]` section is the metadata. The keys before the first
+    /// header are the section `DEFAULT`.
+    #[test]
+    fn an_ini_file_gives_sections_and_a_metadata_tree() {
+        let f = SopsFormat::Ini;
+        let path = Path::new(INI_PATH);
+        let doc = f.parse(INI_BASE.as_bytes(), path).unwrap();
+        assert_eq!(
+            leaf_names(&doc.entries),
+            [
+                "DEFAULT/bare",
+                "empty",
+                "s/EMPTY",
+                "s/k",
+                "s/longer_key_name"
+            ]
+        );
+        assert_eq!(
+            doc.entries["s"]["k"],
+            "ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]"
+        );
+        assert_eq!(doc.entries["s"]["EMPTY"], "");
+        assert_eq!(doc.entries["empty"], serde_json::json!({}));
+        let want = serde_json::json!({
+            "age": [
+                {
+                    "enc": "-----BEGIN AGE ENCRYPTED FILE-----\nblob0\n-----END AGE ENCRYPTED FILE-----\n",
+                    "recipient": "age1x",
+                },
+                {"enc": "blob1", "recipient": "age1y"},
+            ],
+            "lastmodified": "1",
+            "mac": "ENC[AES256_GCM,data:m,type:str]",
+            "unencrypted_suffix": "_pub",
+            "version": "3.13.3",
+        });
+        assert_eq!(Value::Object(doc.meta.clone()), want);
+        assert!(has_recipients(&doc.meta));
+
+        // The sections can come in any order, and the padding of a key is
+        // not part of the key. A file with no key before the first header
+        // has no `DEFAULT` section.
+        let (body, meta) = INI_BASE.split_once("[sops]\n").unwrap();
+        let body = body
+            .replace("bare = ENC[AES256_GCM,data:b,iv:y,tag:z,type:str]\n", "")
+            .replace("k               =", "k=");
+        let moved = f
+            .parse(format!("[sops]\n{meta}\n{body}").as_bytes(), path)
+            .unwrap();
+        assert_eq!(moved.meta, doc.meta);
+        assert_eq!(
+            leaf_names(&moved.entries),
+            ["empty", "s/EMPTY", "s/k", "s/longer_key_name"]
+        );
+        assert_eq!(moved.entries["s"], doc.entries["s"]);
+    }
+
+    /// An INI store refuses each line that the INI reader of sops takes
+    /// in a special way, a section twice, a key twice and a file of
+    /// another format. The error quotes no file content.
+    #[test]
+    fn an_ini_store_refuses_a_file_that_is_not_strict_ini_lines() {
+        let f = SopsFormat::Ini;
+        let path = Path::new(INI_PATH);
+        let in_s = |line: &str| INI_BASE.replace("[s]\n", &format!("[s]\n{line}\n"));
+        let key_value = "a line is not KEY = VALUE";
+        let header = "a section header is not [NAME]";
+        let cases = [
+            (in_s("no equals secret-ish"), key_value),
+            (in_s("=secret-ish"), key_value),
+            (in_s("x = \"secret-ish\""), key_value),
+            (in_s("x = 'secret-ish'"), key_value),
+            (in_s("x = `secret-ish`"), key_value),
+            (in_s("x = secret-ish \\"), key_value),
+            (in_s("x = secret-ish ; note"), key_value),
+            (in_s("x = secret-ish # note"), key_value),
+            (in_s("x =  secret-ish"), key_value),
+            (in_s("x = secret-ish "), key_value),
+            (in_s("x : secret-ish"), key_value),
+            (in_s("x:y = secret-ish"), key_value),
+            (in_s("\"x\" = secret-ish"), key_value),
+            (in_s("x y = secret-ish"), key_value),
+            (in_s("- = secret-ish"), key_value),
+            (in_s(" x = secret-ish"), "a line starts with a space"),
+            (in_s("\tx = secret-ish"), "a line has a control character"),
+            (in_s("x = secret-ish\r"), "a line has a control character"),
+            (in_s("k = secret-ish"), "a key appears twice"),
+            (in_s("[s]"), "a section appears twice"),
+            (in_s("[sops]"), "a section appears twice"),
+            (in_s("[DEFAULT]"), header),
+            (in_s("[secret-ish"), header),
+            (in_s("[]"), header),
+            (in_s("[a b]"), header),
+            (in_s("[a] ; note"), header),
+            (in_s("[a]]"), header),
+            (format!("\u{feff}{INI_BASE}"), "a byte order mark"),
+            (
+                INI_BASE.replace("mac  ", "mac = secret-ish\nmac  "),
+                "a key appears twice",
+            ),
+            (BASE.to_owned(), key_value),
+            (JSON_BASE.to_owned(), key_value),
+        ];
+        for (text, want) in &cases {
+            let e = f.parse(text.as_bytes(), path).unwrap_err();
+            let shown = e.to_string();
+            assert!(shown.contains("as a sops INI file"), "{shown}");
+            assert!(shown.contains(want), "{want}: {shown}");
+            assert!(
+                !shown.contains("secret-ish") && !shown.contains("ENC["),
+                "{shown}"
+            );
+            assert_eq!(e.exit(), Exit::Failed);
+            let e = refusal(f, text.as_bytes(), path).unwrap_err();
+            assert!(e.to_string().contains("it is not a sops INI file"), "{e}");
+            assert!(e.to_string().contains("format is ini"), "{e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        let e = f.parse(b"[s]\nA = \xff\n", path).unwrap_err();
+        assert!(e.to_string().contains("not UTF-8"), "{e}");
+        assert!(refusal(f, INI_BASE.as_bytes(), path).is_ok());
+
+        // Each line of a sops dotenv file is an INI line, but the file has
+        // no `[sops]` section: a read fails, and a write is refused.
+        let e = f.parse(DOTENV_BASE.as_bytes(), path).unwrap_err();
+        assert!(e.to_string().contains("no sops metadata section"), "{e}");
+        let e = refusal(f, DOTENV_BASE.as_bytes(), path).unwrap_err();
+        assert!(e.to_string().contains("it is not a sops INI file"), "{e}");
+        // A file with a `[sops]` section and no MAC is an INI file that
+        // secrit cannot use: a parse error on both paths.
+        for text in [
+            INI_BASE.replace("mac  ", "macx "),
+            INI_BASE.split_once("age__list").unwrap().0.to_owned(),
+            INI_BASE.replace("age__list_1__map_enc ", "age__list_7__map_enc "),
+        ] {
+            let e = f.parse_to_write(text.as_bytes(), path).unwrap_err();
+            assert_eq!(e.exit(), Exit::Failed, "{e}");
+            assert!(!e.to_string().contains("ENC["), "{e}");
+        }
+        // An INI file is not a dotenv file.
+        let e = refusal(
+            SopsFormat::Dotenv,
+            INI_BASE.as_bytes(),
+            Path::new(DOTENV_PATH),
+        );
+        assert!(
+            e.unwrap_err()
+                .to_string()
+                .contains("not a sops dotenv file")
+        );
+
+        for name in ["s.yaml", "S.YML", "s.json", "s.env"] {
+            let e = refusal(f, INI_BASE.as_bytes(), &Path::new("/s").join(name)).unwrap_err();
+            assert!(e.to_string().contains("as INI"), "{name}: {e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        for name in ["secrets", "a.ini", "a.yaml.ini", "PROD.INI"] {
+            assert!(
+                f.refuse_other_name(&Path::new("/s").join(name)).is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The copy validation of 6.1.2 holds for an INI store too: only the
+    /// target, the MAC and the time may change. A new section is a new
+    /// parent map; the padding of the other keys is not part of a value.
+    #[test]
+    fn validate_catches_tampering_in_ini() {
+        let path = Path::new(INI_PATH);
+        let parse = |s: &str| SopsFormat::Ini.parse(s.as_bytes(), path).unwrap();
+        let orig = parse(INI_BASE);
+        let v = SecretValue::new(b"v".to_vec());
+        let put = Op::Put(&v, PutMode::CreateOnly);
+        let stamped = |s: String| {
+            s.replace("data:m,", "data:NEW,").replace(
+                "lastmodified               = 1",
+                "lastmodified               = 2",
+            )
+        };
+        // A new key in the section `s`, which pads the other keys again.
+        let in_s = name("s/a_very_long_key_name_indeed");
+        let with_key = |value: &str| {
+            stamped(
+                INI_BASE
+                    .replace("k               =", "k                           =")
+                    .replace("longer_key_name =", "longer_key_name             =")
+                    .replace(
+                        "EMPTY           = \n",
+                        &format!("EMPTY                       = \na_very_long_key_name_indeed = {value}\n"),
+                    ),
+            )
+        };
+        assert!(validate(&orig, &parse(&with_key(ENC)), &in_s, put).is_ok());
+        for bad in [
+            with_key("v"),
+            with_key("5"),
+            with_key("ENC[AES256_GCM,data:q,iv:w,tag:e,type:float]"),
+            with_key(ENC).replace("data:x", "data:Y"),
+            with_key(ENC).replace("data:b", "data:Y"),
+            with_key(ENC).replace("age1y", "age1other"),
+            with_key(ENC).replace("blob1", "blob2"),
+            with_key(ENC).replace("= _pub", "= _other"),
+            with_key(ENC).replace("unencrypted_suffix         = _pub\n", ""),
+            with_key(ENC).replace("[empty]\n", ""),
+            with_key(ENC).replace("[empty]\n", &format!("[empty]\nz = {ENC}\n")),
+            with_key(ENC).replace("[empty]\n", "[other]\n"),
+            with_key(ENC).replace("EMPTY                       = \n", ""),
+            with_key(ENC).replace("EMPTY                       = \n", "EMPTY = x\n"),
+            with_key(ENC).replace("bare = ", "bare2 = "),
+            format!("top = {ENC}\n{}", with_key(ENC)),
+        ] {
+            assert!(validate(&orig, &parse(&bad), &in_s, put).is_err(), "{bad}");
+        }
+
+        // A name in a section that is not there: the section is new.
+        let in_t = name("t/k");
+        let with_section = |value: &str| {
+            stamped(INI_BASE.replace("[sops]\n", &format!("[t]\nk = {value}\n\n[sops]\n")))
+        };
+        assert!(validate(&orig, &parse(&with_section(ENC)), &in_t, put).is_ok());
+        assert!(validate(&orig, &parse(&with_section("v")), &in_t, put).is_err());
+        let two = with_section(ENC).replace("[t]\n", &format!("[t]\nk2 = {ENC}\n"));
+        assert!(validate(&orig, &parse(&two), &in_t, put).is_err());
+
+        // A remove of the one key of a section leaves no section.
+        let k = name("s/k");
+        let removed = parse(&INI_BASE.replace(
+            "k               = ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n",
+            "",
+        ));
+        assert!(validate(&orig, &removed, &k, Op::Remove).is_ok());
+        assert!(validate(&orig, &orig, &k, Op::Remove).is_err());
+        let bare = name("DEFAULT/bare");
+        let pruned =
+            parse(&INI_BASE.replace("bare = ENC[AES256_GCM,data:b,iv:y,tag:z,type:str]\n", ""));
+        assert!(validate(&orig, &pruned, &bare, Op::Remove).is_ok());
     }
 
     /// The copy validation of 6.1.2 holds for a JSON store too.

@@ -50,8 +50,13 @@
 //! - base64 that is wrapped into lines (64 or 76 columns, as PEM and MIME
 //!   write it) is not matched.
 //! - The worst-case cost is O(stream length x value length): each input
-//!   byte that starts a pattern costs the length of the patterns that start
-//!   with it.
+//!   position that holds the first 8 bytes of a pattern costs the length of
+//!   that pattern. A prefilter compares the first 8 bytes as one word, so
+//!   output that only often holds the first byte of a pattern stays fast
+//!   (issue #10: a 4 KiB value and 64 MiB of output went from about 0.4
+//!   MiB/s to about 120 MiB/s, and to about 90 MiB/s when every byte is the
+//!   first byte, in a release build). The prefilter result shows in the
+//!   time, as the hold-back does: whether output starts like a pattern.
 //! - A prefix that [`Masker::flush_held`] releases is not masked when the
 //!   rest of the value follows.
 
@@ -125,9 +130,14 @@ impl Masker {
         for ids in &mut by_first {
             ids.sort_by_key(|&i| Reverse(list[i].bytes.len()));
         }
+        // Made once at its final size, so it never grows and leaves an
+        // unwiped copy behind.
+        let mut heads = Zeroizing::new(Vec::with_capacity(list.len()));
+        heads.extend(list.iter().map(|p| head_word(&p.bytes)));
         Self {
             patterns: Patterns {
                 list,
+                heads,
                 by_first,
                 names,
             },
@@ -225,6 +235,9 @@ struct Pattern {
 
 struct Patterns {
     list: Vec<Pattern>,
+    /// The first [`HEAD`] bytes of each pattern in `list`, for the
+    /// prefilter in [`Patterns::at`].
+    heads: Zeroizing<Vec<u64>>,
     /// For each byte value, the patterns that start with it, longest first.
     by_first: Vec<Vec<usize>>,
     /// The name of each masked value.
@@ -282,10 +295,21 @@ impl Patterns {
     /// What starts at the start of `rest`, which is not empty. A pattern
     /// longer than `rest` that `rest` starts holds the input, so a match is
     /// taken only when no longer one can follow.
+    ///
+    /// Prefilter (issue #10): a pattern is compared in full only when its
+    /// first [`HEAD`] bytes, or as many as `rest` and the pattern have, are
+    /// equal to those of `rest`. That test is one masked XOR of two words,
+    /// with no branch inside it on the bytes. Without it, each byte of
+    /// output that starts a pattern costs a compare of the full length of
+    /// every pattern that starts with that byte.
     fn at(&self, rest: &[u8], eof: bool) -> At {
+        let word = head_word(rest);
         for &i in &self.by_first[usize::from(rest[0])] {
             let pattern = &self.list[i];
             let bytes: &[u8] = &pattern.bytes;
+            if !heads_equal(word, self.heads[i], bytes.len().min(rest.len())) {
+                continue;
+            }
             if bytes.len() > rest.len() {
                 if !eof && same(&bytes[..rest.len()], rest) {
                     return At::Hold;
@@ -306,6 +330,30 @@ impl Patterns {
         let names: Vec<&str> = labels.iter().map(|&l| self.names[l].as_str()).collect();
         format!("[secrit:{}]", names.join("+"))
     }
+}
+
+/// How many first bytes of a pattern the prefilter compares.
+const HEAD: usize = 8;
+
+/// The first [`HEAD`] bytes of `bytes` as one word, with zero bytes after a
+/// shorter slice.
+fn head_word(bytes: &[u8]) -> u64 {
+    let mut word = [0u8; HEAD];
+    let n = bytes.len().min(HEAD);
+    word[..n].copy_from_slice(&bytes[..n]);
+    u64::from_le_bytes(word)
+}
+
+/// Whether the first `len` bytes (at most [`HEAD`]) of two head words are
+/// equal. The words are compared as a whole, in constant time, so the
+/// result does not show which byte differs.
+fn heads_equal(a: u64, b: u64, len: usize) -> bool {
+    let mask = if len >= HEAD {
+        u64::MAX
+    } else {
+        (1u64 << (8 * len)) - 1
+    };
+    bool::from(((a ^ b) & mask).ct_eq(&0))
 }
 
 /// Equality of secret bytes in constant time for the length. Slices of
@@ -927,6 +975,65 @@ mod tests {
         // A full-capacity wipe per call costs seconds here; a length-only wipe costs
         // microseconds. The wide limit keeps a busy CI runner from failing the test.
         assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A 4 KiB base64-like value that starts with `a`.
+    fn long_value() -> Vec<u8> {
+        let mut x: u32 = 0x2545_f491;
+        let mut value: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                B64_STANDARD[usize::try_from(x % 64).unwrap()]
+            })
+            .collect();
+        value[0] = b'a';
+        value
+    }
+
+    /// Issue #10: output that often holds the first byte of a pattern, with
+    /// a 4 KiB value. Without the prefilter, each such byte costs a compare
+    /// of the full length of every pattern that starts with it: about 0.4
+    /// MiB/s in a release build.
+    #[test]
+    fn output_full_of_first_bytes_is_fast() {
+        let value = long_value();
+        let mut m = masker(&[("big", &value)]);
+        let line = b"a cat and a dog ate an apple at a cafe; a=YWJj 6162 a%20b \"a\\u0041\" aaaa\n";
+        let chunk: Vec<u8> = line.iter().copied().cycle().take(64 * 1024).collect();
+        let start = std::time::Instant::now();
+        let mut out = 0;
+        for _ in 0..16 {
+            out += m.feed(&chunk).len();
+        }
+        out += m.finish().len();
+        let took = start.elapsed();
+        assert_eq!(out, 16 * chunk.len());
+        // 1 MiB. A debug build with the prefilter needs well under a second.
+        // The wide limit keeps a busy CI runner from failing the test.
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    /// The prefilter keeps every match: the long value is masked in the
+    /// middle of such output, split at every chunk size.
+    #[test]
+    fn the_prefilter_keeps_matches() {
+        let value = long_value();
+        let mut input = b"a aa abc ".repeat(50);
+        input.extend_from_slice(&value);
+        input.extend_from_slice(b" a ab");
+        let mut want = b"a aa abc ".repeat(50);
+        want.extend_from_slice(b"[secrit:big] a ab");
+        for size in [1, 3, 7, 8, 9, 4095, 4096, 4097] {
+            let mut m = masker(&[("big", &value)]);
+            let mut got = Vec::new();
+            for piece in input.chunks(size) {
+                got.extend_from_slice(m.feed(piece));
+            }
+            got.extend_from_slice(m.finish());
+            assert!(got == want, "chunk size {size}");
+        }
     }
 
     #[test]

@@ -63,8 +63,8 @@ pub trait Fixture: Sized {
     fn fail_tool_echoing_stdin(&self);
 }
 
-/// The sops format of a [`SopsStore`] fixture.
-pub trait SopsFormat {
+/// The sops format of a [`SopsFixtureStore`] fixture.
+pub trait FixtureFormat {
     /// The sops `--input-type` and the store file's extension.
     const NAME: &'static str;
 }
@@ -72,36 +72,36 @@ pub trait SopsFormat {
 /// A sops YAML store (`main.yaml`).
 pub struct Yaml;
 
-impl SopsFormat for Yaml {
+impl FixtureFormat for Yaml {
     const NAME: &'static str = "yaml";
 }
 
 /// A sops JSON store (`main.json`).
 pub struct Json;
 
-impl SopsFormat for Json {
+impl FixtureFormat for Json {
     const NAME: &'static str = "json";
 }
 
 /// A sops store in the format `F`, encrypted to two temp age keys.
-pub struct SopsStore<F: SopsFormat> {
+pub struct SopsFixtureStore<F: FixtureFormat> {
     env: TestEnv,
     format: PhantomData<F>,
 }
 
 /// A sops YAML store, the v0.1 store.
-pub type SopsFixture = SopsStore<Yaml>;
+pub type SopsFixture = SopsFixtureStore<Yaml>;
 /// A sops JSON store (v0.2 plan S4).
-pub type SopsJsonFixture = SopsStore<Json>;
+pub type SopsJsonFixture = SopsFixtureStore<Json>;
 
-impl<F: SopsFormat> SopsStore<F> {
+impl<F: FixtureFormat> SopsFixtureStore<F> {
     /// The [`TestEnv`] of the store, for the checks that only sops has.
     pub fn env(&self) -> &TestEnv {
         &self.env
     }
 }
 
-impl<F: SopsFormat> Fixture for SopsStore<F> {
+impl<F: FixtureFormat> Fixture for SopsFixtureStore<F> {
     const CAPS: Caps = Caps {
         names_without_decrypt: true,
         backups: true,

@@ -298,6 +298,8 @@ pub fn run(ctx: &Ctx, plan: &Plan) -> Result<Ended, Error> {
             drop(values);
             // Returns only on failure; the memfds stay open in the new image.
             let e = cmd.exec();
+            // On other systems `handoff` is `()`, and a drop of it is a lint error.
+            #[cfg(target_os = "linux")]
             drop(handoff);
             Err(Error::Failed(format!("could not run {shown}: {e}")))
         }

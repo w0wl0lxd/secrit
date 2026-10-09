@@ -8,7 +8,7 @@
 mod common;
 
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 
 use common::conformance::get_to_file;
 use common::fixture::Fixture;
@@ -328,7 +328,7 @@ fn a_signal_during_a_blocked_call_exits_130() {
     f.signal_keyring("STOP");
     std::fs::write(d.hook_dir().join("go"), b"").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(700));
-    let st = Command::new(common::bin("kill"))
+    let st = std::process::Command::new(common::bin("kill"))
         .args(["-INT", &child.id().to_string()])
         .status()
         .unwrap();

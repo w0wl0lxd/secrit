@@ -4,7 +4,7 @@
 pub mod sops;
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::{BackendConfig, BackendKind, Config, Env, StoreConfig, ToolSetting};
 use crate::display::escape_path;
@@ -140,13 +140,6 @@ pub const MAX_RETRIES: usize = 3;
 pub enum Location {
     /// One file that holds every name.
     File(PathBuf),
-}
-
-impl Location {
-    #[must_use]
-    pub fn file(path: &Path) -> Self {
-        Location::File(path.to_path_buf())
-    }
 }
 
 /// Control characters are escaped, so a path cannot drive the terminal.

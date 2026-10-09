@@ -13,14 +13,13 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{interrupted, shell_path};
-use crate::backend::BackendError;
-use crate::backend::sops::{MIN_SOPS, NEED_SOPS, SopsBackend};
+use crate::backend::sops::SopsBackend;
 use crate::child;
 use crate::config::{
     BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
     config_path, home,
 };
-use crate::display::escape;
+use crate::display::{escape, escape_path};
 use crate::error::{Error, Exit};
 use crate::git::{Repo, find_root};
 use crate::signals;
@@ -118,16 +117,7 @@ fn steps(
         path_env.as_deref(),
     )?;
     let backend = SopsBackend::new(sops_store, sops.path.clone(), lock_timeout, &env)?;
-    let (a, b, c) = backend.sops_version()?;
-    if (a, b) < MIN_SOPS {
-        return Err(BackendError::ToolTooOld {
-            tool: "sops",
-            found: format!("{a}.{b}.{c}"),
-            path: sops.path,
-            need: NEED_SOPS,
-        }
-        .into());
-    }
+    let (a, b, c) = backend.checked_version()?;
     out.note(&format!(
         "sops {a}.{b}.{c} at {}; age-keygen at {}",
         escape(&sops.path.to_string_lossy()),
@@ -148,7 +138,7 @@ fn steps(
         let facts = backend.inspect()?;
         out.note(&format!(
             "store file {} exists ({} names); unchanged",
-            escape(&sops_store.file.to_string_lossy()),
+            escape_path(&sops_store.file),
             facts.names
         ));
     } else {

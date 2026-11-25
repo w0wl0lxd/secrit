@@ -268,39 +268,80 @@ fn sops_file(env: &TestEnv, path: &Path, output: &str, content: &[u8]) {
     chmod(path, 0o600);
 }
 
-/// v0.2 V14: v0.1 writes YAML only, so `store` and `rm` on a store that is
-/// not YAML (by its content or by its name) exit 3 and leave the file
-/// byte-identical. `ls` still reads it.
+/// v0.2 V14 and T50: a write never rewrites a store in another format. A
+/// store whose content or name does not match its format (from `format`,
+/// else from the file name) is refused by `store` and `rm` with exit 3, and
+/// the file stays byte-identical. `ls` still reads a file that the store's
+/// own parser reads.
 #[test]
-fn a_store_that_is_not_yaml_is_refused_and_unchanged() {
-    for (file, output, said) in [
-        ("main.json", "json", "a .json file"),
-        ("main.yaml", "json", "a sops JSON file"),
-        ("main.json", "yaml", "a .json file"),
+fn a_store_in_another_format_is_refused_and_unchanged() {
+    for (file, output, format, said, ls) in [
+        ("main.yaml", "json", "", "it is a sops JSON file", true),
+        ("main.json", "yaml", "", "it is not a sops JSON file", false),
+        ("main.json", "json", "yaml", "a .json file", true),
+        ("main.yaml", "yaml", "json", "a .yaml file", false),
+        ("main.yml", "json", "json", "a .yml file", true),
     ] {
         let mut env = TestEnv::new();
         std::fs::write(
             &env.sops_config,
             format!(
-                "creation_rules:\n  - path_regex: secrets/main\\.(yaml|json)$\n    age: {}\n",
+                "creation_rules:\n  - path_regex: secrets/main\\.\n    age: {}\n",
                 env.recipients.join(",")
             ),
         )
         .unwrap();
         env.store_file = env.store_dir.join(file);
         sops_file(&env, &env.store_file, output, br#"{"old": "v"}"#);
-        env.write_config("");
+        let key = if format.is_empty() {
+            String::new()
+        } else {
+            format!("format = \"{format}\"\n")
+        };
+        env.write_config(&key);
         let before = env.store_bytes();
-        let case = format!("{file} as {output}");
+        let case = format!("{file} as {output}, format '{format}'");
 
         let out = env.store_value("new", b"v");
         assert_eq!(code(&out), 3, "{case}: {}", stderr(&out));
         assert!(stderr(&out).contains(said), "{case}: {}", stderr(&out));
         let out = env.run(["rm", "--yes", "old"], None);
         assert_eq!(code(&out), 3, "{case}: {}", stderr(&out));
+        assert!(stderr(&out).contains(said), "{case}: {}", stderr(&out));
         assert_eq!(env.store_bytes(), before, "{case}");
         assert_eq!(env.temp_files(), Vec::<std::path::PathBuf>::new());
-        assert_eq!(env.ls(), ["old"], "{case}");
+        if ls {
+            assert_eq!(env.ls(), ["old"], "{case}");
+        }
+    }
+}
+
+/// v0.2 plan 5.8: with no `format`, sops reads a `.env` file as dotenv and
+/// an `.ini` file as INI, which this secrit does not support yet. Every
+/// command on such a store exits 3 and leaves the file unchanged.
+#[test]
+fn a_dotenv_or_ini_store_is_refused() {
+    for (file, said) in [("main.env", "dotenv"), ("MAIN.INI", "INI")] {
+        let mut env = TestEnv::new();
+        env.store_file = env.store_dir.join(file);
+        std::fs::write(&env.store_file, "old=ENC[x]\n").unwrap();
+        chmod(&env.store_file, 0o600);
+        env.write_config("");
+        for args in [&["store", "n"][..], &["ls"], &["rm", "--yes", "old"]] {
+            let out = env.run(args, Some(b"v"));
+            assert_eq!(code(&out), 3, "{file} {args:?}: {}", stderr(&out));
+            assert!(stderr(&out).contains(said), "{file}: {}", stderr(&out));
+        }
+        // doctor shows the refusal as a fail row of the store.
+        let out = env.run(["doctor"], None);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_ne!(code(&out), 0, "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("fail  store main") && l.contains(said)),
+            "{file}: {text}"
+        );
+        assert_eq!(env.store_bytes(), b"old=ENC[x]\n");
     }
 }
 

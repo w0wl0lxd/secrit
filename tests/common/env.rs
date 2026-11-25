@@ -261,6 +261,10 @@ impl Dirs {
 /// The v0.1 environment: [`Dirs`] plus a sops store and its age keys.
 pub struct TestEnv {
     dirs: Dirs,
+    /// The sops format of the store file: `yaml` (`main.yaml`) or `json`
+    /// (`main.json`). The config names no `format`, so secrit takes it
+    /// from the file name.
+    pub format: &'static str,
     pub store_dir: PathBuf,
     pub store_file: PathBuf,
     pub sops_config: PathBuf,
@@ -298,6 +302,11 @@ pub fn bin(name: &str) -> PathBuf {
 
 impl TestEnv {
     pub fn new() -> Self {
+        Self::with_format("yaml")
+    }
+
+    /// A [`TestEnv`] whose store file is sops `format` (`yaml` or `json`).
+    pub fn with_format(format: &'static str) -> Self {
         let sops = tool("SECRIT_TEST_SOPS", "sops");
         let age_keygen = tool("SECRIT_TEST_AGE_KEYGEN", "age-keygen");
         let ssh_keygen = tool("SECRIT_TEST_SSH_KEYGEN", "ssh-keygen");
@@ -316,7 +325,8 @@ impl TestEnv {
         let sops_config = store_root.join(".sops.yaml");
         write_sops_config(&sops_config, &recipients);
         let env = Self {
-            store_file: store_dir.join("main.yaml"),
+            store_file: store_dir.join(format!("main.{format}")),
+            format,
             dirs,
             store_dir,
             sops_config,
@@ -395,20 +405,16 @@ impl TestEnv {
         self.create_store_with(path, &[], b"{}\n");
     }
 
-    /// A sops file with the JSON `content`, made by the real sops. `extra`
-    /// is passed to `sops encrypt` (for example `--age <recipient>`).
+    /// A sops file in the store's format with the JSON `content`, made by
+    /// the real sops. `extra` is passed to `sops encrypt` (for example
+    /// `--age <recipient>`).
     pub fn create_store_with(&self, path: &Path, extra: &[&str], content: &[u8]) {
         let mut child = self
             .sops_cmd()
             .arg("encrypt")
             .args(extra)
-            .args([
-                "--input-type",
-                "json",
-                "--output-type",
-                "yaml",
-                "--filename-override",
-            ])
+            .args(["--input-type", "json", "--output-type", self.format])
+            .arg("--filename-override")
             .arg(path)
             .arg("/dev/stdin")
             .stdin(Stdio::piped())
@@ -440,11 +446,18 @@ impl TestEnv {
         c
     }
 
-    /// Decrypt the whole store in the test process. Never printed.
+    /// Decrypt the whole store in the test process, with the store's own
+    /// format as the input type. Never printed.
     pub fn decrypt(&self) -> serde_json::Map<String, Value> {
         let out = self
             .sops_cmd()
-            .args(["decrypt", "--input-type", "yaml", "--output-type", "json"])
+            .args([
+                "decrypt",
+                "--input-type",
+                self.format,
+                "--output-type",
+                "json",
+            ])
             .arg(&self.store_file)
             .output()
             .unwrap();
@@ -568,7 +581,7 @@ fn keygen(age_keygen: &Path, out: &Path) -> String {
 
 pub fn write_sops_config(path: &Path, recipients: &[String]) {
     let text = format!(
-        "creation_rules:\n  - path_regex: secrets/.*\\.yaml$\n    age: {}\n",
+        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json)$\n    age: {}\n",
         recipients.join(",")
     );
     std::fs::write(path, text).unwrap();

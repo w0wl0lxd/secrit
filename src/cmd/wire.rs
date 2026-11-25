@@ -7,7 +7,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::{Ctx, shell_path, shell_word};
-use crate::backend::BackendError;
+use crate::backend::sops::SopsFormat;
+use crate::backend::{BackendError, WireSource};
 use crate::cli::WireFormat;
 use crate::display::escape_path;
 use crate::error::Error;
@@ -16,12 +17,13 @@ use crate::name::Name;
 
 pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> Result<(), Error> {
     let env = |k: &str| std::env::var_os(k);
+    // Both forms point at /run/secrets/NAME, which only sops-nix fills.
+    let (file, sops_format) = sops_file(ctx, name)?;
     let text = match format {
         WireFormat::Nix => {
             let owner = owner_name(owner, &env)?;
-            let file = sops_file(ctx)?;
-            let flake = flake_root(ctx, file);
-            nix_stanza(name, file, flake.as_deref(), &owner)
+            let flake = flake_root(ctx, &file);
+            nix_stanza(name, &file, sops_format, flake.as_deref(), &owner)
         }
         WireFormat::Env => env_line(name),
     };
@@ -50,9 +52,15 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
     Ok(())
 }
 
-/// The store file that sops-nix reads.
-fn sops_file(ctx: &Ctx) -> Result<&Path, Error> {
-    Ok(&ctx.store.require_sops()?.file)
+/// The store file that sops-nix reads, and its format (v0.2 plan 5.7).
+fn sops_file(ctx: &Ctx, name: &Name) -> Result<(PathBuf, SopsFormat), Error> {
+    match ctx.backend.wire_source(name) {
+        Some(WireSource::SopsFile { file, format }) => Ok((file, format)),
+        None => Err(Error::Refused(format!(
+            "store '{}' has no sops file for sops-nix to read, and every wire format needs one",
+            ctx.store.name
+        ))),
+    }
 }
 
 fn warn(ctx: &Ctx, msg: &str) {
@@ -172,7 +180,13 @@ fn nix_string(s: &str) -> String {
     out
 }
 
-fn nix_stanza(name: &Name, file: &Path, flake: Option<&Path>, owner: &str) -> String {
+fn nix_stanza(
+    name: &Name,
+    file: &Path,
+    format: SopsFormat,
+    flake: Option<&Path>,
+    owner: &str,
+) -> String {
     let abs = file.to_string_lossy();
     let rel = flake
         .and_then(|f| file.strip_prefix(f).ok())
@@ -191,7 +205,8 @@ fn nix_stanza(name: &Name, file: &Path, flake: Option<&Path>, owner: &str) -> St
         ),
     };
     format!(
-        "sops.secrets.\"{name}\" = {{\n  sopsFile = {source}\n  format = \"yaml\";\n  owner = \"{owner}\";\n}};\n"
+        "sops.secrets.\"{name}\" = {{\n  sopsFile = {source}\n  format = \"{}\";\n  owner = \"{owner}\";\n}};\n",
+        format.name()
     )
 }
 
@@ -221,6 +236,8 @@ fn env_line(name: &Name) -> String {
 mod tests {
     use super::*;
 
+    const YAML: SopsFormat = SopsFormat::Yaml;
+
     fn name(s: &str) -> Name {
         Name::parse(s).unwrap()
     }
@@ -230,6 +247,7 @@ mod tests {
         let s = nix_stanza(
             &name("gh-token"),
             Path::new("/etc/nixos/secrets/secrit.yaml"),
+            SopsFormat::Yaml,
             Some(Path::new("/etc/nixos")),
             "alice",
         );
@@ -246,9 +264,9 @@ mod tests {
 
     #[test]
     fn the_stanza_falls_back_to_an_absolute_path() {
-        let s = nix_stanza(&name("a"), Path::new("/s/x.yaml"), None, "u");
+        let s = nix_stanza(&name("a"), Path::new("/s/x.yaml"), YAML, None, "u");
         assert!(s.contains("sopsFile = /s/x.yaml; # absolute"), "{s}");
-        let s = nix_stanza(&name("a"), Path::new("/s p/${x}.yaml"), None, "u");
+        let s = nix_stanza(&name("a"), Path::new("/s p/${x}.yaml"), YAML, None, "u");
         assert!(
             s.contains("sopsFile = \"/s p/\\${x}.yaml\"; # absolute"),
             "{s}"
@@ -256,6 +274,7 @@ mod tests {
         let s = nix_stanza(
             &name("a"),
             Path::new("/f/s p.yaml"),
+            YAML,
             Some(Path::new("/f")),
             "u",
         );
@@ -269,6 +288,7 @@ mod tests {
         let s = nix_stanza(
             &name("a"),
             Path::new("/s/a\u{1b}]0;x\u{7}\u{202e}b.yaml"),
+            YAML,
             None,
             "u",
         );
@@ -280,6 +300,24 @@ mod tests {
             ),
             "{s}"
         );
+    }
+
+    /// The stanza names the store's format (v0.2 plan 5.7).
+    #[test]
+    fn the_stanza_names_the_format() {
+        for format in SopsFormat::ALL {
+            let s = nix_stanza(&name("a"), Path::new("/s/x"), format, None, "u");
+            let want = format!("  format = \"{}\";\n", format.name());
+            assert!(s.contains(&want), "{s}");
+        }
+        let s = nix_stanza(
+            &name("a"),
+            Path::new("/s/x.json"),
+            SopsFormat::Json,
+            None,
+            "u",
+        );
+        assert!(s.contains("  format = \"json\";\n"), "{s}");
     }
 
     #[test]

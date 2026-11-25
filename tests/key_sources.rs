@@ -246,19 +246,22 @@ fn a_key_command_round_trips_and_runs_once_per_sops_run() {
     assert_eq!(runs(), 3, "ls decrypts nothing");
 }
 
-/// T47a: a key command that needs `PATH` (an env shebang and a bare `cat`)
-/// fails with the documented environment message, and `doctor` warns
-/// about the shebang.
+/// T47a: a key command that needs `PATH` (an env shebang and a bare program
+/// that only a `PATH` entry could find) fails with the documented
+/// environment message, and `doctor` warns about the shebang. The program
+/// sits in the test's own `bin` directory, never in a default search path,
+/// so the result does not depend on the host's `/bin`.
 #[test]
 fn a_key_command_that_needs_path_fails_with_the_environment_message() {
     let env = TestEnv::new();
     let dir = env.root.path().join("bin");
     let cmd = dir.join("age-key");
     script_at(
-        &cmd,
-        "#!/usr/bin/env sh",
+        &dir.join("age-key-reader"),
+        "#!/bin/sh",
         &format!("cat {}", sh_quote(&env.key_file)),
     );
+    script_at(&cmd, "#!/usr/bin/env sh", "age-key-reader");
     chmod(&dir, 0o700);
     write_section(
         &env,

@@ -1012,7 +1012,8 @@ fn doctor_fails_each_store_check() {
 /// v0.2 plan S3: the sops module split moves the store rows out of the
 /// doctor command and changes no row. This pins every row of a full setup
 /// (a value, a backup, a git repository with a flake) in order. The
-/// hardening rows depend on the host, so the test drops them. The status of
+/// hardening rows depend on the host, so the test drops them; it also drops
+/// the build row that a test build adds (pinned elsewhere). The status of
 /// the agent and tool rows depends on the host and the build, so the test
 /// compares only their names.
 #[test]
@@ -1031,7 +1032,7 @@ fn doctor_rows_keep_their_order() {
     let host_dependent = ["agent", "sops", "age-keygen"];
     let got: Vec<(String, String)> = rows(&out)
         .into_iter()
-        .filter(|(c, _)| c != "hardening")
+        .filter(|(c, _)| c != "hardening" && c != "build")
         .map(|(c, s)| {
             let s = if host_dependent.contains(&c.as_str()) {
                 "*".to_owned()

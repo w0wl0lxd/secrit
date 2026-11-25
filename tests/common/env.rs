@@ -261,6 +261,11 @@ impl Dirs {
 /// The v0.1 environment: [`Dirs`] plus a sops store and its age keys.
 pub struct TestEnv {
     dirs: Dirs,
+    /// The sops format of the store file: `yaml` (`main.yaml`), `json`
+    /// (`main.json`), `dotenv` (`main.env`) or `ini` (`main.ini`). The
+    /// config names no
+    /// `format`, so secrit takes it from the file name.
+    pub format: &'static str,
     pub store_dir: PathBuf,
     pub store_file: PathBuf,
     pub sops_config: PathBuf,
@@ -298,6 +303,12 @@ pub fn bin(name: &str) -> PathBuf {
 
 impl TestEnv {
     pub fn new() -> Self {
+        Self::with_format("yaml")
+    }
+
+    /// A [`TestEnv`] whose store file is sops `format` (`yaml`, `json`,
+    /// `dotenv` or `ini`).
+    pub fn with_format(format: &'static str) -> Self {
         let sops = tool("SECRIT_TEST_SOPS", "sops");
         let age_keygen = tool("SECRIT_TEST_AGE_KEYGEN", "age-keygen");
         let ssh_keygen = tool("SECRIT_TEST_SSH_KEYGEN", "ssh-keygen");
@@ -316,7 +327,8 @@ impl TestEnv {
         let sops_config = store_root.join(".sops.yaml");
         write_sops_config(&sops_config, &recipients);
         let env = Self {
-            store_file: store_dir.join("main.yaml"),
+            store_file: store_dir.join(format!("main.{}", format_ext(format))),
+            format,
             dirs,
             store_dir,
             sops_config,
@@ -395,20 +407,16 @@ impl TestEnv {
         self.create_store_with(path, &[], b"{}\n");
     }
 
-    /// A sops file with the JSON `content`, made by the real sops. `extra`
-    /// is passed to `sops encrypt` (for example `--age <recipient>`).
+    /// A sops file in the store's format with the JSON `content`, made by
+    /// the real sops. `extra` is passed to `sops encrypt` (for example
+    /// `--age <recipient>`).
     pub fn create_store_with(&self, path: &Path, extra: &[&str], content: &[u8]) {
         let mut child = self
             .sops_cmd()
             .arg("encrypt")
             .args(extra)
-            .args([
-                "--input-type",
-                "json",
-                "--output-type",
-                "yaml",
-                "--filename-override",
-            ])
+            .args(["--input-type", "json", "--output-type", self.format])
+            .arg("--filename-override")
             .arg(path)
             .arg("/dev/stdin")
             .stdin(Stdio::piped())
@@ -440,11 +448,18 @@ impl TestEnv {
         c
     }
 
-    /// Decrypt the whole store in the test process. Never printed.
+    /// Decrypt the whole store in the test process, with the store's own
+    /// format as the input type. Never printed.
     pub fn decrypt(&self) -> serde_json::Map<String, Value> {
         let out = self
             .sops_cmd()
-            .args(["decrypt", "--input-type", "yaml", "--output-type", "json"])
+            .args([
+                "decrypt",
+                "--input-type",
+                self.format,
+                "--output-type",
+                "json",
+            ])
             .arg(&self.store_file)
             .output()
             .unwrap();
@@ -453,6 +468,44 @@ impl TestEnv {
             Value::Object(m) => m,
             _ => panic!("decrypt output is not an object"),
         }
+    }
+
+    /// The decrypted value at the name `name`, where each `/` goes one
+    /// map down; `None` when the store has no such key path.
+    pub fn decrypt_at(&self, name: &str) -> Option<Value> {
+        let mut v = Value::Object(self.decrypt());
+        for key in name.split('/') {
+            v = v.as_object_mut()?.remove(key)?;
+        }
+        Some(v)
+    }
+
+    /// The names of the decrypted store, sorted: one for each value that
+    /// is not a map, with `/` between the keys of its path, and one for
+    /// each empty map. sops shows a `DEFAULT` section for every INI file;
+    /// an empty one is not listed.
+    pub fn decrypt_names(&self) -> Vec<String> {
+        fn walk(prefix: &str, map: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+            for (k, v) in map {
+                let name = format!("{prefix}{k}");
+                match v {
+                    Value::Object(m) if !m.is_empty() => walk(&format!("{name}/"), m, out),
+                    _ => out.push(name),
+                }
+            }
+        }
+        let mut all = self.decrypt();
+        if all
+            .get("DEFAULT")
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            all.remove("DEFAULT");
+        }
+        let mut names = Vec::new();
+        walk("", &all, &mut names);
+        names.sort();
+        names
     }
 
     /// Assert that `name` decrypts to the string `want`, without printing it.
@@ -566,9 +619,17 @@ fn keygen(age_keygen: &Path, out: &Path) -> String {
     String::from_utf8(pubkey.stdout).unwrap().trim().to_owned()
 }
 
+/// The file name extension that sops reads as the sops `format`.
+pub fn format_ext(format: &str) -> &str {
+    match format {
+        "dotenv" => "env",
+        other => other,
+    }
+}
+
 pub fn write_sops_config(path: &Path, recipients: &[String]) {
     let text = format!(
-        "creation_rules:\n  - path_regex: secrets/.*\\.yaml$\n    age: {}\n",
+        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json|env|ini)$\n    age: {}\n",
         recipients.join(",")
     );
     std::fs::write(path, text).unwrap();

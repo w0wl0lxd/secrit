@@ -7,8 +7,8 @@
 //! it, and renames it into place through [`FileStore`]. `gpg.rs` runs gpg,
 //! and `doctor.rs` gives the `doctor` rows of a pass store.
 //!
-//! Names have one segment until S5. `list` already reports nested entries
-//! (`a/b`) that pass or gopass wrote.
+//! Names have one segment: the backend refuses a nested name.
+//! `list` still reports nested entries (`a/b`) that pass or gopass wrote.
 
 mod doctor;
 mod gpg;
@@ -29,7 +29,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use self::gpg::{Gpg, Recipient};
 use super::atomic::{self, FileEdit, FileStore};
-use super::{Backend, BackendError, DoctorCtx, Location, PutMode, Target, WriteReport};
+use super::{
+    Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, Target, WireSource,
+    WriteReport,
+};
 use crate::config::{BackendKind, Env, PassStore, PassValue, Pinentry};
 use crate::lock::{self, LockError};
 use crate::name::Name;
@@ -409,6 +412,14 @@ impl PassBackend {
 }
 
 impl Backend for PassBackend {
+    fn capabilities(&self) -> Capabilities {
+        // A nested pass entry (`a/b`) is a later slice; `list` shows one
+        // that another tool wrote, but `store` and `get` refuse the name.
+        Capabilities {
+            nested_names: false,
+        }
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::Pass
     }
@@ -528,6 +539,11 @@ impl Backend for PassBackend {
 
     fn doctor(&self, report: &mut Report, ctx: &DoctorCtx<'_>) {
         doctor::rows(report, self, ctx);
+    }
+
+    fn wire_source(&self, _name: &Name) -> Option<WireSource> {
+        // `wire` emits sops-nix stanzas only.
+        None
     }
 
     fn commit_hint(&self, name: &Name) -> Option<PathBuf> {

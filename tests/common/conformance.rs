@@ -36,6 +36,12 @@ macro_rules! conformance_suite {
     };
 }
 
+/// The short name `short` of a case as a name that the store of `F` can
+/// hold.
+fn name_of<F: Fixture>(short: &str) -> String {
+    format!("{}{short}", F::NAME_PREFIX)
+}
+
 fn assert_stored<F: Fixture>(f: &F, name: &str, want: &[u8]) {
     assert!(
         f.read_back(name).as_deref() == Some(want),
@@ -84,31 +90,32 @@ pub fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u
 pub fn round_trip<F: Fixture>() {
     let f = F::new();
     let d = f.dirs();
+    let [a, b] = F::NAMES;
     assert_eq!(d.ls(), Vec::<String>::new());
 
-    let out = d.store_value("b.key", b"value-b\n");
+    let out = d.store_value(b, b"value-b\n");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stderr(&out).contains("stored b.key in main"));
-    let out = d.store_value("a-key_1", b"value-a");
+    assert!(stderr(&out).contains(&format!("stored {b} in main")));
+    let out = d.store_value(a, b"value-a");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 
-    assert_eq!(d.ls(), ["a-key_1", "b.key"]);
-    assert_eq!(f.names(), ["a-key_1", "b.key"]);
-    assert_stored(&f, "a-key_1", b"value-a");
-    assert_stored(&f, "b.key", b"value-b");
+    assert_eq!(d.ls(), [a, b]);
+    assert_eq!(f.names(), [a, b]);
+    assert_stored(&f, a, b"value-a");
+    assert_stored(&f, b, b"value-b");
     let json = d.run(["ls", "--json"], None);
     assert_eq!(
         String::from_utf8(json.stdout).unwrap().trim(),
-        r#"["a-key_1","b.key"]"#
+        format!(r#"["{a}","{b}"]"#)
     );
     assert_backups(&f, 0);
 
-    let out = d.run(["rm", "a-key_1", "--yes"], None);
+    let out = d.run(["rm", a, "--yes"], None);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stderr(&out).contains("removed a-key_1"));
-    assert_eq!(d.ls(), ["b.key"]);
-    assert_eq!(f.names(), ["b.key"]);
-    assert_eq!(f.read_back("a-key_1"), None);
+    assert!(stderr(&out).contains(&format!("removed {a}")));
+    assert_eq!(d.ls(), [b]);
+    assert_eq!(f.names(), [b]);
+    assert_eq!(f.read_back(a), None);
     assert_backups(&f, 1);
 }
 
@@ -116,11 +123,11 @@ pub fn round_trip<F: Fixture>() {
 /// read.
 pub fn get_stdout_returns_the_exact_value<F: Fixture>() {
     let f = F::new();
-    let out = f
-        .dirs()
-        .run(["store", "n", "--raw"], Some(b"exact\nbytes\n"));
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    let out = f.dirs().run(["store", n, "--raw"], Some(b"exact\nbytes\n"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let (out, got) = get_to_file(&f, false, "n");
+    let (out, got) = get_to_file(&f, false, n);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(got == b"exact\nbytes\n", "get --stdout bytes differ");
 }
@@ -128,11 +135,13 @@ pub fn get_stdout_returns_the_exact_value<F: Fixture>() {
 /// T12: no silent overwrite.
 pub fn create_only_keeps_the_old_value<F: Fixture>() {
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
-    let out = f.dirs().store_value("n", b"new");
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"old")), 0);
+    let out = f.dirs().store_value(n, b"new");
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(stderr(&out).contains("already exists"));
-    assert_stored(&f, "n", b"old");
+    assert_stored(&f, n, b"old");
     assert_backups(&f, 0);
 }
 
@@ -140,28 +149,33 @@ pub fn create_only_keeps_the_old_value<F: Fixture>() {
 /// keeps backups.
 pub fn replace_changes_the_value<F: Fixture>() {
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
-    let out = f.dirs().run(["store", "n", "--replace"], Some(b"new"));
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"old")), 0);
+    let out = f.dirs().run(["store", n, "--replace"], Some(b"new"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert_stored(&f, "n", b"new");
-    assert_eq!(f.names(), ["n"]);
+    assert_stored(&f, n, b"new");
+    assert_eq!(f.names(), [n]);
     assert_backups(&f, 1);
 }
 
 /// `rm` of a missing name fails; with no terminal it needs `--yes`.
 pub fn rm_needs_an_existing_name_and_a_confirmation<F: Fixture>() {
     let f = F::new();
-    let out = f.dirs().run(["rm", "nope", "--yes"], None);
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    let nope = name_of::<F>("nope");
+    let out = f.dirs().run(["rm", nope.as_str(), "--yes"], None);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     assert!(stderr(&out).contains("does not exist"));
 
-    assert_eq!(code(&f.dirs().store_value("n", b"v")), 0);
+    assert_eq!(code(&f.dirs().store_value(n, b"v")), 0);
     let mut cmd = no_tty(&f.dirs().cmd());
-    cmd.args(["rm", "n"]);
+    cmd.args(["rm", n]);
     let out = run_cmd(cmd, std::iter::empty::<&str>(), None);
     assert_eq!(code(&out), 3, "{}", stderr(&out));
-    assert_eq!(f.dirs().ls(), ["n"]);
-    assert_stored(&f, "n", b"v");
+    assert_eq!(f.dirs().ls(), [n]);
+    assert_stored(&f, n, b"v");
     assert_backups(&f, 0);
 }
 
@@ -173,10 +187,12 @@ pub fn ls_never_decrypts<F: Fixture>() {
         "write the case for a backend whose ls unlocks the store (v0.2 plan 5.2)"
     );
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"locked-canary-6d0e")), 0);
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"locked-canary-6d0e")), 0);
     f.lock_values();
-    assert_eq!(f.dirs().ls(), ["n"]);
-    let (out, got) = get_to_file(&f, false, "n");
+    assert_eq!(f.dirs().ls(), [n]);
+    let (out, got) = get_to_file(&f, false, n);
     assert_ne!(code(&out), 0, "get worked on a locked store");
     assert_absent(&out, "locked-canary-6d0e");
     assert!(got.is_empty(), "get wrote a value from a locked store");
@@ -186,19 +202,21 @@ pub fn ls_never_decrypts<F: Fixture>() {
 /// store, replace, get or rm.
 pub fn values_never_reach_a_child_argv<F: Fixture>() {
     let f = F::new();
+    let n = name_of::<F>("n");
+    let n = n.as_str();
     let log = f.dirs().root.path().join("argv 'it'.log");
     if F::CAPS.child_tool {
         f.log_tool_argv(&log);
     }
     let d = f.dirs();
-    let out = d.store_value("n", b"argv-canary-91f3");
+    let out = d.store_value(n, b"argv-canary-91f3");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let out = d.run(["store", "n", "--replace"], Some(b"argv-canary-2b7c"));
+    let out = d.run(["store", n, "--replace"], Some(b"argv-canary-2b7c"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    let (out, got) = get_to_file(&f, false, "n");
+    let (out, got) = get_to_file(&f, false, n);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(got == b"argv-canary-2b7c", "get --stdout bytes differ");
-    let out = d.run(["rm", "n", "--yes"], None);
+    let out = d.run(["rm", n, "--yes"], None);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 
     let logged = std::fs::read_to_string(&log).unwrap_or_default();
@@ -220,16 +238,20 @@ pub fn child_stderr_never_shows_a_value<F: Fixture>() {
         return;
     }
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"old")), 0);
     f.fail_tool_echoing_stdin();
-    let out = f.dirs().store_value("m", b"stderr-canary-5c2e");
+    let out = f
+        .dirs()
+        .store_value(&name_of::<F>("m"), b"stderr-canary-5c2e");
     assert_redacted::<F>(&out, "stderr-canary-5c2e");
     let out = f
         .dirs()
-        .run(["store", "n", "--replace"], Some(b"stderr-canary-8a41"));
+        .run(["store", n, "--replace"], Some(b"stderr-canary-8a41"));
     assert_redacted::<F>(&out, "stderr-canary-8a41");
-    assert_eq!(f.names(), ["n"]);
-    assert_stored(&f, "n", b"old");
+    assert_eq!(f.names(), [n]);
+    assert_stored(&f, n, b"old");
 }
 
 /// A failed write shows no value and drops each echoed line whole (SEC-15).
@@ -249,23 +271,25 @@ fn assert_redacted<F: Fixture>(out: &Output, value: &str) {
 /// when there is no terminal.
 pub fn get_is_refused_for_agents<F: Fixture>() {
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"get-canary-77aa")), 0);
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"get-canary-77aa")), 0);
 
     let mut cmd = f.dirs().cmd();
     cmd.env("CLAUDECODE", "1");
-    let out = run_cmd(cmd, ["get", "n", "--stdout"], None);
+    let out = run_cmd(cmd, ["get", n, "--stdout"], None);
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(stderr(&out).contains("CLAUDECODE"));
     assert_absent(&out, "get-canary-77aa");
 
-    let (out, got) = get_to_file(&f, true, "n");
+    let (out, got) = get_to_file(&f, true, n);
     assert_eq!(code(&out), 3, "get on a terminal for an agent");
     assert!(String::from_utf8_lossy(&out.stdout).contains("CLAUDECODE"));
     assert_absent(&out, "get-canary-77aa");
     assert!(got.is_empty(), "get wrote a value for an agent");
 
     let mut cmd = no_tty(&f.dirs().cmd());
-    cmd.args(["get", "n", "--stdout"]);
+    cmd.args(["get", n, "--stdout"]);
     let out = run_cmd(cmd, std::iter::empty::<&str>(), None);
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(stderr(&out).contains("there is no terminal"));

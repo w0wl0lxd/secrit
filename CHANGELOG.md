@@ -52,6 +52,39 @@ All notable changes to this project are recorded here. The format follows
   `format` key into a new config. A flag that does not match the file name exits 3
   before init makes a file.
 - `secrit wire` prints the store's format in the sops-nix stanza (`format = "json";`).
+- Nested names for sops YAML and JSON stores (v0.2 plan S5). A name is a key path:
+  segments joined by `/`, at most 8 segments and 255 bytes, each segment in the v0.1
+  name grammar. `secrit store a/b/c` writes a nested key and creates the missing maps;
+  `get`, `rm` and `ls` take the same path. `rm` removes each map that it leaves empty.
+  `store` refuses (exit 3, before the value) a path through a value that is not a map
+  (T49), and `store` and `rm` refuse a name that holds other names. The copy validation
+  compares the whole tree: only the target changes, and only missing parent maps are new.
+- `secrit wire a/b/c` prints `key = "a/b/c";` in the sops-nix stanza, so sops-nix reads
+  the nested key; the value appears at `/run/secrets/a/b/c`.
+- A store whose backend cannot hold a nested name refuses one with exit 3 (the
+  `nested_names` capability). The sops YAML and JSON formats hold nested names.
+- sops dotenv stores (v0.2 plan S6). `format = "dotenv"`, or a file name that ends in
+  `.env`, gives a store of `NAME=value` lines. A name is a variable name with no `sops_`
+  prefix; any other name, and a nested name, is refused with exit 3 before the value is
+  read. `store` and `rm` refuse a file that is not strict dotenv lines (a line with no
+  `=`, an empty key, a key twice) or whose `sops_` lines do not form the sops metadata
+  tree. The copy validation reads that flat metadata as it reads the `sops` map of a
+  YAML store. `secrit init --format dotenv` creates the store.
+- `secrit wire` refuses a dotenv store with exit 3, because sops-nix gives a dotenv file
+  to a consumer only as one whole file. The message names `sops exec-env`. `store`
+  prints no `wire` hint for a dotenv store.
+- sops INI stores (v0.2 plan S6b). `format = "ini"`, or a file name that ends in `.ini`,
+  gives a store of `[section]` headers and `KEY = value` lines. A name is `section/key`:
+  two segments, each a variable name, and the section is not `sops`. Any other name is
+  refused with exit 3 before the value is read. `store` and `rm` refuse a file that is
+  not strict INI lines (a quoted value, a `:` separator, an inline comment, a continued
+  line, an indented line, a `[DEFAULT]` header, a section twice, a key twice) or that
+  has no `[sops]` section. The copy validation reads the flat lines of the `[sops]`
+  section as it reads the `sops` map of a YAML store. `secrit init --format ini` creates
+  the store. An `.ini` file name is no longer refused.
+- `secrit wire` refuses an INI store with exit 3, because sops-nix gives an INI file to a
+  consumer only as one whole file. The message names `sops decrypt`. `store` prints no
+  `wire` hint for an INI store.
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
@@ -75,12 +108,21 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- `secrit ls` lists the leaves of a nested map by their key paths, not the map's name.
+  A v0.1 store file in which another tool wrote a nested map (`app: {db: ..., key: ...}`)
+  listed `app` before; it now lists `app/db` and `app/key`. `ls --json` changes the same
+  way, and the `doctor` name count and cleartext rows count and name leaves. A file with
+  only top-level names lists the same names as before.
+- The sops name rules (`sops` reserved, the suffix rules) run when `store` checks the
+  store file, after the config loads, not when the name is parsed. `store sops` and
+  `store x_unencrypted` still exit 3 before a value is read. `get` and `rm` no longer
+  refuse such a name by its form: `get sops` and `rm sops` say that it does not exist,
+  and `rm x_unencrypted` removes a cleartext entry of that name.
 - The message for a sops run that stopped to ask on the terminal names the configured key
   source, not "v0.1 supports only an age key file". A key command that fails because it
   needs `PATH` gets a note on the cleared environment. A run that hits the shorter key
   source deadline says what it may wait on.
 - The default age key file applies only when the store names no other key source.
-
 - The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
   `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML
   store, so `doctor` passes it there; for a JSON store, `doctor` warns and names the new

@@ -238,7 +238,7 @@ fn refuse_a_differing_flag(have: &SopsStore, store: &SopsStore, name: &str) -> R
     // A flag that names the format the config already resolves to is not
     // a difference.
     if have.format != store.format
-        && SopsFormat::of_file(have.format, &have.file).ok() != store.format
+        && Some(SopsFormat::of_file(have.format, &have.file)) != store.format
     {
         differ.push(format!(
             "--format (the config has format = {})",
@@ -686,7 +686,19 @@ fn next_steps(
     out.note(
         "next: with home-manager, set programs.secrit.settings to the config (README, section 'Install')",
     );
-    out.note("next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza");
+    // sops-nix gives out a dotenv or an INI file only whole, so `wire`
+    // refuses it.
+    out.note(match SopsFormat::of_file(store.format, &store.file) {
+        SopsFormat::Yaml | SopsFormat::Json => {
+            "next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza"
+        }
+        SopsFormat::Dotenv => {
+            "next: 'secrit store NAME'; a program reads the store with: sops exec-env FILE 'COMMAND'"
+        }
+        SopsFormat::Ini => {
+            "next: 'secrit store SECTION/KEY'; a program reads the store with: sops decrypt FILE"
+        }
+    });
     Ok(())
 }
 

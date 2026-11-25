@@ -1310,10 +1310,17 @@ PLAN 4.5 holds, with these changes:
 4. **Masking** (S12, `mask.rs`). On when stdout or stderr is not a TTY, or when an agent
    is detected. Patterns per value: the raw bytes; standard and URL-safe base64, each with
    and without padding, at all three byte offsets with the unstable edge characters
-   dropped; percent-encoding; the JSON-escaped form; lowercase hex. The replacement is
-   `[secrit:NAME]`.
+   dropped; percent-encoding in the RFC 3986, form (`+` for space), URI-component and
+   path variants with upper and lower hex digits; the JSON-escaped forms of serde_json,
+   Go and Python (`ensure_ascii`), with and without an escaped solidus; upper and lower
+   hex; and each of these for the value without one final newline. The replacement is
+   `[secrit:NAME]`; a region that overlapping values cover is masked whole as
+   `[secrit:A+B]`.
    - Streaming: hold back only the longest buffer suffix that is a proper prefix of some
-     pattern. Flush the rest at once. Flush everything at EOF. Match leftmost-longest.
+     pattern. Flush the rest at once. Flush everything at EOF. Match leftmost-longest,
+   and grow a match while another match starts inside it and ends after it. After an
+   idle period (100 ms by default) S13 calls `flush_held`, so a prompt with no newline
+   is shown; at most a proper prefix of one pattern goes out unmasked.
      This replaces the "longest − 1 bytes" tail of PLAN 4.5, which held prompts with no
      newline.
    - The matcher is hand-written over `Zeroizing<Vec<u8>>`. `aho-corasick` keeps buffers

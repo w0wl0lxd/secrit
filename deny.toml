@@ -4,6 +4,17 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# The Secret Service backend uses the `secret-service` crate, which builds on
+# `zbus` 5. The zbus project merged `zbus_names`, `zvariant` and
+# `zvariant_derive` into `zbus` 6; `secret-service` has no release on it yet,
+# and the advisories say "no safe upgrade is available". These are
+# maintenance notices, not vulnerabilities. Drop them when `secret-service`
+# moves to `zbus` 6.
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant is merged into zbus 6; secret-service has no release on it yet (maintenance notice only)" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names is merged into zbus 6; secret-service has no release on it yet (maintenance notice only)" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is merged into zbus 6; secret-service has no release on it yet (maintenance notice only)" },
+]
 
 [licenses]
 version = 2

@@ -62,6 +62,13 @@
 //!   cannot be taken back. To match that rest, the masker keeps the last
 //!   released bytes (at most the longest pattern length minus one) in a
 //!   `Zeroizing` buffer.
+//! - A masked region that keeps growing (a value of `aaaa` and an endless
+//!   stream of `a`) is held until it ends, because its label names every
+//!   value that made it. Once the held bytes pass twice the longest pattern
+//!   (plus 4 KiB), they are released as at the end of the stream: the region
+//!   so far is replaced, and a proper prefix at the tail goes out unmasked.
+//!   Memory stays bounded; the output differs from one replace over the
+//!   whole stream only for such a region.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -75,6 +82,9 @@ use crate::secret::SecretValue;
 /// A value shorter than this is not masked: it would match by chance too
 /// often.
 pub const MIN_MASK_BYTES: usize = 4;
+
+/// Held bytes allowed beyond twice the longest pattern (see the known gaps).
+const HOLD_SLACK: usize = 4096;
 
 const B64_STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -93,6 +103,8 @@ pub struct Masker {
     /// How many bytes at the start of `pending` are already out. They can
     /// still start a match whose rest follows; they never go out again.
     released: usize,
+    /// The most that `pending` holds between calls.
+    hold_cap: usize,
     /// The output of the last call. Bytes past its length are always zero.
     out: Zeroizing<Vec<u8>>,
 }
@@ -143,6 +155,7 @@ impl Masker {
         heads.extend(list.iter().map(|p| head_word(&p.bytes)));
         let longest = list.iter().map(|p| p.bytes.len()).max().unwrap_or(0);
         Self {
+            hold_cap: 2 * longest + HOLD_SLACK,
             patterns: Patterns {
                 list,
                 heads,
@@ -176,6 +189,10 @@ impl Masker {
         wipe(&mut self.out);
         append(&mut self.pending, chunk);
         self.scan(false);
+        if self.pending.len() > self.hold_cap {
+            // A region that keeps growing: release it as at the end.
+            self.scan(true);
+        }
         &self.out
     }
 
@@ -1084,6 +1101,22 @@ mod tests {
             got.extend_from_slice(m.finish());
             assert!(got == want, "chunk size {size}");
         }
+    }
+
+    /// A masked region that never ends does not grow the held bytes without
+    /// bound, and every byte of it is still replaced.
+    #[test]
+    fn an_endless_overlapping_region_is_bounded() {
+        let mut m = masker(&[("pw", b"aaaa")]);
+        let cap = m.hold_cap;
+        let mut out = Vec::new();
+        for _ in 0..(4 * cap) / 4 {
+            out.extend_from_slice(m.feed(b"aaaa"));
+            assert!(m.pending.len() <= cap, "{} held", m.pending.len());
+        }
+        out.extend_from_slice(m.finish());
+        assert!(out.starts_with(b"[secrit:pw]"));
+        assert!(!contains(&out, b"aa"), "unmasked bytes in the output");
     }
 
     #[test]

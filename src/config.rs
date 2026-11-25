@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::backend::sops::SopsFormat;
+
 pub const ENV_CONFIG: &str = "SECRIT_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 30;
@@ -83,6 +85,7 @@ struct RawConfig {
 struct RawStore {
     backend: BackendKind,
     file: Option<String>,
+    format: Option<SopsFormat>,
     sops_config: Option<String>,
     age_key_file: Option<String>,
     collection: Option<String>,
@@ -208,6 +211,9 @@ pub struct SecretServiceStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SopsStore {
     pub file: PathBuf,
+    /// The `format` key. With none, the backend takes the format from the
+    /// file name (v0.2 plan 5.8).
+    pub format: Option<SopsFormat>,
     pub sops_config: Option<PathBuf>,
     pub age_key_file: Option<PathBuf>,
 }
@@ -388,6 +394,7 @@ fn store_backend(name: &str, s: &RawStore, home: &Path) -> Result<BackendConfig,
             })?;
             Ok(BackendConfig::Sops(SopsStore {
                 file: expand(file, home, &key("file"))?,
+                format: s.format,
                 sops_config: s
                     .sops_config
                     .as_deref()
@@ -402,6 +409,7 @@ fn store_backend(name: &str, s: &RawStore, home: &Path) -> Result<BackendConfig,
         }
         BackendKind::SecretService => {
             refuse("file", s.file.is_some())?;
+            refuse("format", s.format.is_some())?;
             refuse("sops_config", s.sops_config.is_some())?;
             refuse("age_key_file", s.age_key_file.is_some())?;
             refuse("wire_hint", s.wire_hint.is_some())?;
@@ -629,6 +637,7 @@ timeout_secs = 5
             wire_hint,
             backend: BackendConfig::Sops(SopsStore {
                 file: "/r/secrets/main.yaml".into(),
+                format: None,
                 sops_config: sops_config.map(PathBuf::from),
                 age_key_file: Some("/r/keys/key1.txt".into()),
             }),
@@ -663,7 +672,7 @@ timeout_secs = 5
         let e = parse(&format!("{head}file = \"/s.yaml\"\nfiel = \"/x\"\n")).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `collection`, `unlock`, `wire_hint`"
+            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `format`, `sops_config`, `age_key_file`, `collection`, `unlock`, `wire_hint`"
         );
         let e = parse(&format!("{head}file = 5\n")).unwrap_err();
         assert_eq!(
@@ -689,13 +698,36 @@ timeout_secs = 5
             for typo in [
                 "fiel = \"/x\"\n",
                 "wire-hint = true\n",
-                "format = \"yaml\"\n",
+                "Format = \"json\"\n",
             ] {
                 let bad = format!("{good}{typo}");
                 let e = parse(&bad).unwrap_err();
                 assert!(matches!(e, ConfigError::Parse { .. }), "{bad}");
                 assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
             }
+        }
+    }
+
+    /// The `format` key of a sops store takes `yaml`, `json`, `dotenv` or
+    /// `ini` (v0.2 plan 5.8). Any other value is refused at its own line.
+    #[test]
+    fn the_sops_format_key_is_checked() {
+        let head = "[stores.a]\nbackend = \"sops\"\nfile = \"/s.sops\"\n";
+        for (value, want) in [
+            ("yaml", Some(SopsFormat::Yaml)),
+            ("json", Some(SopsFormat::Json)),
+            ("dotenv", Some(SopsFormat::Dotenv)),
+            ("ini", Some(SopsFormat::Ini)),
+        ] {
+            let c = parse(&format!("{head}format = \"{value}\"\n")).unwrap();
+            assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, want);
+        }
+        let c = parse(head).unwrap();
+        assert_eq!(sops_of(c.store(Some("a")).unwrap()).format, None);
+        for value in ["\"env\"", "\"binary\"", "\"INI\"", "\"JSON\"", "5"] {
+            let e = parse(&format!("{head}format = {value}\n")).unwrap_err();
+            assert!(matches!(e, ConfigError::Parse { .. }), "{value}");
+            assert!(e.to_string().contains("line 4, column 10"), "{value}: {e}");
         }
     }
 

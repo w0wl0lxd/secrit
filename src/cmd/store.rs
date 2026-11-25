@@ -2,7 +2,7 @@
 
 use super::rm::{NO_BACKUP, confirm};
 use super::{Ctx, StoreArgs};
-use crate::backend::{BackendError, PutMode};
+use crate::backend::{BackendError, PutMode, WireSource};
 use crate::cli::ARGV_VALUE_MESSAGE;
 use crate::display::escape_path;
 use crate::error::Error;
@@ -68,8 +68,12 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     if no_backup {
         ctx.status(NO_BACKUP);
     }
-    // Only a sops store has a sops-nix stanza to print.
-    if ctx.store.wire_hint && ctx.store.sops().is_some() {
+    // The hint is for a name that `wire` can expose.
+    let wired = matches!(
+        ctx.backend.wire_source(name),
+        Some(WireSource::SopsFile { .. })
+    );
+    if ctx.store.wire_hint && wired {
         ctx.status(&format!(
             "run 'secrit wire {name}' to expose it at /run/secrets/{name}"
         ));

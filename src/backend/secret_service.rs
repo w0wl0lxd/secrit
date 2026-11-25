@@ -48,7 +48,9 @@ use secret_service::blocking::{Collection, SecretService};
 use zbus::zvariant::OwnedObjectPath;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, WriteReport};
+use super::{
+    Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, WireSource, WriteReport,
+};
 use crate::agent;
 use crate::config::{BackendKind, Env, SecretServiceStore, Unlock};
 use crate::display::escape;
@@ -576,12 +578,21 @@ fn value_of(
 }
 
 impl Backend for SecretServiceBackend {
+    fn wire_source(&self, _name: &Name) -> Option<WireSource> {
+        // `wire` emits sops-nix stanzas only.
+        None
+    }
+
     fn kind(&self) -> BackendKind {
         BackendKind::SecretService
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { backups: false }
+        // A nested name is a later slice for this backend.
+        Capabilities {
+            nested_names: false,
+            backups: false,
+        }
     }
 
     fn location(&self) -> &Location {

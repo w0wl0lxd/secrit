@@ -261,9 +261,9 @@ impl Dirs {
 /// The v0.1 environment: [`Dirs`] plus a sops store and its age keys.
 pub struct TestEnv {
     dirs: Dirs,
-    /// The sops format of the store file: `yaml` (`main.yaml`) or `json`
-    /// (`main.json`). The config names no `format`, so secrit takes it
-    /// from the file name.
+    /// The sops format of the store file: `yaml` (`main.yaml`), `json`
+    /// (`main.json`) or `dotenv` (`main.env`). The config names no
+    /// `format`, so secrit takes it from the file name.
     pub format: &'static str,
     pub store_dir: PathBuf,
     pub store_file: PathBuf,
@@ -305,7 +305,8 @@ impl TestEnv {
         Self::with_format("yaml")
     }
 
-    /// A [`TestEnv`] whose store file is sops `format` (`yaml` or `json`).
+    /// A [`TestEnv`] whose store file is sops `format` (`yaml`, `json` or
+    /// `dotenv`).
     pub fn with_format(format: &'static str) -> Self {
         let sops = tool("SECRIT_TEST_SOPS", "sops");
         let age_keygen = tool("SECRIT_TEST_AGE_KEYGEN", "age-keygen");
@@ -325,7 +326,7 @@ impl TestEnv {
         let sops_config = store_root.join(".sops.yaml");
         write_sops_config(&sops_config, &recipients);
         let env = Self {
-            store_file: store_dir.join(format!("main.{format}")),
+            store_file: store_dir.join(format!("main.{}", format_ext(format))),
             format,
             dirs,
             store_dir,
@@ -579,9 +580,17 @@ fn keygen(age_keygen: &Path, out: &Path) -> String {
     String::from_utf8(pubkey.stdout).unwrap().trim().to_owned()
 }
 
+/// The file name extension that sops reads as the sops `format`.
+pub fn format_ext(format: &str) -> &str {
+    match format {
+        "dotenv" => "env",
+        other => other,
+    }
+}
+
 pub fn write_sops_config(path: &Path, recipients: &[String]) {
     let text = format!(
-        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json)$\n    age: {}\n",
+        "creation_rules:\n  - path_regex: secrets/.*\\.(yaml|json|env)$\n    age: {}\n",
         recipients.join(",")
     );
     std::fs::write(path, text).unwrap();

@@ -84,31 +84,32 @@ fn get_to_file<F: Fixture>(f: &F, agent: bool, name: &str) -> (Output, Vec<u8>) 
 pub fn round_trip<F: Fixture>() {
     let f = F::new();
     let d = f.dirs();
+    let [a, b] = F::NAMES;
     assert_eq!(d.ls(), Vec::<String>::new());
 
-    let out = d.store_value("b.key", b"value-b\n");
+    let out = d.store_value(b, b"value-b\n");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stderr(&out).contains("stored b.key in main"));
-    let out = d.store_value("a-key_1", b"value-a");
+    assert!(stderr(&out).contains(&format!("stored {b} in main")));
+    let out = d.store_value(a, b"value-a");
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 
-    assert_eq!(d.ls(), ["a-key_1", "b.key"]);
-    assert_eq!(f.names(), ["a-key_1", "b.key"]);
-    assert_stored(&f, "a-key_1", b"value-a");
-    assert_stored(&f, "b.key", b"value-b");
+    assert_eq!(d.ls(), [a, b]);
+    assert_eq!(f.names(), [a, b]);
+    assert_stored(&f, a, b"value-a");
+    assert_stored(&f, b, b"value-b");
     let json = d.run(["ls", "--json"], None);
     assert_eq!(
         String::from_utf8(json.stdout).unwrap().trim(),
-        r#"["a-key_1","b.key"]"#
+        format!(r#"["{a}","{b}"]"#)
     );
     assert_backups(&f, 0);
 
-    let out = d.run(["rm", "a-key_1", "--yes"], None);
+    let out = d.run(["rm", a, "--yes"], None);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stderr(&out).contains("removed a-key_1"));
-    assert_eq!(d.ls(), ["b.key"]);
-    assert_eq!(f.names(), ["b.key"]);
-    assert_eq!(f.read_back("a-key_1"), None);
+    assert!(stderr(&out).contains(&format!("removed {a}")));
+    assert_eq!(d.ls(), [b]);
+    assert_eq!(f.names(), [b]);
+    assert_eq!(f.read_back(a), None);
     assert_backups(&f, 1);
 }
 

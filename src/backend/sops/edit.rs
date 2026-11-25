@@ -165,7 +165,8 @@ impl SopsBackend {
 
     /// Refuse a name that sops would store in cleartext under the file's own
     /// rules (the metadata in its `sops` block, which `sops set` applies),
-    /// or that the format reserves (v0.2 plan 5.4, 6.1.3). sops tests the
+    /// or that the format cannot hold or reserves (v0.2 plan 5.4, 6.1.3;
+    /// T58 for the `sops_` prefix of a dotenv file). sops tests the
     /// suffix rules on each key of the path (sops 3.13.3, checked in the
     /// S5 lab): a leaf is cleartext when any key on its path ends with
     /// `unencrypted_suffix`, and encrypted under `encrypted_suffix` only
@@ -175,6 +176,7 @@ impl SopsBackend {
         name: &Name,
         meta: &Map<String, Value>,
     ) -> Result<(), BackendError> {
+        self.format.check_name(name)?;
         // Only the top-level `sops` key is metadata: `app/sops` is a name.
         if name.segments().next() == Some(RESERVED) {
             return Err(NameError::Reserved.into());

@@ -279,7 +279,9 @@ impl Backend for SopsBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { nested_names: true }
+        Capabilities {
+            nested_names: self.format.nested_names(),
+        }
     }
 
     fn location(&self) -> &Location {
@@ -367,12 +369,21 @@ impl Backend for SopsBackend {
     }
 
     /// sops-nix reads a nested key from the `key` option, with the
-    /// segments joined by `/` (v0.2 plan 5.7).
+    /// segments joined by `/` (v0.2 plan 5.7). It has no key option for a
+    /// dotenv file: the secret is the whole decrypted file (sops-nix
+    /// `sops-install-secrets`, read in the S6 lab).
     fn wire_source(&self, name: &Name) -> Option<WireSource> {
-        Some(WireSource::SopsFile {
-            file: self.file().to_path_buf(),
-            format: self.format,
-            key: name.is_nested().then(|| name.clone()),
+        let file = self.file().to_path_buf();
+        Some(match self.format {
+            SopsFormat::Yaml | SopsFormat::Json => WireSource::SopsFile {
+                file,
+                format: self.format,
+                key: name.is_nested().then(|| name.clone()),
+            },
+            SopsFormat::Dotenv => WireSource::WholeSopsFile {
+                file,
+                format: self.format,
+            },
         })
     }
 }
@@ -415,7 +426,7 @@ fn nearest_sops_config(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::format::tests::{BASE, doc};
+    use super::format::tests::{BASE, DOTENV_BASE, doc};
     use super::format::validate;
     use super::*;
     use crate::error::Exit;
@@ -527,11 +538,11 @@ mod tests {
         assert_eq!(of_store.pattern, of_backend.pattern);
 
         // A store whose format is not known has no temp copies to ignore.
-        let env = SopsStore {
-            file: tmp.path().join("main.env"),
+        let ini = SopsStore {
+            file: tmp.path().join("main.ini"),
             ..store
         };
-        let e = TempIgnore::of(&env).unwrap_err();
+        let e = TempIgnore::of(&ini).unwrap_err();
         assert_eq!(e.exit(), Exit::Refused);
     }
 
@@ -565,16 +576,93 @@ mod tests {
             };
             assert_eq!((file.as_path(), format), (b.file(), want), "{name}");
             assert_eq!(key, None, "{name}");
+            assert!(b.capabilities().nested_names, "{name}");
         }
-        for name in ["s.env", "s.ini"] {
-            let e = open(name, None).unwrap_err();
-            assert_eq!(e.exit(), Exit::Refused, "{name}");
+        // A dotenv store is flat, and sops-nix gives it out only whole.
+        for (name, explicit) in [("s.env", None), ("s.txt", Some(SopsFormat::Dotenv))] {
+            let b = open(name, explicit).unwrap();
+            assert_eq!(b.format, SopsFormat::Dotenv, "{name}");
+            assert!(!b.capabilities().nested_names, "{name}");
+            let want = WireSource::WholeSopsFile {
+                file: b.file().to_path_buf(),
+                format: SopsFormat::Dotenv,
+            };
+            assert_eq!(b.wire_source(&n), Some(want), "{name}");
+        }
+        let e = open("s.ini", None).unwrap_err();
+        assert_eq!(e.exit(), Exit::Refused);
+    }
+
+    /// v0.2 plan 5.4 and T58: a dotenv store takes a variable name with
+    /// no `sops_` prefix. `check_put` refuses any other name with exit 3,
+    /// with no sops run (the sops path here does not exist). The suffix
+    /// rule of the flat metadata applies too.
+    #[test]
+    fn a_dotenv_store_takes_variable_names_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store_file_for(tmp.path(), "main.env", DOTENV_BASE);
+        assert_eq!(b.format, SopsFormat::Dotenv);
+        assert_eq!(b.list().unwrap(), ["A", "EMPTY"]);
+        for ok in ["TOKEN", "b2_C", "SOPS_X", "xsops_y"] {
+            assert!(b.check_put(&name(ok), PutMode::CreateOnly).is_ok(), "{ok}");
+        }
+        for mode in [PutMode::CreateOnly, PutMode::Replace] {
+            for bad in ["sops_x", "sops_mac", "sops_age__list_0__map_enc"] {
+                let e = b.check_put(&name(bad), mode).unwrap_err();
+                assert!(
+                    matches!(e, BackendError::Name(NameError::MetadataPrefix)),
+                    "{bad}: {e}"
+                );
+                assert!(e.to_string().contains("metadata"), "{e}");
+                assert_eq!(e.exit(), Exit::Refused);
+            }
+            for bad in ["a.b", "a-b", "0a", "a/b"] {
+                let e = b.check_put(&name(bad), mode).unwrap_err();
+                assert!(
+                    matches!(e, BackendError::Name(NameError::NotVariable)),
+                    "{bad}: {e}"
+                );
+                assert_eq!(e.exit(), Exit::Refused);
+            }
+        }
+        // The name `sops` stays reserved, as in every sops format.
+        let e = b.check_put(&name("sops"), PutMode::CreateOnly).unwrap_err();
+        assert!(matches!(e, BackendError::Name(NameError::Reserved)), "{e}");
+        // The file sets unencrypted_suffix = _pub in a flat metadata line.
+        let e = b
+            .check_put(&name("tok_pub"), PutMode::CreateOnly)
+            .unwrap_err();
+        assert!(
+            matches!(e, BackendError::Name(NameError::UnencryptedSuffix { .. })),
+            "{e}"
+        );
+        // A metadata line is not an entry, so it is no name to remove.
+        let e = b.check_remove(&name("sops_mac")).unwrap_err();
+        assert!(matches!(e, BackendError::Missing { .. }), "{e}");
+        assert!(b.check_remove(&name("A")).is_ok());
+        let e = b.check_put(&name("A"), PutMode::CreateOnly).unwrap_err();
+        assert!(matches!(e, BackendError::Exists { .. }), "{e}");
+        assert!(b.inspect().unwrap().plaintext.is_empty());
+
+        // A YAML store has no such rule.
+        let yaml = backend_for(tmp.path(), BASE);
+        for ok in ["sops_x", "a.b", "0a"] {
+            assert!(
+                yaml.check_put(&name(ok), PutMode::CreateOnly).is_ok(),
+                "{ok}"
+            );
         }
     }
 
     fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {
-        let file = dir.join("main.yaml");
-        std::fs::write(&file, yaml).unwrap();
+        store_file_for(dir, "main.yaml", yaml)
+    }
+
+    /// A backend for the store file `file_name` in `dir` with the content
+    /// `text`. The format comes from the file name.
+    fn store_file_for(dir: &Path, file_name: &str, text: &str) -> SopsBackend {
+        let file = dir.join(file_name);
+        std::fs::write(&file, text).unwrap();
         let store = SopsStore {
             file,
             format: None,

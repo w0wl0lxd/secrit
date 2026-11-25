@@ -1,6 +1,11 @@
 //! The store file format (v0.2 plan 5.5, 5.8 and 6.1.2): how secrit picks
 //! the format of a sops file, parses it, and checks the copy that sops
 //! wrote.
+//!
+//! A dotenv file is read as sops 3.13.3 reads it (`stores/dotenv` and
+//! `stores/flatten.go`, checked in the S6 lab): one `KEY=VALUE` per line,
+//! split at the first `=` with no trimming, `#` in the first column for a
+//! comment, and every `sops_` line as flat metadata.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,7 +18,7 @@ use serde_json::{Map, Number, Value};
 use super::edit::Op;
 use crate::backend::{BackendError, Location};
 use crate::display::escape;
-use crate::name::Name;
+use crate::name::{DOTENV_METADATA_PREFIX, Name, NameError};
 
 /// The recipient keys of the sops metadata.
 const KEY_TYPES: &[&str] = &[
@@ -36,9 +41,17 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 const YAML_ENDINGS: [&str; 2] = [".yaml", ".yml"];
 /// The file name ending that sops reads as JSON.
 const JSON_ENDING: &str = ".json";
+/// The file name ending that sops reads as dotenv.
+const DOTENV_ENDING: &str = ".env";
 /// The file name endings that sops reads as a format that secrit does not
-/// support yet, with that format's name (v0.2 plan S6 and S6b).
-const UNSUPPORTED_ENDINGS: [(&str, &str); 2] = [(".env", "dotenv"), (".ini", "INI")];
+/// support yet, with that format's name (v0.2 plan S6b).
+const UNSUPPORTED_ENDINGS: [(&str, &str); 1] = [(".ini", "INI")];
+/// The separators of a flat metadata key (sops `stores/flatten.go`):
+/// `age__list_0__map_enc` is `age[0].enc`.
+const MAP_SEPARATOR: &str = "__map_";
+const LIST_SEPARATOR: &str = "__list_";
+/// What a write says about a file that is not dotenv lines.
+const NOT_DOTENV: &str = "it is not a sops dotenv file";
 
 /// The format of a sops store file: the `format` key of a sops store
 /// (v0.2 plan 5.8).
@@ -49,6 +62,8 @@ pub enum SopsFormat {
     Yaml,
     /// A sops JSON file
     Json,
+    /// A sops dotenv file
+    Dotenv,
 }
 
 /// A parsed sops file: the entries, and the sops metadata apart.
@@ -61,20 +76,23 @@ pub struct SopsDoc {
 impl SopsFormat {
     /// Every format: for the tests that must cover each one, and for the
     /// temp copies that `doctor` lists.
-    pub const ALL: [SopsFormat; 2] = [SopsFormat::Yaml, SopsFormat::Json];
+    pub const ALL: [SopsFormat; 3] = [SopsFormat::Yaml, SopsFormat::Json, SopsFormat::Dotenv];
 
     /// The format of the store `file`: `explicit` (the `format` key), else
     /// the one that sops picks from the file name. A `.json` name means
-    /// JSON, and any other name means YAML, as in v0.1. A name that sops
-    /// reads as dotenv or INI is refused until secrit supports that format
-    /// (v0.2 plan 5.8).
+    /// JSON, a `.env` name means dotenv, and any other name means YAML, as
+    /// in v0.1. A name that sops reads as INI is refused until secrit
+    /// supports that format (v0.2 plan 5.8).
     pub fn of_file(explicit: Option<SopsFormat>, file: &Path) -> Result<Self, BackendError> {
         if let Some(format) = explicit {
             return Ok(format);
         }
         let name = lower_file_name(file);
-        if name.ends_with(JSON_ENDING) {
-            return Ok(SopsFormat::Json);
+        if let Some(format) = [SopsFormat::Json, SopsFormat::Dotenv]
+            .into_iter()
+            .find(|f| f.endings().iter().any(|e| name.ends_with(e)))
+        {
+            return Ok(format);
         }
         match UNSUPPORTED_ENDINGS.iter().find(|(e, _)| name.ends_with(e)) {
             Some((ending, format)) => Err(BackendError::Unsafe {
@@ -93,6 +111,7 @@ impl SopsFormat {
         match self {
             SopsFormat::Yaml => "yaml",
             SopsFormat::Json => "json",
+            SopsFormat::Dotenv => "dotenv",
         }
     }
 
@@ -103,7 +122,28 @@ impl SopsFormat {
 
     /// The extension of a temp copy, so sops reads it in this format.
     pub fn temp_ext(self) -> &'static str {
-        self.name()
+        match self {
+            SopsFormat::Yaml | SopsFormat::Json => self.name(),
+            SopsFormat::Dotenv => "env",
+        }
+    }
+
+    /// Whether a name with more than one segment addresses a nested key.
+    /// A dotenv file is flat: sops refuses a nested `set` on it (S6 lab).
+    pub fn nested_names(self) -> bool {
+        match self {
+            SopsFormat::Yaml | SopsFormat::Json => true,
+            SopsFormat::Dotenv => false,
+        }
+    }
+
+    /// The name rule of the format, on top of the name grammar (v0.2 plan
+    /// 5.4). A put runs it before any input.
+    pub fn check_name(self, name: &Name) -> Result<(), NameError> {
+        match self {
+            SopsFormat::Yaml | SopsFormat::Json => Ok(()),
+            SopsFormat::Dotenv => name.check_dotenv(),
+        }
     }
 
     /// Whether `ext` is the temp copy extension of any format. A change of
@@ -117,7 +157,7 @@ impl SopsFormat {
     /// input of `sops encrypt`, whatever the output format.
     pub fn empty_doc(self) -> &'static [u8] {
         match self {
-            SopsFormat::Yaml | SopsFormat::Json => b"{}\n",
+            SopsFormat::Yaml | SopsFormat::Json | SopsFormat::Dotenv => b"{}\n",
         }
     }
 
@@ -126,6 +166,7 @@ impl SopsFormat {
         match self {
             SopsFormat::Yaml => "YAML",
             SopsFormat::Json => "JSON",
+            SopsFormat::Dotenv => "dotenv",
         }
     }
 
@@ -134,17 +175,25 @@ impl SopsFormat {
         match self {
             SopsFormat::Yaml => "sops YAML file",
             SopsFormat::Json => "sops JSON file",
+            SopsFormat::Dotenv => "sops dotenv file",
+        }
+    }
+
+    /// The file name endings that sops reads as this format.
+    fn endings(self) -> &'static [&'static str] {
+        match self {
+            SopsFormat::Yaml => &YAML_ENDINGS,
+            SopsFormat::Json => &[JSON_ENDING],
+            SopsFormat::Dotenv => &[DOTENV_ENDING],
         }
     }
 
     /// The file name endings that sops reads as another format.
     fn other_endings(self) -> Vec<&'static str> {
-        let own: &[&str] = match self {
-            SopsFormat::Yaml => &[JSON_ENDING],
-            SopsFormat::Json => &YAML_ENDINGS,
-        };
-        own.iter()
-            .copied()
+        Self::ALL
+            .into_iter()
+            .filter(|f| *f != self)
+            .flat_map(|f| f.endings().iter().copied())
             .chain(UNSUPPORTED_ENDINGS.iter().map(|(e, _)| *e))
             .collect()
     }
@@ -155,6 +204,10 @@ impl SopsFormat {
             SopsFormat::Yaml => serde_saphyr::from_slice(bytes)
                 .map_err(|_| self.parse_error(path, "invalid YAML"))?,
             SopsFormat::Json => strict_json(bytes).map_err(|what| self.parse_error(path, what))?,
+            SopsFormat::Dotenv => {
+                let lines = dotenv_lines(bytes).map_err(|what| self.parse_error(path, what))?;
+                return self.dotenv_doc(lines, path);
+            }
         };
         self.doc(value, path)
     }
@@ -177,14 +230,26 @@ impl SopsFormat {
         let Some(Value::Object(meta)) = entries.remove("sops") else {
             return Err(parse_err("there is no sops metadata block"));
         };
-        if !meta
-            .get("mac")
-            .and_then(Value::as_str)
-            .is_some_and(|m| m.starts_with("ENC["))
-        {
+        if !has_mac(&meta) {
             return Err(parse_err("the sops block has no MAC"));
         }
         Ok(SopsDoc { entries, meta })
+    }
+
+    /// The entries and the sops metadata of the lines of a dotenv file.
+    fn dotenv_doc(self, lines: DotenvLines, path: &Path) -> Result<SopsDoc, BackendError> {
+        let parse_err = |what: &str| self.parse_error(path, what);
+        if lines.meta.is_empty() {
+            return Err(parse_err("there are no sops metadata lines"));
+        }
+        let meta = unflatten(lines.meta).map_err(parse_err)?;
+        if !has_mac(&meta) {
+            return Err(parse_err("the sops metadata lines have no MAC"));
+        }
+        Ok(SopsDoc {
+            entries: lines.entries,
+            meta,
+        })
     }
 
     /// [`Self::parse`] for the write path. Every sops run names the
@@ -194,7 +259,9 @@ impl SopsFormat {
     /// fail on it. A YAML store refuses a JSON file: a YAML file in flow
     /// style also parses as JSON, but sops never writes one, and a leading
     /// UTF-8 BOM does not hide a JSON file. A JSON store refuses a file
-    /// that is not strict JSON, and parses the file only once.
+    /// that is not strict JSON, and parses the file only once. A dotenv
+    /// store refuses a file that is not `KEY=VALUE` lines: a sops YAML,
+    /// JSON or INI file has a line with no `=`.
     pub fn parse_to_write(self, bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
         self.refuse_other_name(path)?;
         match self {
@@ -213,6 +280,10 @@ impl SopsFormat {
                 let value = strict_json(bytes)
                     .map_err(|_| self.other_format(path, "it is not a sops JSON file"))?;
                 self.doc(value, path)
+            }
+            SopsFormat::Dotenv => {
+                let lines = dotenv_lines(bytes).map_err(|_| self.other_format(path, NOT_DOTENV))?;
+                self.dotenv_doc(lines, path)
             }
         }
     }
@@ -258,6 +329,173 @@ fn lower_file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+/// Whether the sops metadata holds the MAC of the file.
+fn has_mac(meta: &Map<String, Value>) -> bool {
+    meta.get("mac")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.starts_with("ENC["))
+}
+
+/// The lines of a dotenv file: the entries, and the metadata lines apart
+/// with the `sops_` prefix off.
+struct DotenvLines {
+    entries: Map<String, Value>,
+    meta: BTreeMap<String, String>,
+}
+
+/// `bytes` as the lines of a dotenv file, split as sops splits them: at
+/// each `\n`, with no trimming; an empty line and a line whose first byte
+/// is `#` hold no entry; every other line is `KEY=VALUE`, split at the
+/// first `=`. An entry value stays as written, because the copy validation
+/// compares the raw `ENC[...]` strings. sops accepts a key twice and a line
+/// with an empty key; secrit refuses both, because either can hide an
+/// entry from the copy validation. The error is fixed text: it must not
+/// quote file content.
+fn dotenv_lines(bytes: &[u8]) -> Result<DotenvLines, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "the file is not UTF-8")?;
+    let mut entries = Map::new();
+    let mut meta = BTreeMap::new();
+    for line in text.split('\n') {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err("a line is not KEY=VALUE");
+        };
+        if key.is_empty() {
+            return Err("a line has no key");
+        }
+        let repeated = match key.strip_prefix(DOTENV_METADATA_PREFIX) {
+            // sops writes a newline in a metadata value as `\n`.
+            Some(meta_key) => meta
+                .insert(meta_key.to_owned(), value.replace("\\n", "\n"))
+                .is_some(),
+            None => entries
+                .insert(key.to_owned(), Value::String(value.to_owned()))
+                .is_some(),
+        };
+        if repeated {
+            return Err("a key appears twice");
+        }
+    }
+    Ok(DotenvLines { entries, meta })
+}
+
+/// One step of a flat metadata key.
+enum Step<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+/// `s` up to the first separator, and the rest from that separator on.
+fn until_separator(s: &str) -> (&str, &str) {
+    let at = [MAP_SEPARATOR, LIST_SEPARATOR]
+        .iter()
+        .filter_map(|sep| s.find(sep))
+        .min()
+        .unwrap_or(s.len());
+    s.split_at(at)
+}
+
+/// The most steps in one flat metadata key. The deepest key that sops
+/// writes has 5 (`key_groups__list_0__map_age__list_0__map_enc`).
+const MAX_STEPS: usize = 16;
+
+/// The steps of a flat metadata key: a key, then `__map_KEY` and
+/// `__list_N` parts. `None` for an empty key, for more than [`MAX_STEPS`]
+/// steps, and for an index that is not a plain number below `limit`: sops
+/// reads any other text as 0, and two spellings of one index would give
+/// two files the same tree.
+fn steps(key: &str, limit: usize) -> Option<Vec<Step<'_>>> {
+    let (head, mut rest) = until_separator(key);
+    if head.is_empty() {
+        return None;
+    }
+    let mut out = vec![Step::Key(head)];
+    while !rest.is_empty() {
+        if out.len() == MAX_STEPS {
+            return None;
+        }
+        if let Some(after) = rest.strip_prefix(MAP_SEPARATOR) {
+            let (k, tail) = until_separator(after);
+            if k.is_empty() {
+                return None;
+            }
+            out.push(Step::Key(k));
+            rest = tail;
+        } else {
+            let (n, tail) = until_separator(rest.strip_prefix(LIST_SEPARATOR)?);
+            let index: usize = n.parse().ok()?;
+            if index >= limit || index.to_string() != n {
+                return None;
+            }
+            out.push(Step::Index(index));
+            rest = tail;
+        }
+    }
+    Some(out)
+}
+
+/// Put `leaf` at `steps` under `slot`. A slot that no line filled yet is
+/// `Null`. `None` when the steps cross a value of another kind, or when
+/// the slot of the leaf is taken.
+fn place(slot: &mut Value, steps: &[Step<'_>], leaf: String) -> Option<()> {
+    let Some((step, rest)) = steps.split_first() else {
+        if !slot.is_null() {
+            return None;
+        }
+        *slot = Value::String(leaf);
+        return Some(());
+    };
+    match step {
+        Step::Key(k) => {
+            if slot.is_null() {
+                *slot = Value::Object(Map::new());
+            }
+            let next = slot.as_object_mut()?.entry(*k).or_insert(Value::Null);
+            place(next, rest, leaf)
+        }
+        Step::Index(i) => {
+            if slot.is_null() {
+                *slot = Value::Array(Vec::new());
+            }
+            let list = slot.as_array_mut()?;
+            if list.len() <= *i {
+                list.resize(*i + 1, Value::Null);
+            }
+            place(&mut list[*i], rest, leaf)
+        }
+    }
+}
+
+/// Whether a list of `v` has an index that no line filled.
+fn has_hole(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Array(a) => a.iter().any(has_hole),
+        Value::Object(m) => m.values().any(has_hole),
+        _ => false,
+    }
+}
+
+/// The metadata tree of the flat `sops_` lines of a dotenv file (v0.2 plan
+/// 6.1.2), as sops builds it: `__map_` opens a map and `__list_N` a list.
+/// sops refuses a value and a map under one key, and a list with a missing
+/// index; so does this.
+fn unflatten(flat: BTreeMap<String, String>) -> Result<Map<String, Value>, &'static str> {
+    const BAD: &str = "the sops metadata lines do not form a tree";
+    let limit = flat.len();
+    let mut root = Value::Object(Map::new());
+    for (key, value) in flat {
+        let steps = steps(&key, limit).ok_or(BAD)?;
+        place(&mut root, &steps, value).ok_or(BAD)?;
+    }
+    match root {
+        Value::Object(meta) if !meta.values().any(has_hole) => Ok(meta),
+        _ => Err(BAD),
+    }
 }
 
 /// `bytes` as strict JSON (v0.2 plan 6.1.2): one value, no byte order mark,
@@ -677,6 +915,7 @@ pub(super) mod tests {
         for (f, text, path) in [
             (SopsFormat::Yaml, BASE, "/s/main.yaml"),
             (SopsFormat::Json, JSON_BASE, "/s/main.json"),
+            (SopsFormat::Dotenv, DOTENV_BASE, "/s/main.env"),
         ] {
             let path = Path::new(path);
             let read = f.parse(text.as_bytes(), path).unwrap();
@@ -784,7 +1023,8 @@ pub(super) mod tests {
     }
 
     /// v0.2 plan 5.8: the `format` key wins; with none, `.json` means JSON,
-    /// `.env` and `.ini` are refused, and any other name means YAML.
+    /// `.env` means dotenv, `.ini` is refused, and any other name means
+    /// YAML.
     #[test]
     fn the_format_comes_from_the_key_or_the_file_name() {
         let of = |explicit, name: &str| SopsFormat::of_file(explicit, &Path::new("/s").join(name));
@@ -795,10 +1035,14 @@ pub(super) mod tests {
             ("main.txt", SopsFormat::Yaml),
             ("main.json", SopsFormat::Json),
             ("MAIN.JSON", SopsFormat::Json),
+            ("a.env", SopsFormat::Dotenv),
+            (".env", SopsFormat::Dotenv),
+            ("PROD.ENV", SopsFormat::Dotenv),
+            ("a.env.yaml", SopsFormat::Yaml),
         ] {
             assert_eq!(of(None, name).unwrap(), want, "{name}");
         }
-        for (name, said) in [("a.env", "dotenv"), (".env", "dotenv"), ("a.INI", "INI")] {
+        for (name, said) in [("a.ini", "INI"), ("a.INI", "INI")] {
             let e = of(None, name).unwrap_err();
             assert!(e.to_string().contains(said), "{name}: {e}");
             assert_eq!(e.exit(), Exit::Refused);
@@ -811,6 +1055,226 @@ pub(super) mod tests {
         assert_eq!(SopsFormat::Json.input_type(), "json");
         assert_eq!(SopsFormat::Json.temp_ext(), "json");
         assert_eq!(SopsFormat::Yaml.name(), "yaml");
+        assert_eq!(SopsFormat::Dotenv.name(), "dotenv");
+        assert_eq!(SopsFormat::Dotenv.input_type(), "dotenv");
+        assert_eq!(SopsFormat::Dotenv.temp_ext(), "env");
+    }
+
+    /// A dotenv file as sops 3.13.3 writes it (S6 lab): a comment, an
+    /// entry, an empty line, an empty value that sops leaves in clear, and
+    /// the flat metadata of two recipients with an `unencrypted_suffix`.
+    /// sops writes each newline of an `enc` value as `\n`.
+    pub const DOTENV_BASE: &str = "# a comment\n\
+A=ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n\
+\n\
+EMPTY=\n\
+sops_age__list_0__map_enc=-----BEGIN AGE ENCRYPTED FILE-----\\nblob0\\n-----END AGE ENCRYPTED FILE-----\\n\n\
+sops_age__list_0__map_recipient=age1x\n\
+sops_age__list_1__map_enc=blob1\n\
+sops_age__list_1__map_recipient=age1y\n\
+sops_lastmodified=1\n\
+sops_mac=ENC[AES256_GCM,data:m,type:str]\n\
+sops_unencrypted_suffix=_pub\n\
+sops_version=3.13.3\n";
+
+    const DOTENV_PATH: &str = "/s/main.env";
+
+    /// v0.2 plan 6.1.2: the `sops_` lines of a dotenv file are its
+    /// metadata, and `__list_N` and `__map_` give the tree. The file has
+    /// two recipients and an `unencrypted_suffix`.
+    #[test]
+    fn a_dotenv_file_gives_entries_and_a_metadata_tree() {
+        let f = SopsFormat::Dotenv;
+        let path = Path::new(DOTENV_PATH);
+        let doc = f.parse(DOTENV_BASE.as_bytes(), path).unwrap();
+        assert_eq!(leaf_names(&doc.entries), ["A", "EMPTY"]);
+        assert_eq!(
+            doc.entries["A"],
+            "ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]"
+        );
+        assert_eq!(doc.entries["EMPTY"], "");
+        let want = serde_json::json!({
+            "age": [
+                {
+                    "enc": "-----BEGIN AGE ENCRYPTED FILE-----\nblob0\n-----END AGE ENCRYPTED FILE-----\n",
+                    "recipient": "age1x",
+                },
+                {"enc": "blob1", "recipient": "age1y"},
+            ],
+            "lastmodified": "1",
+            "mac": "ENC[AES256_GCM,data:m,type:str]",
+            "unencrypted_suffix": "_pub",
+            "version": "3.13.3",
+        });
+        assert_eq!(Value::Object(doc.meta.clone()), want);
+        assert!(has_recipients(&doc.meta));
+
+        // Only the `sops_` prefix, with the case as written, is metadata.
+        let extra = format!("sops=ENC[a]\nSOPS_X=ENC[b]\nxsops_y=ENC[c]\n{DOTENV_BASE}");
+        let more = f.parse(extra.as_bytes(), path).unwrap();
+        assert_eq!(
+            leaf_names(&more.entries),
+            ["A", "EMPTY", "SOPS_X", "sops", "xsops_y"]
+        );
+        assert_eq!(more.meta, doc.meta);
+        // A value is every byte after the first `=`, with no trimming, and
+        // a `#` after the first column starts no comment.
+        let odd = format!("K= a=b # c \r\n{DOTENV_BASE}");
+        let odd = f.parse(odd.as_bytes(), path).unwrap();
+        assert_eq!(odd.entries["K"], " a=b # c \r");
+        // The line order does not change the tree.
+        let mut lines: Vec<&str> = DOTENV_BASE.lines().collect();
+        lines.reverse();
+        let reversed = f.parse(lines.join("\n").as_bytes(), path).unwrap();
+        assert_eq!(reversed.meta, doc.meta);
+        assert_eq!(reversed.entries, doc.entries);
+    }
+
+    /// A dotenv store refuses a file that is not `KEY=VALUE` lines, a key
+    /// twice and a name that sops reads as another format. The error
+    /// quotes no file content.
+    #[test]
+    fn a_dotenv_store_refuses_a_file_that_is_not_dotenv_lines() {
+        let f = SopsFormat::Dotenv;
+        let path = Path::new(DOTENV_PATH);
+        let with = |line: &str| format!("{line}\n{DOTENV_BASE}");
+        let cases = [
+            (with("no equals secret-ish"), "a line is not KEY=VALUE"),
+            (with("=secret-ish"), "a line has no key"),
+            (with("A=secret-ish"), "a key appears twice"),
+            (with("sops_mac=secret-ish"), "a key appears twice"),
+            (BASE.to_owned(), "a line is not KEY=VALUE"),
+            (JSON_BASE.to_owned(), "a line is not KEY=VALUE"),
+        ];
+        for (text, want) in &cases {
+            let e = f.parse(text.as_bytes(), path).unwrap_err();
+            let shown = e.to_string();
+            assert!(shown.contains("as a sops dotenv file"), "{shown}");
+            assert!(shown.contains(want), "{shown}");
+            assert!(
+                !shown.contains("secret-ish") && !shown.contains("ENC["),
+                "{shown}"
+            );
+            assert_eq!(e.exit(), Exit::Failed);
+            let e = refusal(f, text.as_bytes(), path).unwrap_err();
+            assert!(
+                e.to_string().contains("it is not a sops dotenv file"),
+                "{e}"
+            );
+            assert!(e.to_string().contains("format is dotenv"), "{e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        let e = f.parse(b"A=\xff\n", path).unwrap_err();
+        assert!(e.to_string().contains("not UTF-8"), "{e}");
+        assert!(refusal(f, DOTENV_BASE.as_bytes(), path).is_ok());
+
+        for name in ["s.yaml", "S.YML", "s.json", "s.ini"] {
+            let e = refusal(f, DOTENV_BASE.as_bytes(), &Path::new("/s").join(name)).unwrap_err();
+            assert!(e.to_string().contains("as dotenv"), "{name}: {e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        for name in ["secrets", ".env", "a.yaml.env", "PROD.ENV"] {
+            assert!(
+                f.refuse_other_name(&Path::new("/s").join(name)).is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    /// The metadata lines must give one tree, as sops requires: no value
+    /// and map under one key, no list with a missing index, and one
+    /// spelling for each index. A file with no metadata or no MAC is not a
+    /// sops file.
+    #[test]
+    fn dotenv_metadata_lines_must_form_a_tree() {
+        let f = SopsFormat::Dotenv;
+        let path = Path::new(DOTENV_PATH);
+        let failed = |text: &str, want: &str| {
+            let e = f.parse_to_write(text.as_bytes(), path).unwrap_err();
+            assert!(e.to_string().contains(want), "{want}: {e}");
+            assert!(!e.to_string().contains("ENC["), "{e}");
+            assert_eq!(e.exit(), Exit::Failed, "{want}");
+        };
+        failed(
+            "A=ENC[AES256_GCM,data:x,type:str]\n",
+            "there are no sops metadata lines",
+        );
+        failed(
+            &DOTENV_BASE.replace("sops_mac=ENC[AES256_GCM,data:m,type:str]\n", ""),
+            "have no MAC",
+        );
+        failed(
+            &DOTENV_BASE.replace("sops_mac=ENC[", "sops_mac=["),
+            "have no MAC",
+        );
+        let with = |line: &str| format!("{line}\n{DOTENV_BASE}");
+        let deep = format!("sops_a{}=x", "__map_b".repeat(MAX_STEPS));
+        for bad in [
+            // A list with a missing index, and an index past every line.
+            DOTENV_BASE.replace("__list_0__", "__list_5__"),
+            DOTENV_BASE.replace("__list_1__", "__list_99__"),
+            // An index that is not a plain number.
+            DOTENV_BASE.replace("__list_1__", "__list_01__"),
+            DOTENV_BASE.replace("__list_1__", "__list_+1__"),
+            DOTENV_BASE.replace("__list_1__", "__list_x__"),
+            DOTENV_BASE.replace("__list_1__", "__list___"),
+            // A value and a list, a value and a map, a list and a map.
+            with("sops_age=x"),
+            with("sops_version__map_k=x"),
+            with("sops_age__map_k=x"),
+            with("sops_age__list_0=x"),
+            // A key part with no text, and too many parts.
+            with("sops_=x"),
+            with("sops___map_k=x"),
+            with("sops_a__map_=x"),
+            with(&deep),
+        ] {
+            failed(&bad, "do not form a tree");
+        }
+        let at_limit = format!("sops_a{}=x", "__map_b".repeat(MAX_STEPS - 1));
+        assert!(f.parse(with(&at_limit).as_bytes(), path).is_ok());
+    }
+
+    /// The copy validation of 6.1.2 holds for a dotenv store too: only the
+    /// target, the MAC and the time may change.
+    #[test]
+    fn validate_catches_tampering_in_dotenv() {
+        let path = Path::new(DOTENV_PATH);
+        let parse = |s: &str| SopsFormat::Dotenv.parse(s.as_bytes(), path).unwrap();
+        let orig = parse(DOTENV_BASE);
+        let b = name("B");
+        let v = SecretValue::new(b"v".to_vec());
+        let put = Op::Put(&v, PutMode::CreateOnly);
+        let with_b = |value: &str| format!("B={value}\n{DOTENV_BASE}");
+        let good = with_b(ENC)
+            .replace("data:m,", "data:NEW,")
+            .replace("sops_lastmodified=1", "sops_lastmodified=2");
+        assert!(validate(&orig, &parse(&good), &b, put).is_ok());
+        for bad in [
+            with_b("v"),
+            with_b("5.0"),
+            with_b("ENC[AES256_GCM,data:q,iv:w,tag:e,type:float]"),
+            with_b(ENC).replace("data:x", "data:Y"),
+            with_b(ENC).replace("age1y", "age1other"),
+            with_b(ENC).replace("blob1", "blob2"),
+            with_b(ENC).replace("suffix=_pub", "suffix=_other"),
+            with_b(ENC).replace("sops_unencrypted_suffix=_pub\n", ""),
+            with_b(ENC).replace(
+                "sops_age__list_1__map_enc=blob1\nsops_age__list_1__map_recipient=age1y\n",
+                "",
+            ),
+            with_b(ENC).replace("EMPTY=\n", ""),
+            with_b(ENC).replace("EMPTY=\n", "EMPTY=x\n"),
+            format!("C={ENC}\n{}", with_b(ENC)),
+        ] {
+            assert!(validate(&orig, &parse(&bad), &b, put).is_err(), "{bad}");
+        }
+
+        let a = name("A");
+        let removed =
+            parse(&DOTENV_BASE.replace("A=ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n", ""));
+        assert!(validate(&orig, &removed, &a, Op::Remove).is_ok());
+        assert!(validate(&orig, &orig, &a, Op::Remove).is_err());
     }
 
     /// The copy validation of 6.1.2 holds for a JSON store too.

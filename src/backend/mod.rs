@@ -101,6 +101,9 @@ pub enum WireSource {
         format: SopsFormat,
         key: Option<Name>,
     },
+    /// A sops file that sops-nix gives to a consumer only as one whole
+    /// file (dotenv), so `wire` cannot expose one name of it.
+    WholeSopsFile { file: PathBuf, format: SopsFormat },
 }
 
 /// What `doctor` gives a backend for its own rows.

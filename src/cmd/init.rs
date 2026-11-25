@@ -685,7 +685,16 @@ fn next_steps(
     out.note(
         "next: with home-manager, set programs.secrit.settings to the config (README, section 'Install')",
     );
-    out.note("next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza");
+    // sops-nix gives out a dotenv file only whole, so `wire` refuses it.
+    let dotenv = matches!(
+        SopsFormat::of_file(store.format, &store.file),
+        Ok(SopsFormat::Dotenv)
+    );
+    out.note(if dotenv {
+        "next: 'secrit store NAME'; a program reads the store with: sops exec-env FILE 'COMMAND'"
+    } else {
+        "next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza"
+    });
     Ok(())
 }
 

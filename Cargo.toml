@@ -1,0 +1,53 @@
+[package]
+name = "secrit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Store secrets in a sops + age file from the command line, with no value on argv"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/w0wl0lxd/secrit"
+readme = "README.md"
+keywords = ["sops", "age", "secrets", "nixos", "cli"]
+categories = ["command-line-utilities", "cryptography"]
+publish = false
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+getrandom = "0.4.3"
+rustix = { version = "1.1.5", features = ["event", "fs", "process", "termios"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "1.3.0"
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+signal-hook = "0.4.5"
+subtle = "2.6.1"
+thiserror = "2.0.21"
+toml = "1.1.6"
+which = "8.0.6"
+zeroize = { version = "1.9.1", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[features]
+# Compiles in SECRIT_TEST_HOOK fault injection for the integration tests.
+# Never enabled in a release or Nix package build.
+test-hooks = []
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

@@ -1,6 +1,7 @@
 //! The backend trait (PLAN section 6.1; v0.2 plan section 5.1) and the
 //! factory that builds a store's backend from the config.
 
+pub mod atomic;
 pub mod sops;
 
 use std::fmt;

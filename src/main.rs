@@ -16,6 +16,7 @@ mod harden;
 mod lock;
 mod mask;
 mod name;
+mod paths;
 mod report;
 mod secret;
 mod signals;
@@ -32,6 +33,7 @@ use crate::cli::{Cli, Command};
 use crate::cmd::run::Ended;
 use crate::cmd::{Ctx, StoreArgs, parse_name};
 use crate::error::Error;
+use crate::name::Name;
 
 fn main() -> ExitCode {
     // Before any input is read (PLAN 8.5).
@@ -74,6 +76,13 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
     signals::defer()
         .map_err(|e| Error::Failed(format!("could not install signal handlers: {e}")))?;
     let ctx = || Ctx::load(config.as_deref(), store.as_deref(), quiet);
+    // The name rules of the grammar run before the config; the store's own
+    // rules for NAME run after it loads (v0.2 plan 5.4).
+    let ctx_for = |name: &Name| -> Result<Ctx, Error> {
+        let ctx = ctx()?;
+        ctx.check_name(name)?;
+        Ok(ctx)
+    };
     let done = match command {
         Command::Store {
             name,
@@ -92,19 +101,20 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             cmd::store::check_argv(&args)?;
             // The name rules come before the config (PLAN 4.1, step 1).
             let name = parse_name(&args.name)?;
-            cmd::store::run(&ctx()?, &name, &args)
+            cmd::store::run(&ctx_for(&name)?, &name, &args)
         }
         Command::Get { name, stdout } => {
             let name = parse_name(&name)?;
-            cmd::get::run(&ctx()?, &name, stdout)
+            cmd::get::run(&ctx_for(&name)?, &name, stdout)
         }
         Command::Ls { json } => cmd::ls::run(&ctx()?, json),
         Command::Rm { name, yes } => {
             let name = parse_name(&name)?;
-            cmd::rm::run(&ctx()?, &name, yes)
+            cmd::rm::run(&ctx_for(&name)?, &name, yes)
         }
         Command::Init {
             sops_file,
+            format,
             sops_config,
             age_key,
             write_sops_config,
@@ -115,6 +125,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             quiet,
             &cmd::init::InitArgs {
                 sops_file,
+                format,
                 sops_config,
                 age_key,
                 write_sops_config,
@@ -130,7 +141,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             format,
         } => {
             let name = parse_name(&name)?;
-            cmd::wire::run(&ctx()?, &name, owner.as_deref(), format)
+            cmd::wire::run(&ctx_for(&name)?, &name, owner.as_deref(), format)
         }
         Command::Run {
             file,

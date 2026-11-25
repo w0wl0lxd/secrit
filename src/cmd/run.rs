@@ -367,7 +367,7 @@ mod tests {
         assert!(usage(&["1A=x"], &[]));
         assert!(usage(&["A=x"], &["A=y"]));
         assert!(matches!(
-            parse_bindings(&["A=bad/name".into()], &[]),
+            parse_bindings(&["A=bad name".into()], &[]),
             Err(Error::Name(_))
         ));
     }

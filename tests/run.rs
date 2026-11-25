@@ -603,7 +603,7 @@ fn bad_command_lines_are_usage_errors() {
         let out = env.run(&args, None);
         assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
     }
-    let out = env.run(["run", "--file", "V=bad/name", "--", &t], None);
+    let out = env.run(["run", "--file", "V=bad name", "--", &t], None);
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     let missing = env.root.path().join("no-such-program");
     let out = env.run(

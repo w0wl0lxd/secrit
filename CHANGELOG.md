@@ -73,6 +73,18 @@ All notable changes to this project are recorded here. The format follows
 - `secrit wire` refuses a dotenv store with exit 3, because sops-nix gives a dotenv file
   to a consumer only as one whole file. The message names `sops exec-env`. `store`
   prints no `wire` hint for a dotenv store.
+- sops INI stores (v0.2 plan S6b). `format = "ini"`, or a file name that ends in `.ini`,
+  gives a store of `[section]` headers and `KEY = value` lines. A name is `section/key`:
+  two segments, each a variable name, and the section is not `sops`. Any other name is
+  refused with exit 3 before the value is read. `store` and `rm` refuse a file that is
+  not strict INI lines (a quoted value, a `:` separator, an inline comment, a continued
+  line, an indented line, a `[DEFAULT]` header, a section twice, a key twice) or that
+  has no `[sops]` section. The copy validation reads the flat lines of the `[sops]`
+  section as it reads the `sops` map of a YAML store. `secrit init --format ini` creates
+  the store. An `.ini` file name is no longer refused.
+- `secrit wire` refuses an INI store with exit 3, because sops-nix gives an INI file to a
+  consumer only as one whole file. The message names `sops decrypt`. `store` prints no
+  `wire` hint for an INI store.
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.

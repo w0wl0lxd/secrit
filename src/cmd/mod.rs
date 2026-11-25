@@ -88,7 +88,7 @@ pub fn note_config_source(path: &Path, source: ConfigSource, quiet: bool) {
 /// `None` when it ignores them already or git cannot tell. The sops backend
 /// names a sample temp copy for git to check.
 pub fn ignore_hint(repo: &Repo, store: &SopsStore) -> Result<Option<String>, Error> {
-    let temp = TempIgnore::of(store)?;
+    let temp = TempIgnore::of(store);
     let ignored = repo.is_ignored(&temp.sample);
     git_interrupted(&ignored)?;
     Ok(ignored.is_ok_and(|i| !i).then(|| {

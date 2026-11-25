@@ -38,6 +38,11 @@ pub trait Fixture: Sized {
     /// trip case. A store with a narrower name grammar gives its own.
     const NAMES: [&'static str; 2] = ["a-key_1", "b.key"];
 
+    /// What comes before the short name of a case (`n`, `m`, `nope`) to
+    /// make a name that the store can hold. An INI store takes
+    /// `section/key` names only, so it gives a section here.
+    const NAME_PREFIX: &'static str = "";
+
     /// A temp environment with an empty store and a config whose
     /// `[stores.main]` table is [`Self::config_section`].
     fn new() -> Self;
@@ -74,6 +79,9 @@ pub trait FixtureFormat {
 
     /// [`Fixture::NAMES`] for a store in this format.
     const NAMES: [&'static str; 2] = ["a-key_1", "b.key"];
+
+    /// [`Fixture::NAME_PREFIX`] for a store in this format.
+    const NAME_PREFIX: &'static str = "";
 }
 
 /// A sops YAML store (`main.yaml`).
@@ -99,6 +107,16 @@ impl FixtureFormat for Dotenv {
     const NAMES: [&'static str; 2] = ["A_KEY_1", "b_key"];
 }
 
+/// A sops INI store (`main.ini`). Its names are `section/key`, each a
+/// variable name (v0.2 plan 5.4).
+pub struct Ini;
+
+impl FixtureFormat for Ini {
+    const NAME: &'static str = "ini";
+    const NAMES: [&'static str; 2] = ["s/A_KEY_1", "s/b_key"];
+    const NAME_PREFIX: &'static str = "s/";
+}
+
 /// A sops store in the format `F`, encrypted to two temp age keys.
 pub struct SopsFixtureStore<F: FixtureFormat> {
     env: TestEnv,
@@ -111,6 +129,8 @@ pub type SopsFixture = SopsFixtureStore<Yaml>;
 pub type SopsJsonFixture = SopsFixtureStore<Json>;
 /// A sops dotenv store (v0.2 plan S6).
 pub type SopsDotenvFixture = SopsFixtureStore<Dotenv>;
+/// A sops INI store (v0.2 plan S6b).
+pub type SopsIniFixture = SopsFixtureStore<Ini>;
 
 impl<F: FixtureFormat> SopsFixtureStore<F> {
     /// The [`TestEnv`] of the store, for the checks that only sops has.
@@ -127,6 +147,7 @@ impl<F: FixtureFormat> Fixture for SopsFixtureStore<F> {
     };
     const REDACTION_NOTE: &'static str = "line(s) not shown, because they may hold the value";
     const NAMES: [&'static str; 2] = F::NAMES;
+    const NAME_PREFIX: &'static str = F::NAME_PREFIX;
 
     fn new() -> Self {
         Self {
@@ -144,7 +165,9 @@ impl<F: FixtureFormat> Fixture for SopsFixtureStore<F> {
     }
 
     fn read_back(&self, name: &str) -> Option<Vec<u8>> {
-        match self.env.decrypt().remove(name) {
+        // A name of the suite has a `/` only as a key path. `b.key` of a
+        // YAML store has none.
+        match self.env.decrypt_at(name) {
             Some(Value::String(s)) => Some(s.into_bytes()),
             Some(_) => panic!("{name} is not stored as a string"),
             None => None,
@@ -152,9 +175,7 @@ impl<F: FixtureFormat> Fixture for SopsFixtureStore<F> {
     }
 
     fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.env.decrypt().keys().cloned().collect();
-        names.sort();
-        names
+        self.env.decrypt_names()
     }
 
     /// sops reads names from the cleartext keys and needs the age key only

@@ -69,7 +69,7 @@ impl SopsBackend {
         lock_timeout: Duration,
         env: &Env,
     ) -> Result<Self, BackendError> {
-        let format = SopsFormat::of_file(store.format, &store.file)?;
+        let format = SopsFormat::of_file(store.format, &store.file);
         let file = FileStore::new(
             store.file.clone(),
             paths::runtime_dir(env),
@@ -370,20 +370,19 @@ impl Backend for SopsBackend {
 
     /// sops-nix reads a nested key from the `key` option, with the
     /// segments joined by `/` (v0.2 plan 5.7). It has no key option for a
-    /// dotenv file: the secret is the whole decrypted file (sops-nix
-    /// `sops-install-secrets`, read in the S6 lab).
+    /// dotenv or an INI file: the secret is the whole decrypted file
+    /// (sops-nix `sops-install-secrets`, read in the S6 lab).
     fn wire_source(&self, name: &Name) -> Option<WireSource> {
         let file = self.file().to_path_buf();
-        Some(match self.format {
-            SopsFormat::Yaml | SopsFormat::Json => WireSource::SopsFile {
+        let format = self.format;
+        Some(if format.one_name_out() {
+            WireSource::SopsFile {
                 file,
-                format: self.format,
+                format,
                 key: name.is_nested().then(|| name.clone()),
-            },
-            SopsFormat::Dotenv => WireSource::WholeSopsFile {
-                file,
-                format: self.format,
-            },
+            }
+        } else {
+            WireSource::WholeSopsFile { file, format }
         })
     }
 }
@@ -408,13 +407,9 @@ impl TempIgnore {
         }
     }
 
-    /// The temp copies of `store`, from its config alone. Fails as
-    /// [`SopsBackend::new`] does when the store's format is not known.
-    pub fn of(store: &SopsStore) -> Result<Self, BackendError> {
-        Ok(Self::new(
-            &store.file,
-            SopsFormat::of_file(store.format, &store.file)?,
-        ))
+    /// The temp copies of `store`, from its config alone.
+    pub fn of(store: &SopsStore) -> Self {
+        Self::new(&store.file, SopsFormat::of_file(store.format, &store.file))
     }
 }
 
@@ -426,7 +421,7 @@ fn nearest_sops_config(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::format::tests::{BASE, DOTENV_BASE, doc};
+    use super::format::tests::{BASE, DOTENV_BASE, INI_BASE, doc};
     use super::format::validate;
     use super::*;
     use crate::error::Exit;
@@ -533,17 +528,17 @@ mod tests {
             sops_config: None,
             age_key_file: None,
         };
-        let (of_store, of_backend) = (TempIgnore::of(&store).unwrap(), b.temp_ignore());
+        let (of_store, of_backend) = (TempIgnore::of(&store), b.temp_ignore());
         assert_eq!(of_store.sample, of_backend.sample);
         assert_eq!(of_store.pattern, of_backend.pattern);
 
-        // A store whose format is not known has no temp copies to ignore.
+        // The sample of an INI store has the extension of its temp copies.
         let ini = SopsStore {
             file: tmp.path().join("main.ini"),
             ..store
         };
-        let e = TempIgnore::of(&ini).unwrap_err();
-        assert_eq!(e.exit(), Exit::Refused);
+        let sample = TempIgnore::of(&ini).sample;
+        assert_eq!(sample.extension().and_then(|e| e.to_str()), Some("ini"));
     }
 
     /// The format comes from the `format` key, else from the file name,
@@ -589,8 +584,78 @@ mod tests {
             };
             assert_eq!(b.wire_source(&n), Some(want), "{name}");
         }
-        let e = open("s.ini", None).unwrap_err();
+        // An INI store takes `section/key`, and sops-nix gives it out only
+        // whole.
+        for (name, explicit) in [("s.ini", None), ("s.txt", Some(SopsFormat::Ini))] {
+            let b = open(name, explicit).unwrap();
+            assert_eq!(b.format, SopsFormat::Ini, "{name}");
+            assert!(b.capabilities().nested_names, "{name}");
+            let want = WireSource::WholeSopsFile {
+                file: b.file().to_path_buf(),
+                format: SopsFormat::Ini,
+            };
+            assert_eq!(b.wire_source(&n), Some(want), "{name}");
+        }
+    }
+
+    /// v0.2 plan 5.4: an INI store takes a name of exactly two segments,
+    /// `section/key`, each a variable name, and no name in the `sops`
+    /// section. `check_put` refuses any other name with exit 3, with no
+    /// sops run (the sops path here does not exist).
+    #[test]
+    fn an_ini_store_takes_section_and_key_names_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = store_file_for(tmp.path(), "main.ini", INI_BASE);
+        assert_eq!(b.format, SopsFormat::Ini);
+        assert_eq!(
+            b.list().unwrap(),
+            [
+                "DEFAULT/bare",
+                "empty",
+                "s/EMPTY",
+                "s/k",
+                "s/longer_key_name"
+            ]
+        );
+        for ok in ["s/new", "t/k", "DEFAULT/k", "empty/k", "SOPS/k"] {
+            assert!(b.check_put(&name(ok), PutMode::CreateOnly).is_ok(), "{ok}");
+        }
+        assert!(b.check_put(&name("s/k"), PutMode::Replace).is_ok());
+        for mode in [PutMode::CreateOnly, PutMode::Replace] {
+            for bad in ["k", "top", "a/b/c", "s/k/deep", "a.b/k", "s/a-b", "s/0k"] {
+                let e = b.check_put(&name(bad), mode).unwrap_err();
+                assert!(
+                    matches!(e, BackendError::Name(NameError::NotSectionKey)),
+                    "{bad}: {e}"
+                );
+                assert!(e.to_string().contains("section/key"), "{e}");
+                assert_eq!(e.exit(), Exit::Refused);
+            }
+            for bad in ["sops/k", "sops/mac"] {
+                let e = b.check_put(&name(bad), mode).unwrap_err();
+                assert!(
+                    matches!(e, BackendError::Name(NameError::ReservedSection)),
+                    "{bad}: {e}"
+                );
+                assert_eq!(e.exit(), Exit::Refused);
+            }
+        }
+        // A section holds other names, so it is no name to write.
+        let e = b.check_put(&name("s"), PutMode::Replace).unwrap_err();
         assert_eq!(e.exit(), Exit::Refused);
+        // The file sets unencrypted_suffix = _pub in the `[sops]` section.
+        // secrit tests each segment, as for a nested name of a YAML store.
+        for bad in ["s/tok_pub", "app_pub/k"] {
+            let e = b.check_put(&name(bad), PutMode::CreateOnly).unwrap_err();
+            assert!(
+                matches!(e, BackendError::Name(NameError::UnencryptedSuffix { .. })),
+                "{bad}: {e}"
+            );
+        }
+        // A metadata line is not an entry, so it is no name to remove.
+        let e = b.check_remove(&name("sops/mac")).unwrap_err();
+        assert_eq!(e.exit(), Exit::Failed, "{e}");
+        assert!(b.check_remove(&name("s/k")).is_ok());
     }
 
     /// v0.2 plan 5.4 and T58: a dotenv store takes a variable name with

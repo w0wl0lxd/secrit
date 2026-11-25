@@ -196,14 +196,16 @@ pub fn rm_needs_an_existing_name_and_a_confirmation<F: Fixture>() {
 /// backups asks nothing.
 pub fn replace_without_backup_needs_a_confirmation<F: Fixture>() {
     let f = F::new();
-    assert_eq!(code(&f.dirs().store_value("n", b"old")), 0);
+    let n = name_of::<F>("n");
+    let n = n.as_str();
+    assert_eq!(code(&f.dirs().store_value(n, b"old")), 0);
     let mut cmd = no_tty(&f.dirs().cmd());
-    cmd.args(["store", "n", "--replace"]);
+    cmd.args(["store", n, "--replace"]);
     let out = run_cmd(cmd, std::iter::empty::<&str>(), Some(b"new"));
     if F::CAPS.backups {
         assert_eq!(code(&out), 0, "{}", stderr(&out));
         assert!(!stderr(&out).contains("no backup"), "{}", stderr(&out));
-        assert_stored(&f, "n", b"new");
+        assert_stored(&f, n, b"new");
         return;
     }
     assert_eq!(code(&out), 3, "{}", stderr(&out));
@@ -212,22 +214,22 @@ pub fn replace_without_backup_needs_a_confirmation<F: Fixture>() {
         "{}",
         stderr(&out)
     );
-    assert_stored(&f, "n", b"old");
+    assert_stored(&f, n, b"old");
 
     // On a terminal, "n" keeps the old value and nothing reads a value.
     let inner = format!(
-        "exec {} store n --replace",
-        super::env::sh_quote(std::path::Path::new(BIN))
+        "exec {} store {n} --replace",
+        super::env::sh_quote(std::path::Path::new(BIN)),
     );
     let out = f.dirs().under_script_with(&inner, b"n\n");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(text.contains("no backup; the old value is gone"), "{text}");
     assert!(text.contains("not replaced"), "{text}");
     assert_eq!(code(&out), 1, "{text}");
-    assert_stored(&f, "n", b"old");
+    assert_stored(&f, n, b"old");
 
     let mut cmd = no_tty(&f.dirs().cmd());
-    cmd.args(["store", "n", "--replace", "--yes"]);
+    cmd.args(["store", n, "--replace", "--yes"]);
     let out = run_cmd(cmd, std::iter::empty::<&str>(), Some(b"new"));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(
@@ -235,7 +237,7 @@ pub fn replace_without_backup_needs_a_confirmation<F: Fixture>() {
         "{}",
         stderr(&out)
     );
-    assert_stored(&f, "n", b"new");
+    assert_stored(&f, n, b"new");
     assert_backups(&f, 0);
 }
 

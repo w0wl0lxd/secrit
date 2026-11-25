@@ -54,6 +54,13 @@
 //!   with it.
 //! - A prefix that [`Masker::flush_held`] releases is not masked when the
 //!   rest of the value follows.
+//! - A masked region that keeps growing (a value of `aaaa` and an endless
+//!   stream of `a`) is held until it ends, because its label names every
+//!   value that made it. Once the held bytes pass twice the longest pattern
+//!   (plus 4 KiB), they are released as at the end of the stream: the region
+//!   so far is replaced, and a proper prefix at the tail goes out unmasked.
+//!   Memory stays bounded; the output differs from one replace over the
+//!   whole stream only for such a region.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -68,6 +75,9 @@ use crate::secret::SecretValue;
 /// often.
 pub const MIN_MASK_BYTES: usize = 4;
 
+/// Held bytes allowed beyond twice the longest pattern (see the known gaps).
+const HOLD_SLACK: usize = 4096;
+
 const B64_STANDARD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64_URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
@@ -81,6 +91,8 @@ pub struct Masker {
     /// Input that is not decided yet: a proper prefix of some pattern, or a
     /// region that can still grow.
     pending: Zeroizing<Vec<u8>>,
+    /// The most that `pending` holds between calls.
+    hold_cap: usize,
     /// The output of the last call. Bytes past its length are always zero.
     out: Zeroizing<Vec<u8>>,
 }
@@ -125,7 +137,9 @@ impl Masker {
         for ids in &mut by_first {
             ids.sort_by_key(|&i| Reverse(list[i].bytes.len()));
         }
+        let longest = list.iter().map(|p| p.bytes.len()).max().unwrap_or(0);
         Self {
+            hold_cap: 2 * longest + HOLD_SLACK,
             patterns: Patterns {
                 list,
                 by_first,
@@ -156,6 +170,10 @@ impl Masker {
         wipe(&mut self.out);
         append(&mut self.pending, chunk);
         self.scan(false);
+        if self.pending.len() > self.hold_cap {
+            // A region that keeps growing: release it as at the end.
+            self.scan(true);
+        }
         &self.out
     }
 
@@ -927,6 +945,22 @@ mod tests {
         // A full-capacity wipe per call costs seconds here; a length-only wipe costs
         // microseconds. The wide limit keeps a busy CI runner from failing the test.
         assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A masked region that never ends does not grow the held bytes without
+    /// bound, and every byte of it is still replaced.
+    #[test]
+    fn an_endless_overlapping_region_is_bounded() {
+        let mut m = masker(&[("pw", b"aaaa")]);
+        let cap = m.hold_cap;
+        let mut out = Vec::new();
+        for _ in 0..(4 * cap) / 4 {
+            out.extend_from_slice(m.feed(b"aaaa"));
+            assert!(m.pending.len() <= cap, "{} held", m.pending.len());
+        }
+        out.extend_from_slice(m.finish());
+        assert!(out.starts_with(b"[secrit:pw]"));
+        assert!(!contains(&out, b"aa"), "unmasked bytes in the output");
     }
 
     #[test]

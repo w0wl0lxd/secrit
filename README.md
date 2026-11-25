@@ -335,8 +335,11 @@ nix flake check                   # fmt, clippy, nextest, cargo-deny, the packag
 The integration tests run the real `sops` and `age-keygen` against a temp directory with
 a temp HOME and new age keys. They find the tools through `SECRIT_TEST_SOPS`,
 `SECRIT_TEST_AGE_KEYGEN` and `SECRIT_TEST_SSH_KEYGEN` (the devShell sets them), else
-`PATH`. The terminal tests need util-linux `script` and `setsid`; they fail, not skip,
-when those are missing. The `test-hooks` feature adds fault injection
+`PATH`. Run the integration tests inside `nix develop`, or set those variables to Nix
+store paths yourself. The flake defines a devShell only for x86_64-linux, so on macOS
+set the variables. Outside the devShell, `tests/common/env.rs` panics when a test tool
+resolves to a mise shim. The terminal tests need util-linux `script` and `setsid`; they
+fail, not skip, when those are missing. The `test-hooks` feature adds fault injection
 (`SECRIT_TEST_HOOK`) for the crash and signal tests; it is never on in a release build.
 
 ## Licence

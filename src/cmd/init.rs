@@ -3,9 +3,7 @@
 //! config. It never replaces or edits a file that exists.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -13,7 +11,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::{interrupted, shell_path};
-use crate::backend::sops::SopsBackend;
+use crate::backend::atomic;
+use crate::backend::sops::{SopsBackend, SopsFormat};
 use crate::child;
 use crate::config::{
     BackendConfig, Config, ConfigError, Env, SopsStore, StoreConfig, ToolSetting, ToolsConfig,
@@ -33,6 +32,8 @@ const MAX_RECIPIENTS_BYTES: usize = 64 * 1024;
 #[derive(Debug)]
 pub struct InitArgs {
     pub sops_file: Option<PathBuf>,
+    /// The store file format; written to the config as `format`.
+    pub format: Option<SopsFormat>,
     pub sops_config: Option<PathBuf>,
     pub age_key: Option<PathBuf>,
     pub write_sops_config: bool,
@@ -117,6 +118,9 @@ fn steps(
         path_env.as_deref(),
     )?;
     let backend = SopsBackend::new(sops_store, sops.path.clone(), lock_timeout, &env)?;
+    // Before any file is made: sops must read the file name in the
+    // store's format.
+    backend.check_file_name()?;
     let (a, b, c) = backend.checked_version()?;
     out.note(&format!(
         "sops {a}.{b}.{c} at {}; age-keygen at {}",
@@ -161,7 +165,7 @@ fn steps(
     interrupted()?;
 
     // 6. Next steps.
-    next_steps(&sops_store.file, &env, &out)?;
+    next_steps(sops_store, &env, &out)?;
     interrupted()
 }
 
@@ -192,6 +196,9 @@ fn store_config(
     };
     let sops = SopsStore {
         file,
+        format: args
+            .format
+            .or_else(|| configured_sops.and_then(|s| s.format)),
         sops_config: match &args.sops_config {
             Some(p) => Some(absolute(p)?),
             None => configured_sops.and_then(|s| s.sops_config.clone()),
@@ -225,6 +232,16 @@ fn refuse_a_differing_flag(have: &SopsStore, store: &SopsStore, name: &str) -> R
         differ.push(format!(
             "--sops-file (the config has file = {})",
             shown(Some(&have.file))
+        ));
+    }
+    // A flag that names the format the config already resolves to is not
+    // a difference.
+    if have.format != store.format
+        && Some(SopsFormat::of_file(have.format, &have.file)) != store.format
+    {
+        differ.push(format!(
+            "--format (the config has format = {})",
+            have.format.map_or("(not set)", SopsFormat::name)
         ));
     }
     if have.sops_config != store.sops_config {
@@ -424,26 +441,17 @@ fn new_key(keygen: &Path, key: &Path) -> Result<(), Error> {
     let fail = |step: &str, e: &dyn std::fmt::Display| {
         Error::Failed(format!("{step} the new age key {shown}: {e}"))
     };
-    std::fs::File::open(&made)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| fail("fsync", &e))?;
+    atomic::sync_path(&made).map_err(|e| fail("fsync", &e))?;
     interrupted()?;
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        &made,
-        rustix::fs::CWD,
-        key,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|e| match e {
-        rustix::io::Errno::EXIST => Error::Refused(format!(
-            "the age key {shown} appeared while init created it; nothing was replaced"
-        )),
-        e => fail("rename", &e),
-    })?;
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| fail("fsync the directory of", &e))
+    atomic::rename_noreplace(rustix::fs::CWD, &made, rustix::fs::CWD, key).map_err(
+        |e| match e {
+            rustix::io::Errno::EXIST => Error::Refused(format!(
+                "the age key {shown} appeared while init created it; nothing was replaced"
+            )),
+            e => fail("rename", &e),
+        },
+    )?;
+    atomic::sync_path(dir).map_err(|e| fail("fsync the directory of", &e))
 }
 
 /// The `.sops.yaml` that covers a new store file. Returns the backend to
@@ -548,20 +556,8 @@ fn regex_escape(s: &str) -> String {
 
 /// Create `path` with `O_EXCL` and `O_NOFOLLOW`, write `bytes` and fsync.
 fn create_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Error> {
-    let _critical = signals::Critical::enter();
-    let fail = |e: std::io::Error| Error::Failed(format!("create {}: {e}", path.display()));
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
-        .open(path)
-        .map_err(fail)?;
-    if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
-        let _ = std::fs::remove_file(path);
-        return Err(fail(e));
-    }
-    Ok(())
+    atomic::create_new_noreplace(path, bytes, mode)
+        .map_err(|e| Error::Failed(format!("create {}: {e}", path.display())))
 }
 
 #[derive(Serialize)]
@@ -574,6 +570,8 @@ struct NewConfig<'a> {
 struct NewStore<'a> {
     backend: &'static str,
     file: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sops_config: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +630,7 @@ fn new_stores<'a>(
         NewStore {
             backend: "sops",
             file: &sops.file,
+            format: args.format.map(SopsFormat::name),
             sops_config: args.sops_config.as_ref().and(sops.sops_config.as_deref()),
             age_key_file: args.age_key.as_ref().and(sops.age_key_file.as_deref()),
         },
@@ -656,12 +655,17 @@ fn store_section(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> 
     })
 }
 
-fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) -> Result<(), Error> {
+fn next_steps(
+    store: &SopsStore,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    out: &Out,
+) -> Result<(), Error> {
+    let file = &store.file;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
     {
-        if let Some(hint) = super::ignore_hint(&repo, file)? {
+        if let Some(hint) = super::ignore_hint(&repo, store)? {
             out.note(&format!("next: ignore temp copies: {hint}"));
         }
         let tracked = if file.exists() {
@@ -681,7 +685,19 @@ fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) ->
     out.note(
         "next: with home-manager, set programs.secrit.settings to the config (README, section 'Install')",
     );
-    out.note("next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza");
+    // sops-nix gives out a dotenv or an INI file only whole, so `wire`
+    // refuses it.
+    out.note(match SopsFormat::of_file(store.format, &store.file) {
+        SopsFormat::Yaml | SopsFormat::Json => {
+            "next: 'secrit store NAME', then 'secrit wire NAME' for the sops-nix stanza"
+        }
+        SopsFormat::Dotenv => {
+            "next: 'secrit store NAME'; a program reads the store with: sops exec-env FILE 'COMMAND'"
+        }
+        SopsFormat::Ini => {
+            "next: 'secrit store SECTION/KEY'; a program reads the store with: sops decrypt FILE"
+        }
+    });
     Ok(())
 }
 
@@ -703,5 +719,46 @@ mod tests {
         let s = rule_snippet(Path::new("/x"), Path::new("/x/it's.yaml"), &[]);
         assert!(s.contains("path_regex: '(^|/)it''s\\.yaml$'"), "{s}");
         assert!(s.contains("age: age1..."), "{s}");
+    }
+
+    /// `--format` differs from the config only when it names another
+    /// format than the one that the config resolves to.
+    #[test]
+    fn a_differing_format_flag_is_refused() {
+        let store = |file: &str, format| SopsStore {
+            file: file.into(),
+            format,
+            sops_config: None,
+            age_key_file: None,
+        };
+        let (json, yaml) = (Some(SopsFormat::Json), Some(SopsFormat::Yaml));
+        for (have, flag) in [
+            (store("/s.json", None), json),
+            (store("/s.sops", json), json),
+            (store("/s.yaml", None), yaml),
+            (store("/s.json", None), None),
+        ] {
+            let with_flag = SopsStore {
+                format: flag.or(have.format),
+                ..have.clone()
+            };
+            assert!(refuse_a_differing_flag(&have, &with_flag, "m").is_ok());
+        }
+        for (have, flag, said) in [
+            (store("/s.yaml", None), json, "format = (not set)"),
+            (store("/s.json", None), yaml, "format = (not set)"),
+            (store("/s.sops", json), yaml, "format = json"),
+        ] {
+            let with_flag = SopsStore {
+                format: flag,
+                ..have.clone()
+            };
+            let e = refuse_a_differing_flag(&have, &with_flag, "m").unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains(&format!("--format (the config has {said})")),
+                "{e}"
+            );
+        }
     }
 }

@@ -31,10 +31,11 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{Backend, BackendError, PutMode, WriteReport};
+use super::{Backend, BackendError, MAX_RETRIES, PutMode, Target, WriteReport};
 use crate::child::{self, ChildError, ChildOutput};
 use crate::config::{BackendKind, StoreConfig};
 use crate::display::escape;
@@ -45,7 +46,6 @@ use crate::signals;
 use crate::trust::{self, TrustError};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ATTEMPTS: usize = 3;
 /// What `create_file` gives sops to encrypt.
 const EMPTY_DOC: &[u8] = b"{}\n";
 /// The cap on the sops output for a new, empty store file.
@@ -112,17 +112,28 @@ struct Snapshot {
     dev: u64,
     ino: u64,
     size: u64,
+    /// Seconds and nanoseconds.
+    mtime: (i64, u64),
     mode: u32,
     hash: [u8; 32],
     bytes: Vec<u8>,
 }
 
 impl Snapshot {
-    /// The same file, content and mode. A chmod between the snapshot and the
-    /// rename would otherwise be lost by the `fchmod` of the copy (R12).
+    /// The same file, content, mtime and mode (PLAN 8.1, steps 5 and 11). A
+    /// chmod between the snapshot and the rename would otherwise be lost by
+    /// the `fchmod` of the copy (R12).
     fn same_as(&self, other: &Snapshot) -> bool {
-        (self.dev, self.ino, self.size, self.mode, self.hash)
-            == (other.dev, other.ino, other.size, other.mode, other.hash)
+        (
+            self.dev, self.ino, self.size, self.mtime, self.mode, self.hash,
+        ) == (
+            other.dev,
+            other.ino,
+            other.size,
+            other.mtime,
+            other.mode,
+            other.hash,
+        )
     }
 }
 
@@ -242,7 +253,11 @@ impl SopsBackend {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .process_group(0);
-        let out = self.run_unchecked(cmd, None, 4096)?;
+        let target = Target {
+            path: self.sops.clone(),
+            name: None,
+        };
+        let out = self.run_unchecked(cmd, None, 4096, "--version", target)?;
         let text = String::from_utf8_lossy(&out.stdout);
         match parse_sops_version(&text) {
             Some(v) if out.status.success() => Ok(v),
@@ -312,6 +327,7 @@ impl SopsBackend {
     pub fn inspect(&self) -> Result<StoreFacts, BackendError> {
         let dir = self.open_dir()?;
         let snap = self.snapshot(&dir, true)?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         let doc = parse_doc(&snap.bytes, &self.file)?;
         let rules = REGEX_RULES
             .iter()
@@ -342,14 +358,35 @@ impl SopsBackend {
         if self.sops_config.is_none() {
             return Ok(false);
         }
-        let out = self.run(self.encrypt_empty(), Some(EMPTY_DOC), 0)?;
+        let out = self.run(
+            self.encrypt_empty(),
+            Some(EMPTY_DOC),
+            0,
+            "encrypt",
+            self.target(None),
+        )?;
         if out.status.success() {
             return Ok(true);
         }
         if String::from_utf8_lossy(&out.stderr).contains("no matching creation rules") {
             return Ok(false);
         }
-        Err(sops_failed("encrypt", &out, &[]))
+        Err(sops_failed("encrypt", self.target(None), &out, &[]))
+    }
+
+    /// The store file, and `name` when the step is about one.
+    fn target(&self, name: Option<&Name>) -> Target {
+        Target {
+            path: self.file.clone(),
+            name: name.cloned(),
+        }
+    }
+
+    fn validation(&self, name: Option<&Name>, reason: impl Into<String>) -> BackendError {
+        BackendError::Validation {
+            target: self.target(name),
+            reason: reason.into(),
+        }
     }
 
     /// Create the store file with no entries (PLAN section 4.6, step 4): sops
@@ -360,18 +397,23 @@ impl SopsBackend {
         let _critical = signals::Critical::enter();
         let dir = self.open_dir()?;
         self.check_dir(&dir)?;
+        refuse_non_yaml_name(&self.file)?;
         if self.sops_config.is_none() {
             return Err(BackendError::NoSopsConfig(self.file.clone()));
         }
-        let out = self.run(self.encrypt_empty(), Some(EMPTY_DOC), MAX_NEW_FILE_BYTES)?;
+        let out = self.run(
+            self.encrypt_empty(),
+            Some(EMPTY_DOC),
+            MAX_NEW_FILE_BYTES,
+            "encrypt",
+            self.target(None),
+        )?;
         if !out.status.success() {
-            return Err(sops_failed("encrypt", &out, &[]));
+            return Err(sops_failed("encrypt", self.target(None), &out, &[]));
         }
         let doc = parse_doc(&out.stdout, &self.file)?;
         if !has_recipients(&doc.meta) {
-            return Err(BackendError::Validation(
-                "the new file has no recipients".into(),
-            ));
+            return Err(self.validation(None, "the new file has no recipients"));
         }
         let tmp = TempCopy::create(&dir, &self.dir, &self.base, &out.stdout)?;
         let (fd, _) = read_entry(&dir, &tmp.name, &tmp.path, true)?;
@@ -476,6 +518,7 @@ impl SopsBackend {
             dev: st.st_dev,
             ino: st.st_ino,
             size: u64::try_from(st.st_size).unwrap_or(0),
+            mtime: (st.st_mtime, st.st_mtime_nsec),
             mode: st.st_mode & 0o7777,
             hash: Sha256::digest(&bytes).into(),
             bytes,
@@ -503,7 +546,9 @@ impl SopsBackend {
         // flag that the lock wait, the sops wait and the protocol poll.
         let _critical = signals::Critical::enter();
         let _lock = lock::acquire(&lock_path, self.lock_timeout)?;
-        for _ in 0..MAX_ATTEMPTS {
+        hook("after-lock");
+        // The first try, then at most MAX_RETRIES more (PLAN 8.1, step 11).
+        for _ in 0..=MAX_RETRIES {
             if let Some(report) = self.attempt(&dir, name, op)? {
                 return Ok(report);
             }
@@ -519,14 +564,18 @@ impl SopsBackend {
         name: &Name,
         op: Op<'_>,
     ) -> Result<Option<WriteReport>, BackendError> {
+        // Steps 2 and 3 again, on the locked file: the directory may have
+        // changed owner or mode while secrit waited for the lock (step 4).
+        self.check_dir(dir)?;
         let snap = self.snapshot(dir, true)?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
         let doc = parse_doc(&snap.bytes, &self.file)?;
         let existed = doc.entries.contains_key(name.as_str());
         match op {
             Op::Put(_, PutMode::CreateOnly) if existed => {
-                return Err(BackendError::Exists(name.clone()));
+                return Err(self.exists_error(name));
             }
-            Op::Remove if !existed => return Err(BackendError::Missing(name.clone())),
+            Op::Remove if !existed => return Err(self.missing_error(name)),
             Op::Put(..) => self.check_cleartext_rules(name, &doc.meta)?,
             Op::Remove => {}
         }
@@ -541,7 +590,7 @@ impl SopsBackend {
 
         let (copy_fd, copy_bytes) = read_entry(dir, &tmp.name, &tmp.path, true)?;
         let copy = parse_doc(&copy_bytes, &tmp.path)?;
-        validate(&doc, &copy, name, op)?;
+        validate(&doc, &copy, name, op).map_err(|reason| self.validation(Some(name), reason))?;
         if let Op::Put(value, _) = op {
             self.readback(&copy_bytes, name, value)?;
         }
@@ -574,6 +623,44 @@ impl SopsBackend {
             b.path
         });
         Ok(Some(WriteReport { backup }))
+    }
+
+    fn exists_error(&self, name: &Name) -> BackendError {
+        BackendError::Exists {
+            name: name.clone(),
+            path: self.file.clone(),
+        }
+    }
+
+    fn missing_error(&self, name: &Name) -> BackendError {
+        BackendError::Missing {
+            name: name.clone(),
+            path: self.file.clone(),
+        }
+    }
+
+    /// Refuse a file that already holds a cleartext entry other than NAME
+    /// (written by another tool, or kept by sops under `unencrypted_suffix`).
+    /// The copy validation refuses such a file after the write (PLAN 8.1,
+    /// step 9); this check runs first, so nobody types a value for nothing.
+    fn check_plaintext(
+        &self,
+        name: &Name,
+        entries: &Map<String, Value>,
+    ) -> Result<(), BackendError> {
+        match entries
+            .iter()
+            .find(|(k, v)| k.as_str() != name.as_str() && has_plaintext(v))
+        {
+            Some((k, _)) => Err(BackendError::CleartextRule {
+                path: self.file.clone(),
+                reason: format!(
+                    "entry '{}' is not encrypted, and secrit never writes a file with a cleartext entry; encrypt it or remove it with sops first",
+                    escape(k)
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Refuse a name that sops would store in cleartext under the file's own
@@ -622,7 +709,7 @@ impl SopsBackend {
     fn sops_set(&self, path: &Path, name: &Name, value: &SecretValue) -> Result<(), BackendError> {
         let json = value
             .to_json_string()
-            .map_err(|_| BackendError::Validation("the value is not UTF-8".into()))?;
+            .map_err(|_| self.validation(Some(name), "the value is not UTF-8"))?;
         let mut cmd = self.command();
         cmd.args([
             "set",
@@ -634,10 +721,15 @@ impl SopsBackend {
         ])
         .arg(path)
         .arg(name.sops_path());
-        let out = self.run(cmd, Some(&json), 0)?;
+        let out = self.run(cmd, Some(&json), 0, "set", self.target(Some(name)))?;
         if !out.status.success() {
             let inner = &json[1..json.len() - 1];
-            return Err(sops_failed("set", &out, &[value.expose(), inner]));
+            return Err(sops_failed(
+                "set",
+                self.target(Some(name)),
+                &out,
+                &[value.expose(), inner],
+            ));
         }
         Ok(())
     }
@@ -647,9 +739,9 @@ impl SopsBackend {
         cmd.args(["unset", "--input-type", "yaml", "--output-type", "yaml"])
             .arg(path)
             .arg(name.sops_path());
-        let out = self.run(cmd, None, 0)?;
+        let out = self.run(cmd, None, 0, "unset", self.target(Some(name)))?;
         if !out.status.success() {
-            return Err(sops_failed("unset", &out, &[]));
+            return Err(sops_failed("unset", self.target(Some(name)), &out, &[]));
         }
         Ok(())
     }
@@ -659,12 +751,13 @@ impl SopsBackend {
     fn readback(&self, copy: &[u8], name: &Name, value: &SecretValue) -> Result<(), BackendError> {
         let json = value
             .to_json_string()
-            .map_err(|_| BackendError::Validation("the value is not UTF-8".into()))?;
+            .map_err(|_| self.validation(Some(name), "the value is not UTF-8"))?;
         let inner = &json[1..json.len() - 1];
         let got = self.decrypt_one(copy, name, "readback decrypt", &[value.expose(), inner])?;
         if !value.ct_eq(got.expose()) {
-            return Err(BackendError::Validation(
-                "the value read back from the new file differs from the input".into(),
+            return Err(self.validation(
+                Some(name),
+                "the value read back from the new file differs from the input",
             ));
         }
         Ok(())
@@ -692,9 +785,15 @@ impl SopsBackend {
         ])
         .arg(name.sops_path())
         .arg("/dev/stdin");
-        let out = self.run(cmd, Some(bytes), MAX_VALUE_BYTES)?;
+        let out = self.run(
+            cmd,
+            Some(bytes),
+            MAX_VALUE_BYTES,
+            step,
+            self.target(Some(name)),
+        )?;
         if !out.status.success() {
-            return Err(sops_failed(step, &out, secrets));
+            return Err(sops_failed(step, self.target(Some(name)), &out, secrets));
         }
         let mut stdout = out.stdout;
         Ok(SecretValue::new(std::mem::take(&mut *stdout)))
@@ -734,19 +833,25 @@ impl SopsBackend {
                 Err(e) => return Err(io_err("create the backup", &path, e)),
             }
         }
-        Err(BackendError::Validation(
-            "could not find a free backup file name".into(),
-        ))
+        Err(BackendError::Io {
+            step: "create the backup",
+            path: dir_path.clone(),
+            source: io::Error::other("could not find a free backup file name"),
+        })
     }
 
+    /// [`Self::run_unchecked`] after the once-only checks. `step` and
+    /// `target` name the run in its errors (PLAN 14).
     fn run(
         &self,
         cmd: Command,
         stdin: Option<&[u8]>,
         stdout_cap: usize,
+        step: &'static str,
+        target: Target,
     ) -> Result<ChildOutput, BackendError> {
         self.check_once()?;
-        self.run_unchecked(cmd, stdin, stdout_cap)
+        self.run_unchecked(cmd, stdin, stdout_cap, step, target)
     }
 
     fn run_unchecked(
@@ -754,6 +859,8 @@ impl SopsBackend {
         cmd: Command,
         stdin: Option<&[u8]>,
         stdout_cap: usize,
+        step: &'static str,
+        target: Target,
     ) -> Result<ChildOutput, BackendError> {
         let timeout = child::timeout();
         child::run(cmd, stdin, stdout_cap, timeout).map_err(|e| match e {
@@ -763,9 +870,13 @@ impl SopsBackend {
                 source,
             },
             ChildError::Interrupted => BackendError::Interrupted,
-            ChildError::Stopped => BackendError::SopsPrompt,
-            ChildError::Timeout => BackendError::SopsTimeout(timeout),
-            ChildError::Overflow => BackendError::SopsOutputTooLarge,
+            ChildError::Stopped => BackendError::SopsPrompt { step, target },
+            ChildError::Timeout => BackendError::SopsTimeout {
+                step,
+                target,
+                after: timeout,
+            },
+            ChildError::Overflow => BackendError::SopsOutputTooLarge { step, target },
         })
     }
 }
@@ -787,13 +898,32 @@ impl Backend for SopsBackend {
         Ok(doc.entries.contains_key(name.as_str()))
     }
 
+    fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
+        let (snap, doc) = self.read_doc()?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
+        if mode == PutMode::CreateOnly && doc.entries.contains_key(name.as_str()) {
+            return Err(self.exists_error(name));
+        }
+        self.check_cleartext_rules(name, &doc.meta)?;
+        self.check_plaintext(name, &doc.entries)
+    }
+
+    fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
+        let (snap, doc) = self.read_doc()?;
+        refuse_non_yaml(&snap.bytes, &self.file)?;
+        if !doc.entries.contains_key(name.as_str()) {
+            return Err(self.missing_error(name));
+        }
+        self.check_plaintext(name, &doc.entries)
+    }
+
     fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError> {
         let (snap, doc) = self.read_doc()?;
         for n in names {
             let entry = doc
                 .entries
                 .get(n.as_str())
-                .ok_or_else(|| BackendError::Missing(n.clone()))?;
+                .ok_or_else(|| self.missing_error(n))?;
             if let Some(kind) = non_string_kind(entry) {
                 return Err(BackendError::NotString {
                     name: n.to_string(),
@@ -999,6 +1129,53 @@ fn read_entry(
     Ok((OwnedFd::from(f), bytes))
 }
 
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The file name endings that sops reads as another format than YAML.
+const NON_YAML_ENDINGS: [&str; 3] = [".json", ".env", ".ini"];
+
+/// v0.1 runs `sops set` and `unset` with `--output-type yaml`, so a write
+/// turns a JSON store into YAML, which a consumer that reads it as JSON
+/// cannot parse (v0.2 plan, V14). The write path refuses such a file before
+/// it reads a value. A YAML file in flow style also parses as JSON; sops
+/// never writes one. A leading UTF-8 BOM does not hide a JSON file.
+fn refuse_non_yaml(bytes: &[u8], path: &Path) -> Result<(), BackendError> {
+    refuse_non_yaml_name(path)?;
+    let body = bytes
+        .strip_prefix(UTF8_BOM)
+        .unwrap_or(bytes)
+        .trim_ascii_start();
+    let object = body.first() == Some(&b'{') && serde_json::from_slice::<IgnoredAny>(body).is_ok();
+    if object {
+        return Err(BackendError::Unsafe {
+            path: path.to_path_buf(),
+            reason: "it is a sops JSON file; secrit v0.1 writes YAML stores only, \
+                     and a write would rewrite it as YAML"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+/// sops picks the format from the file name, so a YAML store file must not
+/// have a name that sops reads as JSON, dotenv or INI.
+fn refuse_non_yaml_name(path: &Path) -> Result<(), BackendError> {
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match NON_YAML_ENDINGS.iter().find(|e| file_name.ends_with(*e)) {
+        Some(ending) => Err(BackendError::Unsafe {
+            path: path.to_path_buf(),
+            reason: format!(
+                "sops does not read a {ending} file as YAML; \
+                 secrit v0.1 writes YAML stores only"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
 fn parse_doc(bytes: &[u8], path: &Path) -> Result<SopsDoc, BackendError> {
     let parse_err = |what: &str| BackendError::Parse {
         path: path.to_path_buf(),
@@ -1030,10 +1207,11 @@ fn has_recipients(meta: &Map<String, Value>) -> bool {
     })
 }
 
-/// Whether `v` holds a leaf that sops did not encrypt.
+/// Whether `v` holds a leaf that sops did not encrypt. sops never encrypts
+/// an empty string or a null; such a leaf holds no secret.
 fn has_plaintext(v: &Value) -> bool {
     match v {
-        Value::String(s) => !s.starts_with("ENC["),
+        Value::String(s) => !s.is_empty() && !s.starts_with("ENC["),
         Value::Bool(_) | Value::Number(_) => true,
         Value::Null => false,
         Value::Array(a) => a.iter().any(has_plaintext),
@@ -1051,8 +1229,9 @@ fn stable_meta(meta: &Map<String, Value>) -> Map<String, Value> {
 }
 
 /// PLAN section 8.1, step 9 (the structural part; the readback is separate).
-fn validate(orig: &SopsDoc, copy: &SopsDoc, name: &Name, op: Op<'_>) -> Result<(), BackendError> {
-    let fail = |m: String| Err(BackendError::Validation(m));
+/// The error is the reason; the caller adds the file and the name.
+fn validate(orig: &SopsDoc, copy: &SopsDoc, name: &Name, op: Op<'_>) -> Result<(), String> {
+    let fail = |m: String| Err(m);
     if !has_recipients(&copy.meta) {
         return fail("the new file has no recipients".into());
     }
@@ -1070,6 +1249,11 @@ fn validate(orig: &SopsDoc, copy: &SopsDoc, name: &Name, op: Op<'_>) -> Result<(
         .find(|k| k.as_str() != name.as_str() && !orig.entries.contains_key(*k))
     {
         return fail(format!("an unexpected entry '{}' appeared", escape(k)));
+    }
+    // No leaf of the new file is cleartext, not even an entry that was
+    // cleartext before: secrit never writes such a file (PLAN 8.1, step 9).
+    if let Some((k, _)) = copy.entries.iter().find(|(_, v)| has_plaintext(v)) {
+        return fail(format!("entry '{}' is not encrypted", escape(k)));
     }
     match op {
         Op::Put(..) => match copy.entries.get(name.as_str()) {
@@ -1110,8 +1294,11 @@ impl TempCopy {
         })?;
         for _ in 0..8 {
             let mut rnd = [0u8; 8];
-            getrandom::fill(&mut rnd)
-                .map_err(|_| BackendError::Validation("no randomness for the temp name".into()))?;
+            getrandom::fill(&mut rnd).map_err(|_| BackendError::Io {
+                step: "name the temp copy",
+                path: dir_path.to_path_buf(),
+                source: io::Error::other("no randomness for the temp name"),
+            })?;
             let hex = crate::lock::hex(&rnd);
             let mut raw = b".".to_vec();
             raw.extend_from_slice(base.as_bytes());
@@ -1138,9 +1325,11 @@ impl TempCopy {
                 Err(e) => return Err(io_err("create the temp copy", &path, e)),
             }
         }
-        Err(BackendError::Validation(
-            "could not find a free temp file name".into(),
-        ))
+        Err(BackendError::Io {
+            step: "create the temp copy",
+            path: dir_path.to_path_buf(),
+            source: io::Error::other("could not find a free temp file name"),
+        })
     }
 
     fn disarm(mut self) {
@@ -1156,9 +1345,15 @@ impl Drop for TempCopy {
     }
 }
 
-fn sops_failed(step: &'static str, out: &ChildOutput, secrets: &[&[u8]]) -> BackendError {
+fn sops_failed(
+    step: &'static str,
+    target: Target,
+    out: &ChildOutput,
+    secrets: &[&[u8]],
+) -> BackendError {
     BackendError::Sops {
         step,
+        target,
         status: match out.status.code() {
             Some(c) => format!("exit {c}"),
             None => "killed by a signal".into(),
@@ -1169,11 +1364,14 @@ fn sops_failed(step: &'static str, out: &ChildOutput, secrets: &[&[u8]]) -> Back
 
 /// Shortest line of a multiline value that is matched on its own.
 const MIN_LINE_NEEDLE: usize = 4;
+/// The most child stderr lines an error shows.
+const MAX_STDERR_LINES: usize = 20;
 
 /// Child stderr for an error message. A line that holds a secret, its JSON
 /// form or one of its lines is dropped whole: an inline mark would show
 /// where a short value sits in otherwise fixed text (SEC-15). The rest is
-/// escaped and cut to 20 lines.
+/// escaped and cut to [`MAX_STDERR_LINES`] lines; a note says how many more
+/// there were.
 fn redact(stderr: &[u8], secrets: &[&[u8]]) -> String {
     let mut needles: Vec<&[u8]> = Vec::new();
     for s in secrets.iter().filter(|s| !s.is_empty()) {
@@ -1186,6 +1384,7 @@ fn redact(stderr: &[u8], secrets: &[&[u8]]) -> String {
     }
     let contains = |hay: &[u8], n: &[u8]| hay.windows(n.len()).any(|w| w == n);
     let mut hidden = 0usize;
+    let mut cut = 0usize;
     let mut shown: Vec<String> = Vec::new();
     for line in stderr.split(|b| *b == b'\n') {
         if needles.iter().any(|n| contains(line, n)) {
@@ -1194,9 +1393,17 @@ fn redact(stderr: &[u8], secrets: &[&[u8]]) -> String {
         }
         let text = String::from_utf8_lossy(line);
         let text = text.trim_end();
-        if !text.trim().is_empty() && shown.len() < 20 {
-            shown.push(escape(text).into_owned());
+        if text.trim().is_empty() {
+            continue;
         }
+        if shown.len() < MAX_STDERR_LINES {
+            shown.push(escape(text).into_owned());
+        } else {
+            cut += 1;
+        }
+    }
+    if cut > 0 {
+        shown.push(format!("({cut} more line(s) not shown)"));
     }
     if hidden > 0 {
         shown.push(format!(
@@ -1291,6 +1498,7 @@ fn hook(_: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Exit;
 
     #[test]
     fn utc_stamp_known_dates() {
@@ -1323,10 +1531,29 @@ mod tests {
         let ctl = redact(b"bad \x1b[2J here\n", &[]);
         assert!(ctl.contains("\\x1b") && !ctl.contains('\x1b'));
 
+        // The header line, 20 lines, and a note for the 30 that were cut.
         let many: Vec<u8> = (0..50)
             .flat_map(|i| format!("line {i}\n").into_bytes())
             .collect();
-        assert_eq!(redact(&many, &[]).lines().count(), 21);
+        let out = redact(&many, &[]);
+        assert_eq!(out.lines().count(), 22);
+        assert!(out.contains("line 19") && !out.contains("line 20"));
+        assert!(out.contains("(30 more line(s) not shown)"), "{out}");
+
+        // Cut lines and hidden lines are counted apart.
+        let mixed: Vec<u8> = (0..25)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .chain(b"hunter2 leaked\n".iter().copied())
+            .collect();
+        let out = redact(&mixed, &[b"hunter2"]);
+        assert!(out.contains("(5 more line(s) not shown)"), "{out}");
+        assert!(out.contains("(1 line(s) not shown, because"), "{out}");
+        assert!(!out.contains("hunter2"));
+
+        let exact: Vec<u8> = (0..20)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        assert!(!redact(&exact, &[]).contains("more line(s)"));
     }
 
     #[test]
@@ -1389,17 +1616,19 @@ mod tests {
     }
 
     #[test]
-    fn same_as_compares_the_mode() {
-        let snap = |mode| Snapshot {
+    fn same_as_compares_the_mode_and_mtime() {
+        let snap = |mode, mtime| Snapshot {
             dev: 1,
             ino: 2,
             size: 3,
+            mtime,
             mode,
             hash: [0; 32],
             bytes: Vec::new(),
         };
-        assert!(snap(0o600).same_as(&snap(0o600)));
-        assert!(!snap(0o600).same_as(&snap(0o640)));
+        assert!(snap(0o600, (5, 6)).same_as(&snap(0o600, (5, 6))));
+        assert!(!snap(0o600, (5, 6)).same_as(&snap(0o640, (5, 6))));
+        assert!(!snap(0o600, (5, 6)).same_as(&snap(0o600, (5, 7))));
     }
 
     fn doc(yaml: &str) -> SopsDoc {
@@ -1414,6 +1643,33 @@ mod tests {
         assert!(parse_doc(b"- a\n", Path::new("/t")).is_err());
         assert!(parse_doc(b"sops:\n  age: []\n", Path::new("/t")).is_err());
         assert_eq!(doc(BASE).entries.len(), 1);
+    }
+
+    #[test]
+    fn a_store_that_is_not_yaml_is_refused() {
+        let yaml = Path::new("/s/main.yaml");
+        assert!(refuse_non_yaml(BASE.as_bytes(), yaml).is_ok());
+        let json = br#"{"a": "ENC[x]", "sops": {"mac": "ENC[m]"}}"#;
+        let bom = b"\xEF\xBB\xBF{\"a\": \"ENC[x]\"}";
+        let bom_space = b"\xEF\xBB\xBF \n {}";
+        for bytes in [&json[..], b"\n  {}\n", &bom[..], &bom_space[..]] {
+            let e = refuse_non_yaml(bytes, yaml).unwrap_err();
+            assert!(e.to_string().contains("sops JSON file"), "{e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        // Flow-style YAML that is not JSON stays allowed, with a BOM too.
+        assert!(refuse_non_yaml(b"{a: b}\n", yaml).is_ok());
+        assert!(refuse_non_yaml(b"\xEF\xBB\xBF{a: b}\n", yaml).is_ok());
+        let mut bom_yaml = b"\xEF\xBB\xBF".to_vec();
+        bom_yaml.extend_from_slice(BASE.as_bytes());
+        assert!(refuse_non_yaml(&bom_yaml, yaml).is_ok());
+        for name in ["main.json", "MAIN.JSON", ".env", "a.env", "a.ini"] {
+            let path = Path::new("/s").join(name);
+            let e = refuse_non_yaml(BASE.as_bytes(), &path).unwrap_err();
+            assert!(e.to_string().contains("YAML stores only"), "{name}: {e}");
+            assert_eq!(e.exit(), Exit::Refused);
+        }
+        assert!(refuse_non_yaml_name(Path::new("/s/a.env.yaml")).is_ok());
     }
 
     #[test]
@@ -1452,5 +1708,121 @@ mod tests {
         let a = Name::parse("a").unwrap();
         assert!(validate(&orig, &removed, &a, Op::Remove).is_ok());
         assert!(validate(&orig, &orig, &a, Op::Remove).is_err());
+
+        // A cleartext leaf that was already in the file fails too (A-3),
+        // and the reason names the entry, never its value.
+        let orig_x = doc(&format!("{BASE}x: cleartext\n"));
+        let copy_x = doc(&format!(
+            "{BASE}x: cleartext\nb: ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]\n"
+        ));
+        let reason = validate(&orig_x, &copy_x, &n, put).unwrap_err();
+        assert!(reason.contains("'x' is not encrypted"), "{reason}");
+        assert!(!reason.contains("cleartext"), "{reason}");
+        let nested_yaml = format!("{BASE}x:\n  k: [1]\n");
+        let nested = doc(&nested_yaml);
+        let nested_removed =
+            doc(&nested_yaml.replace("a: ENC[AES256_GCM,data:x,iv:y,tag:z,type:str]\n", ""));
+        let reason = validate(&nested, &nested_removed, &a, Op::Remove).unwrap_err();
+        assert!(reason.contains("'x' is not encrypted"), "{reason}");
+    }
+
+    #[test]
+    fn a_cleartext_entry_is_refused_before_the_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), &format!("{BASE}x_unencrypted: plain\n"));
+        let z = Name::parse("z").unwrap();
+        let a = Name::parse("a").unwrap();
+        let e = b.check_put(&z, PutMode::CreateOnly).unwrap_err();
+        assert!(
+            e.to_string().contains("'x_unencrypted' is not encrypted"),
+            "{e}"
+        );
+        assert!(!e.to_string().contains("plain"), "{e}");
+        assert_eq!(e.exit(), Exit::Refused);
+        let e = b.check_remove(&a).unwrap_err();
+        assert!(e.to_string().contains("is not encrypted"), "{e}");
+        assert_eq!(e.exit(), Exit::Refused);
+
+        // NAME itself may be the cleartext entry: the write replaces or
+        // removes it.
+        let b = backend_for(tmp.path(), &format!("{BASE}e: plain\n"));
+        let e_name = Name::parse("e").unwrap();
+        assert!(b.check_put(&e_name, PutMode::Replace).is_ok());
+        assert!(b.check_remove(&e_name).is_ok());
+        let e = b.check_remove(&z).unwrap_err();
+        assert!(matches!(e, BackendError::Missing { .. }), "{e}");
+    }
+
+    /// sops never encrypts an empty string, so an empty leaf holds no
+    /// secret, the same as a null leaf.
+    #[test]
+    fn an_empty_string_leaf_is_not_plaintext() {
+        assert!(!has_plaintext(&Value::String(String::new())));
+        assert!(!has_plaintext(&Value::Null));
+        let nested: Value = serde_json::from_str(r#"{"k": ["", null], "m": {"n": ""}}"#).unwrap();
+        assert!(!has_plaintext(&nested));
+        assert!(has_plaintext(&Value::String(" ".into())));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), &format!("{BASE}e: \"\"\n"));
+        let z = Name::parse("z").unwrap();
+        let a = Name::parse("a").unwrap();
+        assert!(b.check_put(&z, PutMode::CreateOnly).is_ok());
+        assert!(b.check_remove(&a).is_ok());
+        assert!(b.inspect().unwrap().plaintext.is_empty());
+
+        // The copy validation keeps the empty entry too.
+        let orig = doc(&format!("{BASE}e: \"\"\n"));
+        let copy = doc(&format!(
+            "{BASE}e: \"\"\nz: ENC[AES256_GCM,data:q,iv:w,tag:e,type:str]\n"
+        ));
+        let v = SecretValue::new(b"v".to_vec());
+        assert!(validate(&orig, &copy, &z, Op::Put(&v, PutMode::CreateOnly)).is_ok());
+    }
+
+    fn backend_for(dir: &Path, yaml: &str) -> SopsBackend {
+        let file = dir.join("main.yaml");
+        std::fs::write(&file, yaml).unwrap();
+        let store = StoreConfig {
+            name: "main".into(),
+            backend: BackendKind::Sops,
+            file,
+            sops_config: None,
+            age_key_file: None,
+            wire_hint: false,
+        };
+        SopsBackend::new(&store, "/nonexistent/sops".into(), Duration::ZERO, &|_| {
+            None
+        })
+        .unwrap()
+    }
+
+    /// PLAN 4.1 step 1: `check_put` refuses before any value is read, with
+    /// no sops run (the sops path here does not exist).
+    #[test]
+    fn check_put_refuses_without_a_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = backend_for(tmp.path(), BASE);
+        let a = Name::parse("a").unwrap();
+        let z = Name::parse("z").unwrap();
+        let e = b.check_put(&a, PutMode::CreateOnly).unwrap_err();
+        assert!(matches!(e, BackendError::Exists { .. }), "{e}");
+        assert!(e.to_string().contains("main.yaml"), "{e}");
+        assert!(b.check_put(&a, PutMode::Replace).is_ok());
+        assert!(b.check_put(&z, PutMode::CreateOnly).is_ok());
+
+        let regex = BASE.replace("  version:", "  unencrypted_regex: ^pub\n  version:");
+        let b = backend_for(tmp.path(), &regex);
+        let e = b.check_put(&z, PutMode::CreateOnly).unwrap_err();
+        assert!(e.to_string().contains("unencrypted_regex"), "{e}");
+        assert_eq!(e.exit(), Exit::Refused);
+
+        let suffix = BASE.replace("  version:", "  unencrypted_suffix: _pub\n  version:");
+        let b = backend_for(tmp.path(), &suffix);
+        let e = b
+            .check_put(&Name::parse("tok_pub").unwrap(), PutMode::Replace)
+            .unwrap_err();
+        assert!(e.to_string().contains("_pub"), "{e}");
+        assert!(b.check_put(&z, PutMode::Replace).is_ok());
     }
 }

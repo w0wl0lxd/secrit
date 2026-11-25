@@ -57,15 +57,22 @@ fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), E
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
-        && file.exists()
     {
-        let tracked = repo.is_tracked(file);
+        if let Some(hint) = super::ignore_hint(&repo, file)? {
+            ctx.status(&format!("then run: {hint}"));
+        }
+        let tracked = if file.exists() {
+            repo.is_tracked(file)
+        } else {
+            Ok(true)
+        };
         super::git_interrupted(&tracked)?;
         if tracked.is_ok_and(|t| !t) {
             ctx.status(&format!(
                 "then run: {}",
                 super::doctor::git_add_hint(&repo, file)
             ));
+            ctx.status(&format!("then: {}", super::spell_hint(&repo, file)));
         }
     }
     if let Some(nix) = &ctx.nix {

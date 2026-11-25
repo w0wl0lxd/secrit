@@ -108,4 +108,13 @@ mod tests {
             Some(Agent::Variable("CODEX_SANDBOX"))
         );
     }
+
+    /// PLAN 8.3: the README lists every variable, so it cannot drift.
+    #[test]
+    fn the_readme_lists_every_variable() {
+        let readme = include_str!("../README.md");
+        for v in AGENT_VARS {
+            assert!(readme.contains(&format!("`{v}`")), "README misses {v}");
+        }
+    }
 }

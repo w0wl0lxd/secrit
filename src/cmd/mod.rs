@@ -9,15 +9,16 @@ pub mod store;
 pub mod wire;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::Backend;
-use crate::backend::sops::SopsBackend;
+use crate::backend::sops::{SopsBackend, TEMP_IGNORE};
 use crate::config::{
     BackendKind, Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home,
 };
 use crate::display::escape;
 use crate::error::Error;
+use crate::git::Repo;
 use crate::name::Name;
 use crate::tools::{self, ResolvedTool, ToolSource};
 
@@ -38,14 +39,7 @@ impl Ctx {
     ) -> Result<Self, Error> {
         let env = |k: &str| std::env::var_os(k);
         let (path, source) = config_path(config_flag, &env)?;
-        // A variable is not visible on the command line, so name the file it
-        // picked (SEC-10).
-        if source == ConfigSource::Env && !quiet {
-            eprintln!(
-                "secrit: using config {} from {ENV_CONFIG}",
-                escape(&path.display().to_string())
-            );
-        }
+        note_config_source(&path, source, quiet);
         let config = Config::load(&path, &home(&env)?)?;
         let store = config.store(store_flag)?.clone();
         let backend: Box<dyn Backend> = match store.backend {
@@ -85,6 +79,51 @@ impl std::fmt::Debug for Ctx {
             .field("store", &self.store.name)
             .finish_non_exhaustive()
     }
+}
+
+/// A variable is not visible on the command line, so name the file it
+/// picked (SEC-10). Every command that reads the config calls this.
+pub fn note_config_source(path: &Path, source: ConfigSource, quiet: bool) {
+    if source == ConfigSource::Env && !quiet {
+        eprintln!(
+            "secrit: using config {} from {ENV_CONFIG}",
+            escape(&path.display().to_string())
+        );
+    }
+}
+
+/// A temp copy name for `file` (PLAN 8.1, step 6), to ask git whether it
+/// ignores temp copies.
+#[must_use]
+pub fn temp_sample(file: &Path) -> PathBuf {
+    file.with_file_name(format!(
+        ".{}.secrit-0000000000000000.yaml",
+        file.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+/// The command that makes `repo` ignore the temp copies of `file`, or `None`
+/// when it ignores them already or git cannot tell.
+pub fn ignore_hint(repo: &Repo, file: &Path) -> Result<Option<String>, Error> {
+    let ignored = repo.is_ignored(&temp_sample(file));
+    git_interrupted(&ignored)?;
+    Ok(ignored.is_ok_and(|i| !i).then(|| {
+        format!(
+            "echo {} >> {}",
+            shell_word(TEMP_IGNORE),
+            shell_path(&repo.root.join(".gitignore"))
+        )
+    }))
+}
+
+/// The reminder that goes with the `git add` hint (PLAN 20, Q1).
+#[must_use]
+pub fn spell_hint(repo: &Repo, file: &Path) -> String {
+    format!(
+        "if a pre-commit spell checker (such as typos) runs in {}, exclude {} from it; ciphertext can fail it",
+        shell_path(&repo.root),
+        shell_path(repo.relative(file))
+    )
 }
 
 fn warn_on_path_fallback(tool: &ResolvedTool, quiet: bool) {

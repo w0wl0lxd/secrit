@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::{interrupted, shell_path};
 use crate::backend::BackendError;
-use crate::backend::sops::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
+use crate::backend::sops::{MIN_SOPS, SopsBackend};
 use crate::child;
 use crate::config::{
     BackendKind, Config, ConfigError, StoreConfig, ToolSetting, ToolsConfig, config_path, home,
@@ -87,7 +87,9 @@ fn steps(
         dry_run: args.dry_run,
     };
     let home = home(&env)?;
-    let (config_file, _) = config_path(config_flag, &env)?;
+    let (config_file, source) = config_path(config_flag, &env)?;
+    // Before step 1: the config names the tools that init runs.
+    super::note_config_source(&config_file, source, quiet);
     let existing = match Config::load(&config_file, &home) {
         Ok(c) => Some(c),
         Err(ConfigError::NotFound(_)) => None,
@@ -286,7 +288,7 @@ fn keygen_command(keygen: &Path) -> Command {
 fn run_keygen(cmd: Command, cap: usize, what: &str) -> Result<child::ChildOutput, Error> {
     let out = child::run(cmd, None, cap, child::timeout()).map_err(|e| match e {
         child::ChildError::Interrupted => Error::Interrupted,
-        e => Error::Failed(format!("age-keygen {what}: {e:?}")),
+        e => Error::Failed(format!("age-keygen {what}: {e}")),
     })?;
     if out.status.success() {
         Ok(out)
@@ -590,7 +592,7 @@ fn write_config(
                 "config {shown} has no store '{}'; unchanged. Add it by hand:",
                 store.name
             ));
-            print!("{}", config_text(store, args)?);
+            print!("{}", store_section(store, args)?);
         }
         return Ok(());
     }
@@ -607,7 +609,17 @@ fn write_config(
     create_new(path, text.as_bytes(), 0o600)
 }
 
-fn config_text(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
+/// Only the store's table, for an existing config: a top-level key appended
+/// after its last table would land inside that table.
+#[derive(Serialize)]
+struct NewSection<'a> {
+    stores: std::collections::BTreeMap<&'a str, NewStore<'a>>,
+}
+
+fn new_stores<'a>(
+    store: &'a StoreConfig,
+    args: &InitArgs,
+) -> std::collections::BTreeMap<&'a str, NewStore<'a>> {
     let mut stores = std::collections::BTreeMap::new();
     stores.insert(
         store.name.as_str(),
@@ -618,11 +630,24 @@ fn config_text(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
             age_key_file: args.age_key.as_ref().and(store.age_key_file.as_deref()),
         },
     );
-    toml::to_string(&NewConfig {
+    stores
+}
+
+fn to_toml(value: &impl Serialize) -> Result<String, Error> {
+    toml::to_string(value).map_err(|e| Error::Failed(format!("could not write the config: {e}")))
+}
+
+fn config_text(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
+    to_toml(&NewConfig {
         default_store: &store.name,
-        stores,
+        stores: new_stores(store, args),
     })
-    .map_err(|e| Error::Failed(format!("could not write the config: {e}")))
+}
+
+fn store_section(store: &StoreConfig, args: &InitArgs) -> Result<String, Error> {
+    to_toml(&NewSection {
+        stores: new_stores(store, args),
+    })
 }
 
 fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) -> Result<(), Error> {
@@ -630,18 +655,8 @@ fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) ->
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
     {
-        let sample = file.with_file_name(format!(
-            ".{}.secrit-0000000000000000.yaml",
-            file.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        let ignored = repo.is_ignored(&sample);
-        super::git_interrupted(&ignored)?;
-        if ignored.is_ok_and(|i| !i) {
-            out.note(&format!(
-                "next: ignore temp copies: echo {} >> {}",
-                super::shell_word(TEMP_IGNORE),
-                shell_path(&repo.root.join(".gitignore"))
-            ));
+        if let Some(hint) = super::ignore_hint(&repo, file)? {
+            out.note(&format!("next: ignore temp copies: {hint}"));
         }
         let tracked = if file.exists() {
             repo.is_tracked(file)
@@ -654,6 +669,7 @@ fn next_steps(file: &Path, env: &dyn Fn(&str) -> Option<OsString>, out: &Out) ->
                 "next: {}",
                 super::doctor::git_add_hint(&repo, file)
             ));
+            out.note(&format!("next: {}", super::spell_hint(&repo, file)));
         }
     }
     out.note(

@@ -37,6 +37,42 @@ All notable changes to this project are recorded here. The format follows
 - GitHub Actions CI: one cargo job (fmt, clippy, nextest, cargo-deny) and `nix flake check`.
 - README section "Set up a store": age key, `.sops.yaml` rule, the empty sops file, the
   `.gitignore` line, and a sops-nix stanza.
+- `wire` prints the `.gitignore` line for temp copies when the store repository does not
+  ignore them, as `init` does.
+- `init` and `wire` print a reminder to exclude the store file from a pre-commit spell
+  checker, next to the `git add` line (PLAN Q1).
+- README: the screen (Kitty remote control, a screen recorder or share) can read a
+  revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
+  only; v0.1 has no clipboard support; all ten agent variables are listed.
+
+### Fixed
+
+- `store` checks the store file's own cleartext rules (`unencrypted_suffix`,
+  `encrypted_suffix`, and the refusal of a file with a regex rule) before it reads the
+  value, so nobody types a value that is then refused.
+- A write that finds the store file changed now retries 3 times (4 attempts) before exit
+  4, as documented; it gave up after 2 retries. The change check also compares the
+  modification time.
+- The write protocol checks the store directory's owner and mode again after it takes the
+  lock, and on each retry.
+- The copy validation refuses a new file in which any entry is not encrypted, also an
+  entry that was cleartext before the write. `store` and `rm` find such an entry before they read a value or
+  ask, and refuse with exit 3; NAME itself may be the cleartext entry. An empty string
+  or a null is not cleartext: sops never encrypts it, and it holds no secret.
+- sops errors name the step, the secret name and the store file (`sops set failed for
+  'NAME' in FILE`), and so do the validation, timeout, prompt and output-size errors.
+  `rm` of a missing name names the file. age-keygen run errors no longer show Debug text
+  such as `Timeout`.
+- A sops error with more than 20 lines of stderr says how many lines were cut.
+- With a config that does not name the store, `init` prints only the `[stores.NAME]`
+  table. It printed a `default_store` line too, which broke the config when appended.
+- `init` and `doctor` announce a config picked by `SECRIT_CONFIG` on stderr, like the
+  other commands; `-q` hides the line.
+- `store` and `rm` refuse a store file that is sops JSON (also after a UTF-8 byte order
+  mark), or whose name ends in `.json`, `.env` or `.ini`, with exit 3, and leave it
+  unchanged. Before, a write turned a JSON
+  store into YAML, which a reader that expects JSON cannot parse. `init` refuses such a
+  file too, and `doctor` shows it as a failed `file` row; `ls` and `get` still read it.
 
 ### Security
 
@@ -120,9 +156,12 @@ from the first draft.
 - A sops older than 3.11 is refused before the first run.
 - `mlock` and `MADV_DONTDUMP` on value buffers are deferred: rustix offers them only as
   `unsafe fn`, and the crate forbids `unsafe` code (PLAN open question Q14).
-- Crates: `signal-hook` added; `rpassword` and `anyhow` dropped; `base64`, `insta` and the
-  rustix `mm` feature wait for the commands that need them; the tests use
+- Crates: `signal-hook` added; `rpassword` and `anyhow` dropped; `base64` and the rustix
+  `mm` feature wait for the commands that need them; the tests use
   `std::process::Command` instead of `assert_cmd`, `assert_fs` and `predicates`.
+- `insta` is not used. The `wire` test compares stdout exactly with no Nix setup and asserts each stderr hint line,
+  and the `doctor` tests assert the `--json` rows of one broken item at a time. No new
+  dependency was needed.
 - The flake builds `x86_64-linux` only, and `rust-toolchain.toml` pins 1.98.1.
 - The licence texts are in `LICENSE-MIT` and `LICENSE-APACHE`.
 - `run` moved to v0.2 (milestone M6, open question Q12), so goal G3 moved too. v0.1 does

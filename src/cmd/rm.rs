@@ -1,16 +1,13 @@
 //! `secrit rm NAME` (PLAN section 4.4).
 
 use super::Ctx;
-use crate::backend::BackendError;
 use crate::display::escape;
 use crate::error::Error;
 use crate::name::Name;
 use crate::tty::{self, LineEnd, ReadError};
 
 pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
-    if !ctx.backend.exists(name)? {
-        return Err(BackendError::Missing(name.clone()).into());
-    }
+    ctx.backend.check_remove(name)?;
     if !yes {
         let question = format!(
             "remove {name} from {}? [y/N] ",

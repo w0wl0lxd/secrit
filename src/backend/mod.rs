@@ -31,11 +31,36 @@ pub struct WriteReport {
     pub backup: Option<PathBuf>,
 }
 
+/// What a backend can do, for the commands that adapt to it (v0.2 plan
+/// 5.2). A field joins in the slice that first reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Names with more than one segment (`a/b`) address nested keys.
+    pub nested_names: bool,
+}
+
+impl Capabilities {
+    /// Refuse `name` when the store cannot hold it (v0.2 plan 5.2): a
+    /// nested name needs `nested_names`. Exit 3, before any input.
+    pub fn check_name(self, name: &Name, location: &Location) -> Result<(), BackendError> {
+        if name.is_nested() && !self.nested_names {
+            return Err(BackendError::Capability {
+                location: location.clone(),
+                what: "nested names (a name with '/')",
+            });
+        }
+        Ok(())
+    }
+}
+
 pub trait Backend {
     fn kind(&self) -> BackendKind;
+    fn capabilities(&self) -> Capabilities;
     /// Where the store lives, for messages and errors.
     fn location(&self) -> &Location;
-    /// Top-level names, sorted, as the file holds them. Must not decrypt.
+    /// Names as the store holds them, sorted: key paths joined by `/`.
+    /// Raw strings: another tool can write a key that is not a valid
+    /// `Name`; `ls` escapes it. Must not decrypt.
     fn list(&self) -> Result<Vec<String>, BackendError>;
     /// Must not decrypt.
     fn exists(&self, name: &Name) -> Result<bool, BackendError>;
@@ -69,8 +94,13 @@ pub trait Backend {
 /// Where a consumer such as sops-nix reads a secret (v0.2 plan 5.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireSource {
-    /// A sops file, with the format that sops-nix must read it as.
-    SopsFile { file: PathBuf, format: SopsFormat },
+    /// A sops file, with the format that sops-nix must read it as, and
+    /// the key path when it is not the plain name (a nested name).
+    SopsFile {
+        file: PathBuf,
+        format: SopsFormat,
+        key: Option<Name>,
+    },
 }
 
 /// What `doctor` gives a backend for its own rows.
@@ -205,6 +235,19 @@ pub enum BackendError {
     Exists { name: Name, location: Location },
     #[error("'{name}' does not exist in {location}")]
     Missing { name: Name, location: Location },
+    /// The key path of the name conflicts with the store's tree (T49).
+    #[error("refusing '{name}' in {location}: {reason}")]
+    KeyPath {
+        name: Name,
+        location: Location,
+        reason: String,
+    },
+    /// The store's backend cannot do what the command asks (v0.2 plan 5.2).
+    #[error("the store {location} does not support {what}")]
+    Capability {
+        location: Location,
+        what: &'static str,
+    },
     #[error("refusing {}: {reason}", escape_path(path))]
     Unsafe { path: PathBuf, reason: String },
     #[error(transparent)]
@@ -303,6 +346,8 @@ impl BackendError {
     pub fn exit(&self) -> Exit {
         match self {
             BackendError::Exists { .. }
+            | BackendError::KeyPath { .. }
+            | BackendError::Capability { .. }
             | BackendError::Unsafe { .. }
             | BackendError::Name(_)
             | BackendError::CleartextRule { .. }
@@ -525,6 +570,35 @@ mod tests {
                 "/bin/sops is sops 3.10.0; secrit needs sops 3.11 or newer (for 'set --value-stdin' and 'unset')",
             ),
         ]);
+    }
+
+    /// v0.2 plan 5.2: a nested name on a store without nested keys exits
+    /// 3 and names the store; a one-segment name always passes.
+    #[test]
+    fn a_nested_name_needs_the_capability() {
+        let flat = Capabilities {
+            nested_names: false,
+        };
+        let nested = Capabilities { nested_names: true };
+        let ab = Name::parse("a/b").unwrap();
+        let e = flat.check_name(&ab, &file()).unwrap_err();
+        assert_eq!(e.exit(), Exit::Refused);
+        assert_eq!(
+            e.to_string(),
+            "the store /s/main.yaml does not support nested names (a name with '/')"
+        );
+        assert!(flat.check_name(&tok(), &file()).is_ok());
+        assert!(nested.check_name(&ab, &file()).is_ok());
+        let e = BackendError::KeyPath {
+            name: ab,
+            location: file(),
+            reason: "'a' holds a string, not a map".into(),
+        };
+        assert_eq!(e.exit(), Exit::Refused);
+        assert_eq!(
+            e.to_string(),
+            "refusing 'a/b' in /s/main.yaml: 'a' holds a string, not a map"
+        );
     }
 
     /// A store path with a control character is escaped in every error,

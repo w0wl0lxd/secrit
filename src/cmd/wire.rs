@@ -18,12 +18,21 @@ use crate::name::Name;
 pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> Result<(), Error> {
     let env = |k: &str| std::env::var_os(k);
     // Both forms point at /run/secrets/NAME, which only sops-nix fills.
-    let (file, sops_format) = sops_file(ctx, name)?;
+    let (file, sops_format, key) = sops_file(ctx, name)?;
     let text = match format {
         WireFormat::Nix => {
             let owner = owner_name(owner, &env)?;
             let flake = flake_root(ctx, &file);
-            nix_stanza(name, &file, sops_format, flake.as_deref(), &owner)
+            nix_stanza(
+                name,
+                &Stanza {
+                    file: &file,
+                    format: sops_format,
+                    key: key.as_ref(),
+                },
+                flake.as_deref(),
+                &owner,
+            )
         }
         WireFormat::Env => env_line(name),
     };
@@ -52,10 +61,11 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
     Ok(())
 }
 
-/// The store file that sops-nix reads, and its format (v0.2 plan 5.7).
-fn sops_file(ctx: &Ctx, name: &Name) -> Result<(PathBuf, SopsFormat), Error> {
+/// The store file that sops-nix reads, its format, and the key path of a
+/// nested name (v0.2 plan 5.7).
+fn sops_file(ctx: &Ctx, name: &Name) -> Result<(PathBuf, SopsFormat, Option<Name>), Error> {
     match ctx.backend.wire_source(name) {
-        Some(WireSource::SopsFile { file, format }) => Ok((file, format)),
+        Some(WireSource::SopsFile { file, format, key }) => Ok((file, format, key)),
         None => Err(Error::Refused(format!(
             "store '{}' has no sops file for sops-nix to read, and every wire format needs one",
             ctx.store.name
@@ -180,13 +190,20 @@ fn nix_string(s: &str) -> String {
     out
 }
 
-fn nix_stanza(
-    name: &Name,
-    file: &Path,
+/// Where sops-nix reads the secret: the store file, its format, and the
+/// key path when it is not the plain name.
+#[derive(Debug, Clone, Copy)]
+struct Stanza<'a> {
+    file: &'a Path,
     format: SopsFormat,
-    flake: Option<&Path>,
-    owner: &str,
-) -> String {
+    key: Option<&'a Name>,
+}
+
+/// The NixOS sops-nix stanza. A nested name gets `key` with its segments
+/// joined by `/`, which sops-nix reads as a nested key in a YAML or JSON
+/// file; the secret appears at `/run/secrets/a/b`.
+fn nix_stanza(name: &Name, at: &Stanza<'_>, flake: Option<&Path>, owner: &str) -> String {
+    let file = at.file;
     let abs = file.to_string_lossy();
     let rel = flake
         .and_then(|f| file.strip_prefix(f).ok())
@@ -204,9 +221,14 @@ fn nix_stanza(
             nix_string(&abs)
         ),
     };
+    // A name holds no character that a Nix string must escape.
+    let key = at
+        .key
+        .map(|k| format!("  key = \"{k}\";\n"))
+        .unwrap_or_default();
     format!(
-        "sops.secrets.\"{name}\" = {{\n  sopsFile = {source}\n  format = \"{}\";\n  owner = \"{owner}\";\n}};\n",
-        format.name()
+        "sops.secrets.\"{name}\" = {{\n  sopsFile = {source}\n  format = \"{}\";\n{key}  owner = \"{owner}\";\n}};\n",
+        at.format.name()
     )
 }
 
@@ -242,9 +264,45 @@ mod tests {
         Name::parse(s).unwrap()
     }
 
+    /// The stanza of a one-segment name, which has no `key`.
+    fn stanza(
+        name: &Name,
+        file: &Path,
+        format: SopsFormat,
+        flake: Option<&Path>,
+        owner: &str,
+    ) -> String {
+        let at = Stanza {
+            file,
+            format,
+            key: None,
+        };
+        nix_stanza(name, &at, flake, owner)
+    }
+
+    /// A nested name gets `key` with its segments joined by `/`, and the
+    /// v0.1 lines stay as they were (v0.2 plan S5).
+    #[test]
+    fn the_stanza_names_the_key_of_a_nested_name() {
+        let n = name("a/b/c");
+        let at = Stanza {
+            file: Path::new("/s/x.yaml"),
+            format: YAML,
+            key: Some(&n),
+        };
+        let s = nix_stanza(&n, &at, None, "u");
+        assert!(s.starts_with("sops.secrets.\"a/b/c\" = {\n"), "{s}");
+        assert!(
+            s.contains("  format = \"yaml\";\n  key = \"a/b/c\";\n  owner = \"u\";\n};\n"),
+            "{s}"
+        );
+        let plain = stanza(&name("a"), Path::new("/s/x.yaml"), YAML, None, "u");
+        assert!(!plain.contains("key ="), "{plain}");
+    }
+
     #[test]
     fn the_stanza_uses_a_flake_relative_path() {
-        let s = nix_stanza(
+        let s = stanza(
             &name("gh-token"),
             Path::new("/etc/nixos/secrets/secrit.yaml"),
             SopsFormat::Yaml,
@@ -264,14 +322,14 @@ mod tests {
 
     #[test]
     fn the_stanza_falls_back_to_an_absolute_path() {
-        let s = nix_stanza(&name("a"), Path::new("/s/x.yaml"), YAML, None, "u");
+        let s = stanza(&name("a"), Path::new("/s/x.yaml"), YAML, None, "u");
         assert!(s.contains("sopsFile = /s/x.yaml; # absolute"), "{s}");
-        let s = nix_stanza(&name("a"), Path::new("/s p/${x}.yaml"), YAML, None, "u");
+        let s = stanza(&name("a"), Path::new("/s p/${x}.yaml"), YAML, None, "u");
         assert!(
             s.contains("sopsFile = \"/s p/\\${x}.yaml\"; # absolute"),
             "{s}"
         );
-        let s = nix_stanza(
+        let s = stanza(
             &name("a"),
             Path::new("/f/s p.yaml"),
             YAML,
@@ -285,7 +343,7 @@ mod tests {
     /// Nix text still names the same path.
     #[test]
     fn the_stanza_escapes_control_characters() {
-        let s = nix_stanza(
+        let s = stanza(
             &name("a"),
             Path::new("/s/a\u{1b}]0;x\u{7}\u{202e}b.yaml"),
             YAML,
@@ -306,11 +364,11 @@ mod tests {
     #[test]
     fn the_stanza_names_the_format() {
         for format in SopsFormat::ALL {
-            let s = nix_stanza(&name("a"), Path::new("/s/x"), format, None, "u");
+            let s = stanza(&name("a"), Path::new("/s/x"), format, None, "u");
             let want = format!("  format = \"{}\";\n", format.name());
             assert!(s.contains(&want), "{s}");
         }
-        let s = nix_stanza(
+        let s = stanza(
             &name("a"),
             Path::new("/s/x.json"),
             SopsFormat::Json,
@@ -338,5 +396,7 @@ mod tests {
             "GH_TOKEN_V2_FILE=/run/secrets/gh-token.v2\n"
         );
         assert_eq!(env_line(&name("9x")), "_9X_FILE=/run/secrets/9x\n");
+        // v0.2 plan 5.7: '/' maps to '_' like every other character.
+        assert_eq!(env_line(&name("a/b")), "A_B_FILE=/run/secrets/a/b\n");
     }
 }

@@ -26,6 +26,17 @@ jobs:
       - run: nix develop -c cargo clippy --all-targets --locked -- -D warnings
       - run: nix develop -c cargo nextest run --all-features --locked
       - run: nix develop -c cargo deny check
+  # macOS cfg errors without a Mac: clippy does not link, so it needs no Apple
+  # SDK. The devShell rustc has no darwin std, so rustup supplies it.
+  darwin-clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: rustup target add aarch64-apple-darwin
+      - run: cargo clippy --all-targets --all-features --locked --target aarch64-apple-darwin -- -D warnings
   # The flake checks: the package, the sandbox test run, the module check.
   nix:
     runs-on: ubuntu-latest

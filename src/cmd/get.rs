@@ -14,7 +14,7 @@
 use std::fs::File;
 use std::io::{IsTerminal, Write};
 
-use rustix::fs::{FileType, fstat};
+use rustix::fs::{FileType, RawMode, fstat};
 
 use super::Ctx;
 use crate::agent::{self, Agent};
@@ -63,7 +63,7 @@ pub enum StdoutKind {
 }
 
 #[must_use]
-pub fn classify_stdout(file_type: FileType, mode: u32, owner_is_me: bool) -> StdoutKind {
+pub fn classify_stdout(file_type: FileType, mode: RawMode, owner_is_me: bool) -> StdoutKind {
     match file_type {
         FileType::Fifo | FileType::Socket | FileType::CharacterDevice => StdoutKind::Stream,
         FileType::RegularFile if !owner_is_me || mode & 0o077 != 0 => StdoutKind::SharedFile,

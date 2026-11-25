@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::{Ctx, shell_path, shell_word};
 use crate::backend::BackendError;
 use crate::cli::WireFormat;
+use crate::display::escape_path;
 use crate::error::Error;
 use crate::git::{Repo, find_root};
 use crate::name::Name;
@@ -18,8 +19,9 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
     let text = match format {
         WireFormat::Nix => {
             let owner = owner_name(owner, &env)?;
-            let flake = flake_root(ctx, &ctx.store.file);
-            nix_stanza(name, &ctx.store.file, flake.as_deref(), &owner)
+            let file = sops_file(ctx)?;
+            let flake = flake_root(ctx, file);
+            nix_stanza(name, file, flake.as_deref(), &owner)
         }
         WireFormat::Env => env_line(name),
     };
@@ -37,7 +39,7 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
         Err(BackendError::NoStoreFile(p)) => {
             warn(
                 ctx,
-                &format!("{} does not exist yet; run 'secrit init'", p.display()),
+                &format!("{} does not exist yet; run 'secrit init'", escape_path(&p)),
             );
         }
         Err(e) => return Err(e.into()),
@@ -48,12 +50,17 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
     Ok(())
 }
 
+/// The store file that sops-nix reads.
+fn sops_file(ctx: &Ctx) -> Result<&Path, Error> {
+    Ok(&ctx.store.require_sops()?.file)
+}
+
 fn warn(ctx: &Ctx, msg: &str) {
     ctx.status(&format!("secrit: warning: {msg}"));
 }
 
 fn next_steps(ctx: &Ctx, env: &dyn Fn(&str) -> Option<OsString>) -> Result<(), Error> {
-    let file = &ctx.store.file;
+    let file = sops_file(ctx)?;
     if let Some(repo) = file
         .parent()
         .and_then(|d| Repo::open(d, env).ok().flatten())
@@ -172,7 +179,7 @@ fn nix_stanza(name: &Name, file: &Path, flake: Option<&Path>, owner: &str) -> St
     let source = match (rel, flake) {
         (Some(r), Some(f)) if nix_path_ok(&r) => format!(
             "{r}; # relative to {}; adjust it to the .nix file that holds this stanza",
-            crate::display::escape(&f.to_string_lossy())
+            escape_path(f)
         ),
         _ if nix_path_ok(&abs) => {
             format!("{abs}; # absolute; pure flake evaluation needs a path inside the flake")

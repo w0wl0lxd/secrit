@@ -16,6 +16,9 @@ pub const ENV_CONFIG: &str = "SECRIT_CONFIG";
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 30;
 
+/// The environment as a lookup function, so tests can pass their own.
+pub type Env = dyn Fn(&str) -> Option<OsString>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("HOME is not set to an absolute path")]
@@ -45,6 +48,8 @@ pub enum ConfigError {
     NoDefaultStore,
     #[error("config key lock.timeout_secs must be at least 1")]
     ZeroTimeout,
+    #[error("store {0} does not use the sops backend")]
+    NotSops(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +65,13 @@ struct RawConfig {
     lock: RawLock,
 }
 
+/// One `[stores.NAME]` table. The `backend` key picks the backend (v0.2 plan
+/// 5.8), and `parse` turns the table into that backend's settings.
+///
+/// The table is one flat struct, not an enum tagged by `backend`: serde
+/// buffers a tagged enum, and toml then reports a bad key at the table
+/// header, not at its own line. A key that only another backend takes
+/// becomes an `Option` here, and `parse` refuses it for this backend.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStore {
@@ -100,19 +112,51 @@ impl Default for RawLock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     Sops,
 }
 
+/// One store of the config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub name: String,
-    pub backend: BackendKind,
+    pub wire_hint: bool,
+    pub backend: BackendConfig,
+}
+
+impl StoreConfig {
+    /// The sops settings, or `None` for a store of another backend.
+    #[must_use]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "None once a second backend exists (v0.2 plan 5.1)"
+    )]
+    pub fn sops(&self) -> Option<&SopsStore> {
+        match &self.backend {
+            BackendConfig::Sops(sops) => Some(sops),
+        }
+    }
+
+    /// [`Self::sops`], for the commands that only a sops store supports.
+    pub fn require_sops(&self) -> Result<&SopsStore, ConfigError> {
+        self.sops()
+            .ok_or_else(|| ConfigError::NotSops(self.name.clone()))
+    }
+}
+
+/// The backend of a store and its own settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendConfig {
+    Sops(SopsStore),
+}
+
+/// The settings of a sops store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SopsStore {
     pub file: PathBuf,
     pub sops_config: Option<PathBuf>,
     pub age_key_file: Option<PathBuf>,
-    pub wire_hint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +253,7 @@ impl Config {
     pub fn parse(text: &str, path: &Path, home: &Path) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Parse {
             path: path.to_path_buf(),
-            message: e.message().to_owned(),
+            message: parse_message(text, &e),
         })?;
         if raw.lock.timeout_secs == 0 {
             return Err(ConfigError::ZeroTimeout);
@@ -217,19 +261,23 @@ impl Config {
         let mut stores = BTreeMap::new();
         for (name, s) in raw.stores {
             let key = |k: &str| format!("stores.{name}.{k}");
+            let backend = match s.backend {
+                BackendKind::Sops => BackendConfig::Sops(SopsStore {
+                    file: expand(&s.file, home, &key("file"))?,
+                    sops_config: s
+                        .sops_config
+                        .map(|v| expand(&v, home, &key("sops_config")))
+                        .transpose()?,
+                    age_key_file: s
+                        .age_key_file
+                        .map(|v| expand(&v, home, &key("age_key_file")))
+                        .transpose()?,
+                }),
+            };
             let store = StoreConfig {
-                backend: s.backend,
-                file: expand(&s.file, home, &key("file"))?,
-                sops_config: s
-                    .sops_config
-                    .map(|v| expand(&v, home, &key("sops_config")))
-                    .transpose()?,
-                age_key_file: s
-                    .age_key_file
-                    .map(|v| expand(&v, home, &key("age_key_file")))
-                    .transpose()?,
-                wire_hint: s.wire_hint,
                 name: name.clone(),
+                wire_hint: s.wire_hint,
+                backend,
             };
             stores.insert(name, store);
         }
@@ -273,6 +321,27 @@ impl Config {
             .get(name)
             .ok_or_else(|| ConfigError::UnknownStore(name.to_owned()))
     }
+}
+
+/// The toml error with the line and column where it starts, so a bad key
+/// inside a store table points at its own line.
+fn parse_message(text: &str, e: &toml::de::Error) -> String {
+    let at = e
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let column = before
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count()
+                + 1;
+            format!("line {line}, column {column}: ")
+        })
+        .unwrap_or_default();
+    format!("{at}{}", e.message())
 }
 
 fn tool_setting(v: Option<&str>, home: &Path, key: &str) -> Result<ToolSetting, ConfigError> {
@@ -379,13 +448,17 @@ age_keygen = "/nix/store/x-age/bin/age-keygen"
 timeout_secs = 5
 "#;
 
+    fn sops_of(s: &StoreConfig) -> &SopsStore {
+        s.sops().unwrap()
+    }
+
     #[test]
     fn parses_the_plan_example() {
         let c = parse(FULL).unwrap();
         let s = c.store(None).unwrap();
-        assert_eq!(s.file, Path::new("/etc/nixos/secrets/secrit.yaml"));
+        assert_eq!(sops_of(s).file, Path::new("/etc/nixos/secrets/secrit.yaml"));
         assert_eq!(
-            s.age_key_file.as_deref(),
+            sops_of(s).age_key_file.as_deref(),
             Some(Path::new("/home/u/.config/sops/age/keys.txt"))
         );
         assert!(s.wire_hint);
@@ -398,6 +471,18 @@ timeout_secs = 5
         assert_eq!(c.nix.unwrap().host, "myhost");
     }
 
+    /// init and wire need a sops store, and say so for another backend.
+    #[test]
+    fn a_sops_store_gives_its_settings() {
+        let c = parse(FULL).unwrap();
+        let s = c.store(None).unwrap();
+        assert_eq!(s.require_sops().unwrap(), sops_of(s));
+        assert_eq!(
+            ConfigError::NotSops("main".into()).to_string(),
+            "store main does not use the sops backend"
+        );
+    }
+
     #[test]
     fn minimal_config_uses_defaults() {
         let c = parse("[stores.a]\nbackend = \"sops\"\nfile = \"~/s.yaml\"\n").unwrap();
@@ -407,7 +492,7 @@ timeout_secs = 5
         );
         assert!(matches!(c.store(None), Err(ConfigError::NoDefaultStore)));
         assert_eq!(
-            c.store(Some("a")).unwrap().file,
+            sops_of(c.store(Some("a")).unwrap()).file,
             Path::new("/home/u/s.yaml")
         );
         assert!(matches!(
@@ -430,6 +515,86 @@ timeout_secs = 5
     fn unknown_backend_is_an_error() {
         let t = "[stores.a]\nbackend = \"keepassxc\"\nfile = \"/s.yaml\"\n";
         assert!(matches!(parse(t), Err(ConfigError::Parse { .. })));
+        let e = parse("[stores.a]\nfile = \"/s.yaml\"\n").unwrap_err();
+        assert!(e.to_string().contains("backend"), "{e}");
+    }
+
+    /// The config shapes that v0.1 and its test suite write parse to the
+    /// same settings as in v0.1 (v0.2 plan, S1a).
+    #[test]
+    fn v01_configs_parse_unchanged() {
+        let store = "[stores.main]\nbackend = \"sops\"\nfile = \"/r/secrets/main.yaml\"\nage_key_file = \"/r/keys/key1.txt\"\n";
+        let tail = "\n[tools]\nsops = \"/nix/store/x-sops/bin/sops\"\n\n[lock]\ntimeout_secs = 2\n";
+        let want = |wire_hint, sops_config: Option<&str>| StoreConfig {
+            name: "main".into(),
+            wire_hint,
+            backend: BackendConfig::Sops(SopsStore {
+                file: "/r/secrets/main.yaml".into(),
+                sops_config: sops_config.map(PathBuf::from),
+                age_key_file: Some("/r/keys/key1.txt".into()),
+            }),
+        };
+        for (extra, expected) in [
+            ("", want(false, None)),
+            ("wire_hint = true\n", want(true, None)),
+            ("wire_hint = false\n", want(false, None)),
+            (
+                "sops_config = \"/r/.sops.yaml\"\n",
+                want(false, Some("/r/.sops.yaml")),
+            ),
+        ] {
+            let text = format!("default_store = \"main\"\n\n{store}{extra}{tail}");
+            let c = parse(&text).unwrap();
+            assert_eq!(c.store(None).unwrap(), &expected, "{text}");
+            assert_eq!(c.lock_timeout, Duration::from_secs(2));
+        }
+        // The form that init writes for a new config.
+        let init = format!("default_store = \"main\"\n\n{store}");
+        assert_eq!(
+            parse(&init).unwrap().store(None).unwrap(),
+            &want(false, None)
+        );
+    }
+
+    /// A bad key or value inside a store table names its own line and
+    /// column, and the unknown-key error lists every key that a store takes.
+    #[test]
+    fn store_errors_name_the_line_and_every_key() {
+        let head = "default_store = \"main\"\n\n[stores.main]\nbackend = \"sops\"\n";
+        let e = parse(&format!("{head}file = \"/s.yaml\"\nfiel = \"/x\"\n")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid config file /c.toml: line 6, column 1: unknown field `fiel`, expected one of `backend`, `file`, `sops_config`, `age_key_file`, `wire_hint`"
+        );
+        let e = parse(&format!("{head}file = 5\n")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid config file /c.toml: line 5, column 8: invalid type: integer `5`, expected a string"
+        );
+        let e = parse("[stores.main]\nbackend = \"keepassxc\"\nfile = \"/s.yaml\"\n").unwrap_err();
+        assert!(
+            e.to_string().contains("line 2, column 11: unknown variant"),
+            "{e}"
+        );
+    }
+
+    /// Each backend refuses the keys that it does not take (v0.2 plan 5.8).
+    #[test]
+    fn each_backend_refuses_unknown_keys() {
+        for (backend, keys) in [("sops", "file = \"/s.yaml\"\n")] {
+            let good = format!("[stores.a]\nbackend = \"{backend}\"\n{keys}");
+            assert!(parse(&good).is_ok(), "{good}");
+            for typo in [
+                "fiel = \"/x\"\n",
+                "wire-hint = true\n",
+                "format = \"yaml\"\n",
+            ] {
+                let bad = format!("{good}{typo}");
+                let e = parse(&bad).unwrap_err();
+                assert!(matches!(e, ConfigError::Parse { .. }), "{bad}");
+                assert!(e.to_string().contains("unknown field"), "{bad}: {e}");
+            }
+        }
     }
 
     #[test]

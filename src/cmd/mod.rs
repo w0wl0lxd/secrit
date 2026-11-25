@@ -11,16 +11,13 @@ pub mod wire;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::backend::Backend;
-use crate::backend::sops::{SopsBackend, TEMP_IGNORE};
-use crate::config::{
-    BackendKind, Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home,
-};
+use crate::backend::sops::TEMP_IGNORE;
+use crate::backend::{self, Backend};
+use crate::config::{Config, ConfigSource, ENV_CONFIG, NixConfig, StoreConfig, config_path, home};
 use crate::display::escape;
 use crate::error::Error;
 use crate::git::Repo;
 use crate::name::Name;
-use crate::tools::{self, ResolvedTool, ToolSource};
 
 /// What every store-backed command needs.
 pub struct Ctx {
@@ -42,22 +39,7 @@ impl Ctx {
         note_config_source(&path, source, quiet);
         let config = Config::load(&path, &home(&env)?)?;
         let store = config.store(store_flag)?.clone();
-        let backend: Box<dyn Backend> = match store.backend {
-            BackendKind::Sops => {
-                let sops = tools::resolve(
-                    tools::SOPS,
-                    &config.tools.sops,
-                    std::env::var_os("PATH").as_deref(),
-                )?;
-                warn_on_path_fallback(&sops, quiet);
-                Box::new(SopsBackend::new(
-                    &store,
-                    sops.path,
-                    config.lock_timeout,
-                    &env,
-                )?)
-            }
-        };
+        let backend = backend::open(&store, &config, &env, quiet)?;
         Ok(Self {
             quiet,
             store,
@@ -124,15 +106,6 @@ pub fn spell_hint(repo: &Repo, file: &Path) -> String {
         shell_path(&repo.root),
         shell_path(repo.relative(file))
     )
-}
-
-fn warn_on_path_fallback(tool: &ResolvedTool, quiet: bool) {
-    if tool.source == ToolSource::Path && !quiet {
-        eprintln!(
-            "secrit: warning: using {} from PATH; set tools.sops to an absolute path, or install secrit with Nix to pin it",
-            tool.path.display()
-        );
-    }
 }
 
 /// `s` as one shell word, for a command that secrit prints for the user to

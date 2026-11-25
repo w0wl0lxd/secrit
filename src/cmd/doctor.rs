@@ -7,16 +7,17 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
-
 use crate::agent;
-use crate::backend::BackendError;
 use crate::backend::sops::{MIN_SOPS, SopsBackend, TEMP_IGNORE};
-use crate::config::{Config, ConfigSource, ENV_CONFIG, StoreConfig, config_path, home};
+use crate::backend::{self, BackendError, DoctorCtx};
+use crate::config::{
+    BackendKind, Config, ConfigSource, ENV_CONFIG, Env, StoreConfig, config_path, home,
+};
 use crate::display::escape;
 use crate::error::Error;
 use crate::git::Repo;
 use crate::harden::HardenReport;
+use crate::report::{Report, Status};
 use crate::tools::{self, ResolvedTool, ToolSource};
 
 /// A temp copy younger than this may belong to a write that still runs.
@@ -24,46 +25,6 @@ const STALE_TEMP: Duration = Duration::from_secs(3600);
 /// The marker in the name of a backup that secrit before 0.1 kept next to
 /// the store file (SEC-2).
 const OLD_BACKUP_MARK: &str = ".secrit-bak.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Ok,
-    Info,
-    Warn,
-    Fail,
-}
-
-impl Status {
-    fn label(self) -> &'static str {
-        match self {
-            Status::Ok => "ok",
-            Status::Info => "info",
-            Status::Warn => "warn",
-            Status::Fail => "fail",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Row {
-    pub check: String,
-    pub status: Status,
-    pub detail: String,
-}
-
-#[derive(Debug, Default)]
-struct Report(Vec<Row>);
-
-impl Report {
-    fn add(&mut self, check: impl Into<String>, status: Status, detail: impl Into<String>) {
-        self.0.push(Row {
-            check: check.into(),
-            status,
-            detail: detail.into(),
-        });
-    }
-}
 
 pub fn run(
     config_flag: Option<&Path>,
@@ -78,11 +39,11 @@ pub fn run(
     super::interrupted()?;
     let mut out = std::io::stdout().lock();
     let written = if json {
-        serde_json::to_writer_pretty(&mut out, &report.0)
+        serde_json::to_writer_pretty(&mut out, report.rows())
             .map_err(std::io::Error::other)
             .and_then(|()| writeln!(out))
     } else {
-        report.0.iter().try_for_each(|c| {
+        report.rows().iter().try_for_each(|c| {
             writeln!(
                 out,
                 "{:<4}  {}: {}",
@@ -93,7 +54,12 @@ pub fn run(
         })
     };
     written.map_err(|e| Error::Failed(format!("could not write to stdout: {e}")))?;
-    match report.0.iter().filter(|c| c.status == Status::Fail).count() {
+    match report
+        .rows()
+        .iter()
+        .filter(|c| c.status == Status::Fail)
+        .count()
+    {
         0 => Ok(()),
         n => Err(Error::Failed(format!("{n} check(s) failed"))),
     }
@@ -104,7 +70,7 @@ fn collect(
     store_flag: Option<&str>,
     quiet: bool,
     hardened: HardenReport,
-    env: &dyn Fn(&str) -> Option<OsString>,
+    env: &Env,
 ) -> Report {
     let mut r = Report::default();
     process_checks(&mut r, hardened, env);
@@ -155,25 +121,45 @@ fn collect(
     if stores.is_empty() {
         r.add("stores", Status::Fail, "the config names no store");
     }
-    let mut version_checked = false;
+    // The tool rows above report a missing sops, so the store rows go on
+    // with a bare name that no check runs. The sops backend asks for sops
+    // only.
+    let sops_path = sops
+        .as_ref()
+        .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
+    let tool = |_: tools::Program, _: &crate::config::ToolSetting| Ok(sops_path.clone());
+    // The backend kinds whose tool version has a row already.
+    let mut versioned: Vec<BackendKind> = Vec::new();
     for store in stores {
-        let sops_path = sops
-            .as_ref()
-            .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
-        let backend = match SopsBackend::new(store, sops_path, config.lock_timeout, env) {
+        let backend = match backend::open_with(store, &config, env, &tool) {
             Ok(b) => b,
             Err(e) => {
                 r.add(format!("store {}", store.name), Status::Fail, e.to_string());
                 continue;
             }
         };
-        if sops.is_some() && !version_checked {
-            version_checked = true;
-            version_check(&mut r, &backend);
+        let kind = backend.kind();
+        let ctx = DoctorCtx {
+            store: &store.name,
+            tool_found: sops.is_some(),
+            tool_version: !versioned.contains(&kind),
+            env,
+        };
+        if ctx.tool_version {
+            versioned.push(kind);
         }
-        store_checks(&mut r, &store.name, &backend, sops.is_some(), env);
+        backend.doctor(&mut r, &ctx);
     }
     r
+}
+
+/// The rows of one sops store, and the sops version row when `ctx` asks
+/// for it.
+pub fn sops_rows(r: &mut Report, backend: &SopsBackend, ctx: &DoctorCtx<'_>) {
+    if ctx.tool_found && ctx.tool_version {
+        version_check(r, backend);
+    }
+    store_checks(r, ctx.store, backend, ctx.tool_found, ctx.env);
 }
 
 fn process_checks(r: &mut Report, hardened: HardenReport, env: &dyn Fn(&str) -> Option<OsString>) {
@@ -693,8 +679,8 @@ mod tests {
             let path_env = path_dir.as_os_str().to_owned();
             let env = move |k: &str| (k == "PATH").then(|| path_env.clone());
             assert!(tool_check(&mut r, program, setting, &env, true).is_some());
-            assert_eq!(r.0.len(), 1, "{:?}", r.0);
-            r.0.remove(0)
+            assert_eq!(r.rows().len(), 1, "{:?}", r.rows());
+            r.rows()[0].clone()
         };
         let auto = crate::config::ToolSetting::Auto;
 

@@ -82,8 +82,15 @@ impl<'a> ModeGuard<'a> {
         let critical = signals::Critical::enter();
         let orig = tcgetattr(tty)?;
         let mut t = orig.clone();
-        t.local_modes
-            .insert(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHOE | LocalModes::ECHOK);
+        // ISIG: Ctrl-C must raise SIGINT here (exit 130) even when the
+        // terminal started with signals off.
+        t.local_modes.insert(
+            LocalModes::ICANON
+                | LocalModes::ECHO
+                | LocalModes::ECHOE
+                | LocalModes::ECHOK
+                | LocalModes::ISIG,
+        );
         tcsetattr(tty, OptionalActions::Now, &t)?;
         Ok(Self {
             tty,
@@ -221,16 +228,31 @@ pub fn confirm_typed(question: &str, expected: &str) -> Result<bool, Error> {
     tcflush(&tty, QueueSelector::IFlush).map_err(|e| io(e.into()))?;
     say(&tty, question).map_err(io)?;
     let mut buf = [0u8; TYPED_NAME_MAX + 1];
-    let mut len = 0;
-    match read_line(&tty, &mut buf, &mut len) {
-        Ok(LineEnd::Newline | LineEnd::Eof) => Ok(typed_matches(&buf[..len], expected)),
-        Err(ReadError::BufferFull | ReadError::LineTooLong) => {
-            // The rest of the long line must not reach the next reader.
+    match read_record(&tty, &mut buf) {
+        // One terminal record that ends in the newline.
+        Ok(n) if n > 0 && buf[n - 1] == b'\n' => Ok(typed_matches(&buf[..n - 1], expected)),
+        // End of input, a record that Ctrl-D ended, or a longer one: not the
+        // name. The rest must not reach the next reader.
+        Ok(_) | Err(ReadError::BufferFull | ReadError::LineTooLong) => {
             let _ = tcflush(&tty, QueueSelector::IFlush);
             Ok(false)
         }
         Err(ReadError::Interrupted) => Err(Error::Interrupted),
         Err(ReadError::Io(e)) => Err(io(e)),
+    }
+}
+
+/// One `read` of a canonical terminal: at most one record, so a second
+/// record is never joined to the first. Returns the bytes read; `0` is end
+/// of input.
+fn read_record(tty: &File, buf: &mut [u8]) -> Result<usize, ReadError> {
+    loop {
+        wait_readable(tty)?;
+        match (&*tty).read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(ReadError::Io(e)),
+        }
     }
 }
 

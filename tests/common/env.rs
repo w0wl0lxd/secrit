@@ -357,13 +357,34 @@ impl Dirs {
             // script may have ended already.
             let _ = input.write_all(answer);
         }
+        if !found {
+            // A command that never asked would keep the session open.
+            let _ = child.kill();
+        }
         drop(input);
-        let status = child.wait().unwrap();
+        // The exit wait is bounded too: a stall after the prompt must fail
+        // the test, not block the suite.
+        let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (status, exited) = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break (st, true);
+            }
+            if std::time::Instant::now() > exit_deadline {
+                let _ = child.kill();
+                break (child.wait().unwrap(), false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         reader.join().unwrap();
         let stdout = std::mem::take(&mut *seen.lock().unwrap());
         assert!(
             found,
             "the prompt never appeared: {}",
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            exited,
+            "the command did not exit after the answer: {}",
             String::from_utf8_lossy(&stdout)
         );
         Output {

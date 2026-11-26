@@ -290,6 +290,7 @@ fn rm_yes_still_asks_under_an_agent() {
 
 /// T27a: an agent that unsets its variable for secrit is still found in
 /// the ancestors, and the question names that process.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_ancestor_walk_finds_an_unset_variable() {
     let env = TestEnv::new();
@@ -314,6 +315,7 @@ fn the_ancestor_walk_finds_an_unset_variable() {
 /// manager, so this test reparents the same way by hand: a helper loses
 /// its parent, waits until the parent is gone, and then runs secrit. secrit
 /// keeps the `script` terminal.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_reparented_command_without_the_variable_bypasses_the_gate() {
     let env = TestEnv::new();

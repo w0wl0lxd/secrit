@@ -367,7 +367,9 @@ keeps the files of the steps it finished; run it again to finish the setup.
   secret name (the store name for `init`) and go on only when it is typed exactly. A `y`
   does not confirm, and `rm --yes` still asks. secrit discards input that was typed before
   the question. With no terminal they are refused with exit 3: CI or a remote job uses
-  `secrit seal`, a scheduled job runs as its own system service, and ssh uses `ssh -t`.
+  `secrit seal`, a scheduled job runs as its own system service that reads an existing
+  secret (a service has no terminal either, so it cannot write the store: unattended
+  writes are not supported), and ssh uses `ssh -t`.
   No variable, config key or flag turns the gate off. It stops accidents, not an agent
   that works around it (see [What secrit does not protect
   against](#what-secrit-does-not-protect-against)). `ls`, `doctor` and `wire` work.

@@ -629,6 +629,7 @@ An agent is detected when any of these is true:
   `AI_AGENT`, `AGENT`, `CODEX_SANDBOX` (macOS only), `CODEX_THREAD_ID`, `CURSOR_AGENT`,
   `GEMINI_CLI`, `CLINE_ACTIVE`, `OPENCODE`, `OPENCODE_CLIENT`, `COPILOT_CLI`;
 - one of these variables is set and not empty in the environment of an ancestor process
+  (Linux only; macOS has no `/proc`, so this check does not apply there)
   (`/proc/<pid>/stat` for the parent, `/proc/<pid>/environ` for the variables; at most 64
   levels; v0.2, PLAN-v0.2 4.1);
 - `/dev/tty` cannot be opened.

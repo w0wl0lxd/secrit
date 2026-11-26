@@ -142,6 +142,9 @@ fn steps(
         escape(&keygen.path.to_string_lossy())
     ));
 
+    // The gate lists the store file only when it is absent now.
+    let store_planned = !sops_store.file.exists();
+
     // 2. Age key, and the write gate before the first write.
     let recipients = key_and_gate(
         &backend,
@@ -163,6 +166,14 @@ fn steps(
             facts.names
         ));
     } else {
+        if !store_planned && !args.dry_run {
+            // The write gate did not list this file: it was removed after the
+            // plan. A new gate decision must cover it.
+            return Err(Error::Failed(format!(
+                "the store file {} was removed while init ran; run 'secrit init' again",
+                escape_path(&sops_store.file)
+            )));
+        }
         let backend = sops_config(
             backend,
             sops_store,
@@ -211,7 +222,7 @@ fn key_and_gate(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     );
     let known = if key_exists {
-        Some(age_key(keygen, &key, out)?)
+        Some(existing_key(keygen, &key, Some(out))?)
     } else {
         None
     };
@@ -226,7 +237,18 @@ fn key_and_gate(
         gate(store_name, &plan, known.as_deref())?;
     }
     let recipients = match known {
-        Some(r) => r,
+        // The gate waited on the operator: the key must still be the one
+        // that the question showed.
+        Some(shown) => {
+            let now = existing_key(keygen, &key, None)?;
+            if now != shown {
+                return Err(Error::Failed(format!(
+                    "the age key {} changed while init waited for the confirmation; run 'secrit init' again",
+                    escape_path(&key)
+                )));
+            }
+            now
+        }
         None => age_key(keygen, &key, out)?,
     };
     interrupted()?;
@@ -546,28 +568,57 @@ fn run_keygen(cmd: Command, cap: usize, what: &str) -> Result<child::ChildOutput
     }
 }
 
+/// The checks on an existing age key file: a regular file of mine, mode 0600,
+/// not empty.
+fn check_key_file(key: &Path, shown: &str, m: &std::fs::Metadata) -> Result<(), Error> {
+    if !m.is_file() {
+        return Err(Error::Refused(format!(
+            "the age key {shown} is a symlink or not a regular file"
+        )));
+    }
+    if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o077 != 0 {
+        return Err(Error::Refused(format!(
+            "the age key {shown} must be yours with mode 0600; run 'chmod 600 {}'",
+            shell_path(key)
+        )));
+    }
+    if m.len() == 0 {
+        return Err(Error::Refused(format!(
+            "the age key {shown} is empty, so it holds no key; remove it ('rm {}') and run 'secrit init' again",
+            shell_path(key)
+        )));
+    }
+    Ok(())
+}
+
+/// The recipients of an age key that must already exist. It never creates
+/// the key, so it is safe before the write gate: a key that vanished is an
+/// error, not a new key made with no confirmation.
+fn existing_key(keygen: &Path, key: &Path, out: Option<&Out>) -> Result<Vec<String>, Error> {
+    let shown = escape(&key.to_string_lossy()).into_owned();
+    match std::fs::symlink_metadata(key) {
+        Ok(m) => {
+            check_key_file(key, &shown, &m)?;
+            if let Some(out) = out {
+                out.note(&format!("age key {shown} exists; unchanged"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::Failed(format!(
+                "the age key {shown} was removed while init ran; run 'secrit init' again"
+            )));
+        }
+        Err(e) => return Err(Error::Failed(format!("{shown}: {e}"))),
+    }
+    recipients_of(keygen, key, &shown, out)
+}
+
 /// Use the key at `key`, or create it. Returns its public recipients.
 fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
     let shown = escape(&key.to_string_lossy()).into_owned();
     match std::fs::symlink_metadata(key) {
         Ok(m) => {
-            if !m.is_file() {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} is a symlink or not a regular file"
-                )));
-            }
-            if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o077 != 0 {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} must be yours with mode 0600; run 'chmod 600 {}'",
-                    shell_path(key)
-                )));
-            }
-            if m.len() == 0 {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} is empty, so it holds no key; remove it ('rm {}') and run 'secrit init' again",
-                    shell_path(key)
-                )));
-            }
+            check_key_file(key, &shown, &m)?;
             out.note(&format!("age key {shown} exists; unchanged"));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -587,6 +638,15 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
         }
         Err(e) => return Err(Error::Failed(format!("{shown}: {e}"))),
     }
+    recipients_of(keygen, key, &shown, Some(out))
+}
+
+fn recipients_of(
+    keygen: &Path,
+    key: &Path,
+    shown: &str,
+    out: Option<&Out>,
+) -> Result<Vec<String>, Error> {
     let mut cmd = keygen_command(keygen);
     cmd.arg("-y").arg(key);
     let found = run_keygen(cmd, MAX_RECIPIENTS_BYTES, "-y")?;
@@ -601,7 +661,9 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
             "age-keygen -y found no age recipient in {shown}"
         )));
     }
-    out.note(&format!("age recipient: {}", recipients.join(", ")));
+    if let Some(out) = out {
+        out.note(&format!("age recipient: {}", recipients.join(", ")));
+    }
     Ok(recipients)
 }
 

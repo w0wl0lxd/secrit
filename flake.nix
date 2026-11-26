@@ -85,10 +85,19 @@
             SECRIT_TEST_GPG = gpgBin;
             SECRIT_TEST_PASS = "${pkgs.pass}/bin/pass";
             SECRIT_TEST_GOPASS = "${pkgs.gopass}/bin/gopass";
+            # The Secret Service fixture (v0.2 plan S10): a private session
+            # bus and gnome-keyring per test, read back with secret-tool.
+            SECRIT_TEST_DBUS_DAEMON = "${pkgs.dbus}/bin/dbus-daemon";
+            SECRIT_TEST_DBUS_SEND = "${pkgs.dbus}/bin/dbus-send";
+            SECRIT_TEST_DBUS_CONFIG = "${pkgs.dbus}/share/dbus-1/session.conf";
+            SECRIT_TEST_GNOME_KEYRING = "${pkgs.gnome-keyring}/bin/gnome-keyring-daemon";
+            SECRIT_TEST_SECRET_TOOL = "${pkgs.libsecret}/bin/secret-tool";
           };
           # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and
-          # git; the test age plugin; gpg and gpgconf for the pass backend, and
-          # pass and gopass for its interop tests (v0.2 plan S11).
+          # git; the test age plugin; gpg and gpgconf for the pass backend, pass
+          # and gopass for its interop tests (v0.2 plan S11), and dbus-daemon,
+          # gnome-keyring-daemon and secret-tool for the Secret Service fixture
+          # (S10).
           testTools = [
             pkgs.util-linux
             pkgs.openssh
@@ -96,6 +105,9 @@
             pkgs.diffutils
             pkgs.git
             agePluginUnencrypted
+            pkgs.dbus
+            pkgs.gnome-keyring
+            pkgs.libsecret
             pkgs.gnupg
             pkgs.pass
             pkgs.gopass
@@ -207,6 +219,12 @@
                         stores.main = {
                           backend = "sops";
                           file = "~/store/secrit.yaml";
+                        };
+                        # One store of each backend kind (v0.2 plan 5.8).
+                        stores.desk = {
+                          backend = "secret-service";
+                          collection = "default";
+                          unlock = "refuse";
                         };
                         stores.pw = {
                           backend = "pass";

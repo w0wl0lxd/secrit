@@ -12,9 +12,10 @@
 use std::time::Duration;
 
 /// Run the actions that `SECRIT_TEST_HOOK` names for `step`. Actions:
-/// `abort`, `sigint`, `sigterm`, `sigquit`, `sleep-<ms>`, and `pause`. A
-/// pause appends the step to `$SECRIT_TEST_HOOK_DIR/log`, then waits (at
-/// most 60 s, or until a signal) for the file `$SECRIT_TEST_HOOK_DIR/go`.
+/// `abort`, `sigint`, `sigterm`, `sigquit`, `sleep-<ms>`, `log`, and
+/// `pause`. `log` appends the step to `$SECRIT_TEST_HOOK_DIR/log`. A pause
+/// logs the step the same way, then waits (at most 60 s, or until a signal)
+/// for the file `$SECRIT_TEST_HOOK_DIR/go`.
 #[cfg(feature = "test-hooks")]
 pub fn hook(step: &str) {
     use rustix::process::{Signal, getpid, kill_process};
@@ -33,6 +34,7 @@ pub fn hook(step: &str) {
             "sigterm" => drop(kill_process(getpid(), Signal::TERM)),
             "sigquit" => drop(kill_process(getpid(), Signal::QUIT)),
             "pause" => pause(step),
+            "log" => log_step(step),
             a => {
                 if let Some(ms) = a.strip_prefix("sleep-").and_then(|m| m.parse().ok()) {
                     std::thread::sleep(Duration::from_millis(ms));
@@ -43,7 +45,7 @@ pub fn hook(step: &str) {
 }
 
 #[cfg(feature = "test-hooks")]
-fn pause(step: &str) {
+fn log_step(step: &str) {
     use std::io::Write;
     use std::path::PathBuf;
     let Some(dir) = std::env::var_os("SECRIT_TEST_HOOK_DIR").map(PathBuf::from) else {
@@ -56,6 +58,15 @@ fn pause(step: &str) {
     {
         let _ = writeln!(log, "{step}");
     }
+}
+
+#[cfg(feature = "test-hooks")]
+fn pause(step: &str) {
+    use std::path::PathBuf;
+    let Some(dir) = std::env::var_os("SECRIT_TEST_HOOK_DIR").map(PathBuf::from) else {
+        return;
+    };
+    log_step(step);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !dir.join("go").exists()
         && !crate::signals::pending()

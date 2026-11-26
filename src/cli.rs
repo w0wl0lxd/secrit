@@ -48,9 +48,12 @@ pub enum Command {
     Store {
         /// The secret name: A-Z, a-z, 0-9, '.', '_' and '-', at most 128 bytes
         name: String,
-        /// Overwrite an existing secret (a ciphertext backup is kept)
+        /// Overwrite an existing secret (a sops store keeps a ciphertext backup; a Secret Service store keeps none and asks first)
         #[arg(long)]
         replace: bool,
+        /// With --replace on a store that keeps no backup: do not ask for confirmation
+        #[arg(long, requires = "replace")]
+        yes: bool,
         /// Allow newlines; a terminal reads until a line that holds only '.'
         #[arg(long)]
         multiline: bool,
@@ -75,7 +78,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a secret (a ciphertext backup is kept)
+    /// Remove a secret (a sops store keeps a ciphertext backup; a Secret Service store keeps none)
     Rm {
         /// The secret name
         name: String,
@@ -161,12 +164,15 @@ pub enum WireFormat {
     Env,
 }
 
+#[allow(clippy::doc_markdown, reason = "doc comments are clap help text")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InitBackend {
     /// A sops file with an age key
     Sops,
     /// A password-store directory, written with gpg
     Pass,
+    /// A Secret Service collection on the session bus (gnome-keyring, KWallet, KeePassXC)
+    SecretService,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

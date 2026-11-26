@@ -136,6 +136,8 @@ fn collect(
             tool_found: match kind {
                 BackendKind::Sops => sops.is_some(),
                 BackendKind::Pass => gpg.is_some(),
+                // No tool: the daemon is the backend.
+                BackendKind::SecretService => true,
             },
             tool_version: !versioned.contains(&kind),
             env,

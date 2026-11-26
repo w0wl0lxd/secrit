@@ -10,12 +10,30 @@ use super::{Ctx, shell_path, shell_word};
 use crate::backend::sops::SopsFormat;
 use crate::backend::{BackendError, WireSource};
 use crate::cli::WireFormat;
-use crate::display::escape_path;
+use crate::display::{escape, escape_path};
 use crate::error::Error;
 use crate::git::{Repo, find_root};
 use crate::name::Name;
 
 pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> Result<(), Error> {
+    // Both formats point at a sops-nix file in /run/secrets. Another
+    // backend has no such file, so wire prints nothing for it (v0.2 plan
+    // 5.7: a format that needs a sops file exits 3 on an opaque store).
+    if ctx.store.sops().is_none() {
+        // The hint names the store (and the config) that this run picked,
+        // so it does not read another store's value of the same name.
+        let config = ctx
+            .config_flag
+            .as_deref()
+            .map_or_else(String::new, |p| format!(" --config {}", shell_path(p)));
+        return Err(Error::Refused(format!(
+            "store {} uses the {} backend, and wire needs a sops store: sops-nix cannot read {}. A program reads the value with 'secrit{config} --store {} get --stdout {name}'",
+            escape(&ctx.store.name),
+            ctx.store.backend.kind().name(),
+            ctx.backend.location(),
+            shell_word(&ctx.store.name)
+        )));
+    }
     let env = |k: &str| std::env::var_os(k);
     // Both forms point at /run/secrets/NAME, which only sops-nix fills.
     let (file, sops_format, key) = sops_file(ctx, name)?;

@@ -3,6 +3,7 @@
 
 pub mod atomic;
 pub mod pass;
+pub mod secret_service;
 pub mod sops;
 
 use std::fmt;
@@ -18,6 +19,7 @@ use crate::secret::SecretValue;
 use crate::tools::{self, Program, ResolvedTool, ToolSource};
 
 use self::pass::PassBackend;
+use self::secret_service::SecretServiceBackend;
 use self::sops::{SopsBackend, SopsFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +41,9 @@ pub struct WriteReport {
 pub struct Capabilities {
     /// Names with more than one segment (`a/b`) address nested keys.
     pub nested_names: bool,
+    /// `store --replace` and `rm` keep a ciphertext backup of the old
+    /// value. Without one, both say so and ask first (T55, Q37).
+    pub backups: bool,
 }
 
 impl Capabilities {
@@ -168,6 +173,12 @@ pub fn open_with(
                     .with_store_name(&store.name),
             ))
         }
+        BackendConfig::SecretService(ss) => Ok(Box::new(SecretServiceBackend::new(
+            &store.name,
+            ss,
+            config.lock_timeout,
+            env,
+        ))),
         BackendConfig::Pass(pass) => {
             let path = tool(tools::GPG, &config.tools.gpg)?;
             Ok(Box::new(PassBackend::new(
@@ -199,14 +210,53 @@ pub const MAX_RETRIES: usize = 3;
 pub enum Location {
     /// One file that holds every name.
     File(PathBuf),
+    /// The items of one secrit store in a Secret Service collection. Boxed,
+    /// so that every error stays small.
+    Collection(Box<CollectionRef>),
     /// A directory with one file per name.
     Dir(PathBuf),
 }
 
-/// Control characters are escaped, so a path cannot drive the terminal.
+/// The items of one secrit store in a Secret Service collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRef {
+    /// The alias or object path from the config.
+    pub collection: String,
+    /// The store name, which each item carries as `secrit-store`.
+    pub store: String,
+}
+
+impl Location {
+    #[must_use]
+    pub fn collection(collection: &str, store: &str) -> Self {
+        Location::Collection(Box::new(CollectionRef {
+            collection: collection.to_owned(),
+            store: store.to_owned(),
+        }))
+    }
+
+    /// What `store --replace` keeps of the old value, for the "already
+    /// exists" error.
+    #[must_use]
+    pub fn replace_note(&self) -> &'static str {
+        match self {
+            Location::File(_) | Location::Dir(_) => "a ciphertext backup is kept",
+            Location::Collection(_) => "no backup is kept; secrit asks first",
+        }
+    }
+}
+
+/// Control characters are escaped, so a path or a name cannot drive the
+/// terminal.
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Location::Collection(c) => write!(
+                f,
+                "Secret Service collection '{}' (secrit-store={})",
+                escape(&c.collection),
+                escape(&c.store)
+            ),
             Location::File(p) | Location::Dir(p) => f.write_str(&escape_path(p)),
         }
     }
@@ -250,7 +300,8 @@ impl fmt::Display for ToolStatus {
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     #[error(
-        "'{name}' already exists in {location}; use --replace to overwrite it (a ciphertext backup is kept)"
+        "'{name}' already exists in {location}; use --replace to overwrite it ({})",
+        location.replace_note()
     )]
     Exists { name: Name, location: Location },
     #[error("'{name}' does not exist in {location}")]
@@ -365,6 +416,33 @@ pub enum BackendError {
         step: &'static str,
         target: Target,
     },
+    /// A daemon call failed. `what` comes from the daemon or the bus, never
+    /// from a value.
+    #[error("{daemon} {step} failed: {what}")]
+    Daemon {
+        daemon: &'static str,
+        step: &'static str,
+        what: String,
+    },
+    /// The collection is locked, and the config does not let secrit ask the
+    /// daemon to unlock it (Q30).
+    #[error(
+        "{0} is locked; unlock it (log in to the desktop session, or use the keyring manager), or set unlock = \"prompt\" in the config"
+    )]
+    Locked(Location),
+    /// The session bus address or socket failed the checks of v0.2 plan
+    /// 6.3 (T31).
+    #[error("refusing the D-Bus session bus: {reason}")]
+    UnsafeBus { reason: String },
+    /// A signal arrived while a daemon call was blocked. The daemon may
+    /// still finish the call.
+    #[error(
+        "interrupted by a signal during {daemon} {step}; the daemon may still finish that call"
+    )]
+    DaemonInterrupted {
+        daemon: &'static str,
+        step: &'static str,
+    },
     /// `need` is the oldest version secrit accepts and why.
     #[error("{} is {tool} {found}; secrit needs {tool} {need}", escape_path(path))]
     ToolTooOld {
@@ -416,11 +494,13 @@ impl BackendError {
             | BackendError::ValueRefused { .. }
             | BackendError::Name(_)
             | BackendError::CleartextRule { .. }
+            | BackendError::Locked(_)
+            | BackendError::UnsafeBus { .. }
             | BackendError::Lock(LockError::UnsafeDir { .. }) => Exit::Refused,
             BackendError::Lock(LockError::Timeout { .. }) | BackendError::Changed(_) => Exit::Busy,
-            BackendError::Interrupted | BackendError::Lock(LockError::Interrupted) => {
-                Exit::Interrupted
-            }
+            BackendError::Interrupted
+            | BackendError::DaemonInterrupted { .. }
+            | BackendError::Lock(LockError::Interrupted) => Exit::Interrupted,
             _ => Exit::Failed,
         }
     }
@@ -653,8 +733,12 @@ mod tests {
     fn a_nested_name_needs_the_capability() {
         let flat = Capabilities {
             nested_names: false,
+            backups: true,
         };
-        let nested = Capabilities { nested_names: true };
+        let nested = Capabilities {
+            nested_names: true,
+            backups: true,
+        };
         let ab = Name::parse("a/b").unwrap();
         let e = flat.check_name(&ab, &file()).unwrap_err();
         assert_eq!(e.exit(), Exit::Refused);
@@ -674,6 +758,64 @@ mod tests {
             e.to_string(),
             "refusing 'a/b' in /s/main.yaml: 'a' holds a string, not a map"
         );
+    }
+
+    /// The Secret Service errors (v0.2 plan 6.3): text and exit code. The
+    /// collection and store names are escaped.
+    #[test]
+    fn daemon_errors_render_and_map_to_exits() {
+        let c = Location::collection("default", "desk");
+        assert_eq!(
+            c.to_string(),
+            "Secret Service collection 'default' (secrit-store=desk)"
+        );
+        assert_eq!(
+            Location::collection("a\u{1b}b", "s\u{7}").to_string(),
+            "Secret Service collection 'a\\x1bb' (secrit-store=s\\x07)"
+        );
+        let cases = [
+            (
+                BackendError::Exists {
+                    name: tok(),
+                    location: c.clone(),
+                },
+                "'tok' already exists in Secret Service collection 'default' (secrit-store=desk); use --replace to overwrite it (no backup is kept; secrit asks first)",
+                Exit::Refused,
+            ),
+            (
+                BackendError::Daemon {
+                    daemon: "Secret Service",
+                    step: "write",
+                    what: "no answer".into(),
+                },
+                "Secret Service write failed: no answer",
+                Exit::Failed,
+            ),
+            (
+                BackendError::Locked(c.clone()),
+                "Secret Service collection 'default' (secrit-store=desk) is locked; unlock it (log in to the desktop session, or use the keyring manager), or set unlock = \"prompt\" in the config",
+                Exit::Refused,
+            ),
+            (
+                BackendError::UnsafeBus {
+                    reason: "it is not a socket".into(),
+                },
+                "refusing the D-Bus session bus: it is not a socket",
+                Exit::Refused,
+            ),
+            (
+                BackendError::DaemonInterrupted {
+                    daemon: "Secret Service",
+                    step: "write",
+                },
+                "interrupted by a signal during Secret Service write; the daemon may still finish that call",
+                Exit::Interrupted,
+            ),
+        ];
+        for (e, text, exit) in cases {
+            assert_eq!(e.to_string(), text);
+            assert_eq!(e.exit(), exit, "{text}");
+        }
     }
 
     /// A store path with a control character is escaped in every error,

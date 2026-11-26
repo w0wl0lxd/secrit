@@ -63,6 +63,23 @@ pub fn lock_path(runtime_dir: &Path, dir_dev: Dev, dir_ino: u64, basename: &OsSt
         .join(format!("{dir_dev:x}-{dir_ino:x}-{short}.lock"))
 }
 
+/// The lock file path of a store that is not a file (v0.2 plan 5.3): a
+/// hash of the backend kind and the raw bytes of each part of the
+/// location. Each part goes in with its length first, so two different
+/// lists of parts never give the same input.
+#[must_use]
+pub fn keyed_lock_path(runtime_dir: &Path, kind: &str, parts: &[&[u8]]) -> PathBuf {
+    let mut h = Sha256::new();
+    for part in std::iter::once(kind.as_bytes()).chain(parts.iter().copied()) {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    let short = hex(&h.finalize()[..8]);
+    runtime_dir
+        .join("secrit")
+        .join(format!("{kind}-{short}.lock"))
+}
+
 /// Take an exclusive lock on `path`, waiting at most `timeout`.
 pub fn acquire(path: &Path, timeout: Duration) -> Result<StoreLock, LockError> {
     let dir = path.parent().ok_or(LockError::NoRuntimeDir)?;
@@ -147,6 +164,22 @@ mod tests {
         assert_ne!(a, lock_path(r, 1, 2, OsStr::new("b.yaml")));
         assert_ne!(a, lock_path(r, 1, 3, OsStr::new("a.yaml")));
         assert!(a.starts_with("/run/user/1000/secrit"));
+    }
+
+    #[test]
+    fn keyed_lock_path_depends_on_kind_and_location() {
+        let r = Path::new("/run/user/1000");
+        let a = keyed_lock_path(r, "secret-service", &[b"c", b"s"]);
+        assert_eq!(a, keyed_lock_path(r, "secret-service", &[b"c", b"s"]));
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"c", b"t"]));
+        assert_ne!(a, keyed_lock_path(r, "keychain", &[b"c", b"s"]));
+        // The parts are framed: moving a byte across a boundary changes it.
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"cs", b""]));
+        assert_ne!(a, keyed_lock_path(r, "secret-service", &[b"c", b"", b"s"]));
+        assert!(a.starts_with("/run/user/1000/secrit"));
+        let file = a.file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(file.starts_with("secret-service-"), "{file}");
+        assert_eq!(a.extension().unwrap(), "lock");
     }
 
     #[test]

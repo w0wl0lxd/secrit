@@ -417,6 +417,7 @@ impl Backend for PassBackend {
         // that another tool wrote, but `store` and `get` refuse the name.
         Capabilities {
             nested_names: false,
+            backups: true,
         }
     }
 

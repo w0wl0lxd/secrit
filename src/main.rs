@@ -76,7 +76,19 @@ fn backend_kind(b: cli::InitBackend) -> config::BackendKind {
     match b {
         cli::InitBackend::Sops => config::BackendKind::Sops,
         cli::InitBackend::Pass => config::BackendKind::Pass,
+        cli::InitBackend::SecretService => config::BackendKind::SecretService,
     }
+}
+
+/// `secrit store`: the argv check and the name rules come before the
+/// config (PLAN 4.1, step 1).
+fn store_command(
+    args: &StoreArgs,
+    ctx_for: impl FnOnce(&Name) -> Result<Ctx, Error>,
+) -> Result<(), Error> {
+    cmd::store::check_argv(args)?;
+    let name = parse_name(&args.name)?;
+    cmd::store::run(&ctx_for(&name)?, &name, args)
 }
 
 /// `secrit run`: the command line and the agent rules come before the
@@ -113,22 +125,21 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
         Command::Store {
             name,
             replace,
+            yes,
             multiline,
             raw,
             extra,
-        } => {
-            let args = StoreArgs {
+        } => store_command(
+            &StoreArgs {
                 name,
                 replace,
+                yes,
                 multiline,
                 raw,
                 extra,
-            };
-            cmd::store::check_argv(&args)?;
-            // The name rules come before the config (PLAN 4.1, step 1).
-            let name = parse_name(&args.name)?;
-            cmd::store::run(&ctx_for(&name)?, &name, &args)
-        }
+            },
+            ctx_for,
+        ),
         Command::Get { name, stdout } => {
             let name = parse_name(&name)?;
             cmd::get::run(&ctx_for(&name)?, &name, stdout)

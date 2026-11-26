@@ -50,6 +50,9 @@ pub struct Dirs {
     pub config_file: PathBuf,
     /// `PATH` for the secrit child: the directories of the given tools.
     path: OsString,
+    /// More variables for the secrit child, such as the session bus
+    /// address of a daemon fixture.
+    envs: Vec<(OsString, OsString)>,
 }
 
 impl Dirs {
@@ -76,7 +79,13 @@ impl Dirs {
             config_home,
             runtime,
             path,
+            envs: Vec::new(),
         }
+    }
+
+    /// Give the secrit child `key=value` too.
+    pub fn set_env(&mut self, key: &str, value: impl Into<OsString>) {
+        self.envs.push((key.into(), value.into()));
     }
 
     /// Write a mode 0600 config with one store, `main`. `store_section` is
@@ -107,6 +116,7 @@ impl Dirs {
             // The ancestor walk stops at this test process, so an agent
             // variable in the environment of the test runner does not count.
             .env("SECRIT_TEST_ANCESTOR_STOP", std::process::id().to_string())
+            .envs(self.envs.iter().map(|(k, v)| (k, v)))
             .current_dir(self.root.path())
             .stdin(Stdio::null());
         c

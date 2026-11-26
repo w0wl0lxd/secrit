@@ -288,6 +288,7 @@ impl Backend for SopsBackend {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             nested_names: self.format.nested_names(),
+            backups: true,
         }
     }
 

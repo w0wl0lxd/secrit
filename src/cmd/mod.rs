@@ -10,7 +10,7 @@ pub mod store;
 pub mod wire;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent;
 use crate::backend::sops::TempIgnore;
@@ -29,6 +29,8 @@ pub struct Ctx {
     pub store: StoreConfig,
     pub nix: Option<NixConfig>,
     pub backend: Box<dyn Backend>,
+    /// The `--config` flag of this run, so a command hint repeats it.
+    pub config_flag: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -49,6 +51,7 @@ impl Ctx {
             store,
             nix: config.nix,
             backend,
+            config_flag: config_flag.map(Path::to_path_buf),
         })
     }
 
@@ -212,10 +215,16 @@ pub fn parse_name(s: &str) -> Result<Name, Error> {
 }
 
 /// The arguments to `store`, after clap.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent flag of the command line"
+)]
 #[derive(Debug)]
 pub struct StoreArgs {
     pub name: String,
     pub replace: bool,
+    /// Skip the no-backup confirmation of `--replace` (T55).
+    pub yes: bool,
     pub multiline: bool,
     pub raw: bool,
     pub extra: Vec<OsString>,

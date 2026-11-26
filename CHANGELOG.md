@@ -103,6 +103,42 @@ All notable changes to this project are recorded here. The format follows
   `build: test hooks are compiled in`, when the test hooks are compiled in. The flake check
   `release-features` fails when the package's `--version` names `test-hooks`.
 - README "What secrit does not protect against" lists the ways around the write gate.
+- Internal: the output masker for the coming `secrit run` (v0.2). No command uses it yet.
+  It replaces a value and its base64 (both alphabets, three byte offsets, with and without
+  padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
+  possible start of a match, so a prompt with no newline goes out at once. A value shorter
+  than 4 bytes is not masked, with a warning.
+  - It also masks uppercase hex; percent-encoding with lowercase hex digits, with `+` for a
+    space (Python `quote_plus`, Go `QueryEscape`), as JavaScript `encodeURIComponent`
+    writes it, and as Python `quote` writes it; and the JSON escapes of Go `json.Marshal`
+    and Python `json.dumps`, with an escaped `/` and with uppercase hex digits.
+  - It also masks a value without its final `\n` or `\r\n`, as `--raw` can store it.
+  - Overlapping values are masked as one region, labelled `[secrit:A+B]`. Before, the
+    second value of an overlap stayed partly visible.
+  - `flush_held` releases held bytes after an idle period, so a prompt that starts like a
+    value is shown. It never shows a full match.
+  - Comparisons of secret bytes run in constant time. A small write after a large one no
+    longer wipes the whole output buffer.
+
+- pass layout backend (`backend = "pass"`, v0.2 plan 6.4): one gpg file per name in a
+  password-store directory, read and written with `gpg`; secrit never runs `pass` or
+  `gopass`. Store keys `dir`, `prefix`, `gnupg_home`, `value` (`whole` or `first-line`)
+  and `pinentry` (`error` or `agent`), and `tools.gpg` (config or baked-in path only, no
+  `PATH`). Recipients come from the nearest `.gpg-id`; `encrypt-to` in `gpg.conf` adds
+  none. secrit lists the packets of each new file and checks its recipients before the
+  rename. A `.gpg-id.sig` refuses writes. `get` uses `--pinentry-mode error`, so a needed
+  passphrase fails at once. Values reach gpg on stdin only, and gpg gets only
+  `GNUPGHOME`. Exact-byte interop with pass 1.7.4 and gopass (`gpgcli`, `fs`) is tested
+  both ways.
+- `store` and `rm` on a pass store in a git repository print the `git add` and
+  `git commit` commands; secrit never commits.
+- `init --backend pass --pass-dir DIR` checks a pass store and its recipient keys, then
+  writes the config or prints the store section. It never creates the store.
+- `doctor` rows for pass stores: the gpg version, the store directory, the `GNUPGHOME`
+  mode, the `.gpg-id`, each recipient key, a `.gpg-id.sig` (warn), the entry count and
+  the git state. The tool rows show only the tools of the backends in use.
+- `secrit --version` prints the baked-in `gpg` path. The Nix package bakes in `gpg`, and
+  the devShell and checks add `gnupg`, `pass` and `gopass`.
 
 ### Changed
 

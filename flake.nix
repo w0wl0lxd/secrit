@@ -33,17 +33,20 @@
           };
           sopsBin = "${pkgs.sops}/bin/sops";
           ageKeygenBin = "${pkgs.age}/bin/age-keygen";
+          gpgBin = "${pkgs.gnupg}/bin/gpg";
           commonArgs = {
             inherit src;
             strictDeps = true;
           };
           # Baked into the binary with option_env! (PLAN 10.2): installing
-          # secrit through Nix installs the exact sops and age-keygen it runs.
+          # secrit through Nix installs the exact sops, age-keygen and gpg it
+          # runs.
           # Kept out of buildDepsOnly, so a sops or age bump does not rebuild
           # the dependencies (NIX-2).
           bakedEnv = {
             SECRIT_SOPS_BIN = sopsBin;
             SECRIT_AGE_KEYGEN_BIN = ageKeygenBin;
+            SECRIT_GPG_BIN = gpgBin;
           };
           # The integration tests run the real tools against a temp dir only.
           testEnv = {
@@ -51,14 +54,22 @@
             SECRIT_TEST_AGE_KEYGEN = ageKeygenBin;
             SECRIT_TEST_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
             SECRIT_TEST_GIT = "${pkgs.git}/bin/git";
+            SECRIT_TEST_GPG = gpgBin;
+            SECRIT_TEST_PASS = "${pkgs.pass}/bin/pass";
+            SECRIT_TEST_GOPASS = "${pkgs.gopass}/bin/gopass";
           };
-          # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and git.
+          # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and
+          # git; gpg and gpgconf for the pass backend, and pass and gopass for
+          # its interop tests (v0.2 plan S11).
           testTools = [
             pkgs.util-linux
             pkgs.openssh
             pkgs.coreutils
             pkgs.diffutils
             pkgs.git
+            pkgs.gnupg
+            pkgs.pass
+            pkgs.gopass
           ];
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           secrit = craneLib.buildPackage (
@@ -167,6 +178,12 @@
                         stores.main = {
                           backend = "sops";
                           file = "~/store/secrit.yaml";
+                        };
+                        stores.pw = {
+                          backend = "pass";
+                          dir = "~/.password-store";
+                          prefix = "secrit";
+                          value = "first-line";
                         };
                         lock.timeout_secs = 5;
                       };

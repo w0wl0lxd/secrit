@@ -12,6 +12,13 @@ mod error;
 mod git;
 mod harden;
 mod lock;
+// `run` (v0.2 plan S13) is the first reader; that slice removes the
+// `expect`. Under `cfg(test)` the unit tests read every item.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "read by `run` from v0.2 plan S13")
+)]
+mod mask;
 mod name;
 mod paths;
 mod report;
@@ -104,6 +111,8 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             cmd::rm::run(&ctx_for(&name)?, &name, yes)
         }
         Command::Init {
+            backend,
+            pass_dir,
             sops_file,
             format,
             sops_config,
@@ -115,6 +124,11 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             store.as_deref(),
             quiet,
             &cmd::init::InitArgs {
+                backend: backend.map(|b| match b {
+                    cli::InitBackend::Sops => crate::config::BackendKind::Sops,
+                    cli::InitBackend::Pass => crate::config::BackendKind::Pass,
+                }),
+                pass_dir,
                 sops_file,
                 format,
                 sops_config,

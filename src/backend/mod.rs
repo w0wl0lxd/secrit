@@ -347,7 +347,8 @@ pub enum BackendError {
     KeySourceTimeout {
         tool: &'static str,
         step: &'static str,
-        target: Target,
+        // Boxed: with `waits`, an inline target makes `Error` too large.
+        target: Box<Target>,
         after: std::time::Duration,
         waits: &'static str,
     },
@@ -620,7 +621,7 @@ mod tests {
                 BackendError::KeySourceTimeout {
                     tool: "sops",
                     step: "decrypt",
-                    target: named(),
+                    target: Box::new(named()),
                     after: Duration::from_millis(3000),
                     waits: "The key command may wait.",
                 },

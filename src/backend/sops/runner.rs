@@ -349,7 +349,7 @@ impl Runner {
                 Some(waits) => BackendError::KeySourceTimeout {
                     tool: TOOL,
                     step,
-                    target,
+                    target: Box::new(target),
                     after: timeout,
                     waits,
                 },

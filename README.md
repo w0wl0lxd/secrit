@@ -162,10 +162,11 @@ sops never gets the terminal, so a key that asks for a passphrase or a PIN fails
 and the message names the key source. A key command or a plugin that waits for another
 reason ends after `age_key_cmd_timeout_secs` (default 20 s), not after the usual 120 s.
 
-The key command runs once for each sops run that decrypts: twice for `store` (the write
-and the read-back check), once for `rm`, and once for each name in `get`. It runs with
-the environment of sops: no terminal, no `PATH` (or only `age_plugin_dir`), and
-`HOME=/nonexistent`. So `pass`, `rbw`, `op` or `secret-tool` fail unless the command sets
+sops runs the key command each time it loads identities, so the command can run more than
+once for one sops run (for example, a second recipient is another try), and `store`
+runs sops twice (the write and the read-back check). Do not rely on a count of runs.
+It runs with the environment of sops: no terminal, `HOME=/nonexistent`, and no `PATH`
+(or only `age_plugin_dir` as `PATH`). So `pass`, `rbw`, `op` or `secret-tool` fail unless the command sets
 its own `PATH` and `HOME`. secrit does not widen the environment for it. Use an absolute
 interpreter, as in this wrapper; `doctor` warns about a `#!/usr/bin/env` line:
 

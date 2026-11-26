@@ -323,9 +323,9 @@ impl Backend for SopsBackend {
 
     fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
         let doc = self.read_doc_to_write()?;
-        // v0.2 S8: key source checks; unset decrypts once.
+        // v0.2 S8: key source checks. The touch plan is set by the write
+        // itself, which knows whether an ancestor is pruned too.
         self.runner.keys().preflight(&doc.meta)?;
-        self.runner.keys().plan(1);
         if !self.check_path(name, &doc.entries, false)? {
             return Err(self.missing_error(name));
         }

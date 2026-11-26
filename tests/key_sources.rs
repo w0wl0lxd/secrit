@@ -640,7 +640,7 @@ fn fake_yubikey(p: &PluginEnv, pin: &str, touch: &str) -> PathBuf {
     let stub = p.env.root.path().join("keys").join("yubikey.identity");
     std::fs::write(
         &stub,
-        format!("{meta}#    Recipient: {recipient}\nAGE-PLUGIN-YUBIKEY-1TESTSTUB\n"),
+        format!("{meta}#    Recipient: {recipient}\nAGE-PLUGIN-YUBIKEY-1V0Z4GQYZQYPQXPQD6A26H\n"),
     )
     .unwrap();
     chmod(&stub, 0o600);

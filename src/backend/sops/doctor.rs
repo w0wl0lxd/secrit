@@ -132,18 +132,22 @@ fn key_source_rows(r: &mut Report, name: &dyn Fn(&str) -> String, backend: &Sops
     }
     if let Some(c) = keys.key_cmd() {
         match keys::check_key_cmd(c) {
-            Ok(()) => r.add(
-                name("key command"),
-                Status::Ok,
-                format!(
-                    "{}; it runs once per sops run that decrypts (a store runs it twice)",
-                    c.display()
-                ),
-            ),
+            Ok(()) => {
+                r.add(
+                    name("key command"),
+                    Status::Ok,
+                    format!(
+                        "{}; sops can run it more than once per run, so it must give the same key each time",
+                        c.display()
+                    ),
+                );
+                // Only a command that passed the check is opened: a FIFO
+                // with no writer would block the read.
+                let (status, detail) = key_cmd_shebang(c);
+                r.add(name("key command shebang"), status, detail);
+            }
             Err(e) => r.add(name("key command"), Status::Fail, e.to_string()),
         }
-        let (status, detail) = key_cmd_shebang(c);
-        r.add(name("key command shebang"), status, detail);
     }
     if let Some(d) = keys.plugin_dir() {
         match keys::check_plugin_dir(d) {

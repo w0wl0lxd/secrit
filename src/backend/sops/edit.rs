@@ -63,7 +63,11 @@ impl FileEdit for SopsEdit<'_> {
             Op::Put(..) => b.check_cleartext_rules(self.name, &doc.meta)?,
             Op::Remove => {
                 let path: Vec<&str> = self.name.segments().collect();
-                self.prune.set(prune_depth(&doc.entries, &path));
+                let depth = prune_depth(&doc.entries, &path);
+                self.prune.set(depth);
+                // One unset for the name, and one more for a pruned
+                // ancestor: each decrypts, so each is a touch.
+                b.runner.keys().plan(1 + usize::from(depth.is_some()));
             }
         }
         Ok((doc, existed))

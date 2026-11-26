@@ -15,9 +15,11 @@
 //!
 //! - sops splits `SOPS_AGE_KEY_CMD` with shlex, so a path with a space or a
 //!   quote is refused here.
-//! - The key command runs once per sops run that needs an identity, with
-//!   sops's own environment: no `PATH` and `HOME=/nonexistent`. A command
-//!   that needs `PATH` fails with "failed to execute command".
+//! - sops runs the key command each time that it loads identities, so it can
+//!   run more than once per sops run (a second recipient is another try). It
+//!   gets sops's own environment: `HOME=/nonexistent`, and no `PATH` unless
+//!   `age_plugin_dir` is set (then `PATH` is that directory). A command that
+//!   needs `PATH` fails with "failed to execute command".
 //! - A key command that reads `/dev/tty` gets SIGTTIN, which the kernel
 //!   sends to the whole sops process group. So sops stops too, and secrit
 //!   ends the run at once.
@@ -56,13 +58,13 @@ use crate::tty;
 pub const AGE_KEY_HINT: &str = "The key in age_key_file must have no passphrase, because secrit never gives sops the terminal (ruling Q24)";
 const SSH_KEY_HINT: &str = "The key in age_ssh_key_file must have no passphrase, because secrit never gives sops the terminal (ruling Q24); use an SSH key without one, or an age key file";
 const PLUGIN_HINT: &str = "The age plugin asked on the terminal, for example for a PIN; secrit never gives sops the terminal (ruling Q24), so use a slot with PIN policy never (level 'touch')";
-const KEY_CMD_HINT: &str = "The key command in age_key_cmd must not read the terminal: it runs with no terminal, no PATH and HOME=/nonexistent (see the README, 'Keys')";
-const KEY_CMD_WAITS: &str = "The key command in age_key_cmd may wait for input on a terminal that it never gets: it runs with no terminal, no PATH and HOME=/nonexistent (see the README, 'Keys').";
+const KEY_CMD_HINT: &str = "The key command in age_key_cmd must not read the terminal: it runs with no terminal and HOME=/nonexistent, and with no PATH unless age_plugin_dir is set (then PATH is only that directory) (see the README, 'Keys')";
+const KEY_CMD_WAITS: &str = "The key command in age_key_cmd may wait for input on a terminal that it never gets: it runs with no terminal and HOME=/nonexistent, and with no PATH unless age_plugin_dir is set (then PATH is only that directory) (see the README, 'Keys').";
 const PLUGIN_DIR_WAITS: &str =
     "An age plugin from age_plugin_dir may wait for input on a terminal that it never gets.";
 const PLUGIN_WAITS: &str = "The age plugin waited for a touch or a PIN: touch the key within touch_timeout_secs, and use a slot with PIN policy never.";
 /// The note on a failed sops run when a key command is set.
-const KEY_CMD_NOTE: &str = "note: the key command in age_key_cmd runs with no PATH and HOME=/nonexistent; give it an absolute shebang and absolute program paths (see the README, 'Keys')";
+const KEY_CMD_NOTE: &str = "note: the key command in age_key_cmd runs with HOME=/nonexistent and no PATH (or only age_plugin_dir as PATH); give it an absolute shebang and absolute program paths (see the README, 'Keys')";
 /// The level of a plugin identity with no `level` key.
 pub const DEFAULT_PLUGIN_LEVEL: Level = Level::Touch;
 /// The strictest level that this build can serve.
@@ -430,6 +432,14 @@ pub fn check_key_cmd(cmd: &Path) -> Result<(), BackendError> {
 /// directory passes the trust rule, and it holds only `age-plugin-*`
 /// programs that pass it too.
 pub fn check_plugin_dir(dir: &Path) -> Result<(), BackendError> {
+    // The directory is passed as `PATH`, which the plugin search splits on
+    // ':', so a ':' would make other directories part of the search.
+    if dir.as_os_str().as_encoded_bytes().contains(&b':') {
+        return Err(unsafe_(
+            dir,
+            "the path holds a ':', which PATH would split into other directories; move the plugin directory to a path without one".into(),
+        ));
+    }
     trust::check_dir(dir).map_err(|e| trust_error(dir, "check the plugin directory", e))?;
     let entries = std::fs::read_dir(dir).map_err(|source| BackendError::Io {
         step: "read the plugin directory",
@@ -515,8 +525,20 @@ impl Head {
 
 /// Read at most `cap` bytes of the file at `path`.
 fn read_head(path: &Path, cap: usize) -> std::io::Result<Head> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut buf = Zeroizing::new(vec![0u8; cap + 1]);
-    let mut f = std::fs::File::open(path)?;
+    // O_NONBLOCK: opening a FIFO with no writer must not wait. The opened
+    // descriptor must be a regular file before anything is read.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let mut len = 0;
     while len < buf.len() {
         match f.read(&mut buf[len..]) {
@@ -574,8 +596,22 @@ pub fn shebang(path: &Path) -> std::io::Result<Shebang> {
     Ok(classify_shebang(&buf[..n]))
 }
 
+/// A native macOS executable: a thin Mach-O of either byte order and width,
+/// or a universal (fat) binary.
+fn is_mach_o(head: &[u8]) -> bool {
+    const MAGICS: [[u8; 4]; 6] = [
+        [0xfe, 0xed, 0xfa, 0xce],
+        [0xfe, 0xed, 0xfa, 0xcf],
+        [0xce, 0xfa, 0xed, 0xfe],
+        [0xcf, 0xfa, 0xed, 0xfe],
+        [0xca, 0xfe, 0xba, 0xbe],
+        [0xbe, 0xba, 0xfe, 0xca],
+    ];
+    head.get(..4).is_some_and(|m| MAGICS.iter().any(|k| k == m))
+}
+
 fn classify_shebang(head: &[u8]) -> Shebang {
-    if head.starts_with(b"\x7fELF") {
+    if head.starts_with(b"\x7fELF") || is_mach_o(head) {
         return Shebang::Absolute;
     }
     let Some(rest) = head.strip_prefix(b"#!") else {
@@ -609,6 +645,7 @@ pub fn parse_stub(text: &str) -> Result<Stub, String> {
     let mut recipient = None;
     let mut serial = None;
     let mut slot = None;
+    let mut identity = None;
     for line in text.lines().map(str::trim) {
         if line.starts_with("AGE-SECRET-KEY-") {
             return Err(
@@ -630,6 +667,7 @@ pub fn parse_stub(text: &str) -> Result<Stub, String> {
             if plugin.replace(name).is_some() {
                 return Err("it holds more than one identity".into());
             }
+            identity = Some(line.to_owned());
         } else if let Some(c) = line.strip_prefix('#') {
             let c = c.trim();
             if let Some((k, v)) = c.split_once(':') {
@@ -648,12 +686,87 @@ pub fn parse_stub(text: &str) -> Result<Stub, String> {
         }
     }
     let plugin = plugin.ok_or("it holds no AGE-PLUGIN- identity line")?;
+    if plugin == "yubikey" {
+        // The identity decides the slot that age-plugin-yubikey uses. The
+        // comment lines are only descriptive, so they are replaced.
+        let id = identity
+            .as_deref()
+            .and_then(decode_yubikey_identity)
+            .ok_or("its AGE-PLUGIN-YUBIKEY- line is not a valid yubikey identity")?;
+        serial = Some(id.0);
+        slot = Some(id.1);
+    }
     Ok(Stub {
         plugin,
         recipient,
         serial,
         slot,
     })
+}
+
+/// The serial and the slot (as `--list` shows them) that an
+/// `AGE-PLUGIN-YUBIKEY-1...` identity encodes: bech32 over the serial (u32,
+/// little endian), the PIV slot byte (0x82 is slot 1) and a 4 byte key tag.
+fn decode_yubikey_identity(line: &str) -> Option<(String, String)> {
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const HRP: &str = "age-plugin-yubikey-";
+    let line = line.to_ascii_lowercase();
+    let (hrp, data) = line.rsplit_once('1')?;
+    if hrp != HRP || data.len() < 6 {
+        return None;
+    }
+    let values: Vec<u8> = data
+        .bytes()
+        .map(|c| {
+            CHARSET
+                .iter()
+                .position(|k| *k == c)
+                .and_then(|i| u8::try_from(i).ok())
+        })
+        .collect::<Option<_>>()?;
+    let mut chk: u32 = 1;
+    let expanded = hrp
+        .bytes()
+        .map(|b| b >> 5)
+        .chain([0])
+        .chain(hrp.bytes().map(|b| b & 31))
+        .chain(values.iter().copied());
+    for v in expanded {
+        let top = chk >> 25;
+        chk = ((chk & 0x01ff_ffff) << 5) ^ u32::from(v);
+        for (i, g) in [
+            0x3b6a_57b2u32,
+            0x2650_8e6d,
+            0x1ea1_19fa,
+            0x3d42_33dd,
+            0x2a14_62b3,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if (top >> i) & 1 == 1 {
+                chk ^= g;
+            }
+        }
+    }
+    if chk != 1 {
+        return None;
+    }
+    let (mut acc, mut bits, mut bytes) = (0u32, 0u32, Vec::new());
+    for v in &values[..values.len() - 6] {
+        acc = (acc << 5) | u32::from(*v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(u8::try_from(acc >> bits).ok()?);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    if bytes.len() < 9 || !(0x82..=0x95).contains(&bytes[4]) {
+        return None;
+    }
+    let serial = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    Some((serial.to_string(), (bytes[4] - 0x81).to_string()))
 }
 
 /// A PIV PIN policy, weakest first.
@@ -949,10 +1062,9 @@ impl Plugin {
         let slots = parse_list(&text);
         slots
             .into_iter()
-            .find(|s| match (&stub.recipient, &s.recipient) {
-                (Some(a), Some(b)) => a == b,
-                _ => stub.serial.as_ref() == Some(&s.serial) && stub.slot.as_ref() == Some(&s.id),
-            })
+            // The serial and slot come from the identity itself, not from a
+            // comment that may be stale.
+            .find(|s| stub.serial.as_ref() == Some(&s.serial) && stub.slot.as_ref() == Some(&s.id))
             .ok_or_else(|| {
                 unsafe_(
                     &self.stub,
@@ -1305,6 +1417,8 @@ mod tests {
     #[test]
     fn shebangs_are_classified() {
         assert_eq!(classify_shebang(b"\x7fELF\x02"), Shebang::Absolute);
+        assert_eq!(classify_shebang(b"\xcf\xfa\xed\xfe\x07"), Shebang::Absolute);
+        assert_eq!(classify_shebang(b"\xca\xfe\xba\xbe\x00"), Shebang::Absolute);
         assert_eq!(classify_shebang(b"#!/bin/sh\necho"), Shebang::Absolute);
         assert_eq!(
             classify_shebang(b"#! /nix/store/x-bash/bin/bash -e\n"),
@@ -1338,7 +1452,24 @@ mod tests {
         assert_eq!(classify_ssh_header(b""), SshKeyHeader::NotOpenSsh);
     }
 
-    const YUBIKEY_STUB: &str = "#       Serial: 5555555, Slot: 1\n#         Name: age identity 1a2b3c4d\n#      Created: Thu, 08 Oct 2026 00:00:00 +0000\n#   PIN policy: Never  (A PIN is NOT required to decrypt)\n# Touch policy: Always (A physical touch is required for every decryption)\n#    Recipient: age1yubikey1qtest\nAGE-PLUGIN-YUBIKEY-1TESTSTUB\n";
+    const YUBIKEY_STUB: &str = "#       Serial: 5555555, Slot: 1\n#         Name: age identity 1a2b3c4d\n#      Created: Thu, 08 Oct 2026 00:00:00 +0000\n#   PIN policy: Never  (A PIN is NOT required to decrypt)\n# Touch policy: Always (A physical touch is required for every decryption)\n#    Recipient: age1yubikey1qtest\nAGE-PLUGIN-YUBIKEY-1V0Z4GQYZQYPQXPQD6A26H\n";
+
+    /// The slot comes from the encoded identity, not from a stale comment.
+    #[test]
+    fn a_yubikey_stub_takes_its_slot_from_the_identity() {
+        let stale = YUBIKEY_STUB.replace("Slot: 1", "Slot: 9");
+        let s = parse_stub(&stale).unwrap();
+        assert_eq!(s.serial.as_deref(), Some("5555555"));
+        assert_eq!(s.slot.as_deref(), Some("1"));
+        let bad = YUBIKEY_STUB.replace("D6A26H", "D6A26J");
+        assert!(parse_stub(&bad).is_err());
+    }
+
+    #[test]
+    fn a_plugin_directory_with_a_colon_is_refused() {
+        let e = check_plugin_dir(Path::new("/tmp/a:b")).unwrap_err();
+        assert!(e.to_string().contains("':'"), "{e}");
+    }
 
     #[test]
     fn stubs_parse_and_a_plain_key_is_refused() {

@@ -5,7 +5,8 @@
 //! `FdoSecrets` server. Each secrit name is one item with the label
 //! `secrit: NAME` and the attributes `application=secrit`,
 //! `secrit-store=<store>` and `secrit-name=NAME`, so
-//! `secret-tool lookup secrit-name NAME` reads it too.
+//! `secret-tool lookup application secrit secrit-store STORE secrit-name NAME`
+//! reads it too.
 //!
 //! - **Bus.** secrit reads `DBUS_SESSION_BUS_ADDRESS` once, or uses
 //!   `$XDG_RUNTIME_DIR/bus` when it is unset. Only `unix:path=<absolute>`
@@ -207,12 +208,15 @@ impl SecretServiceBackend {
         Ok(lock::acquire(&self.lock_path(dir), self.lock_timeout)?)
     }
 
-    /// The lock file of this store under `runtime_dir`.
+    /// The lock file of this store under `runtime_dir`. The key is the raw
+    /// store name only: an alias and an object path can name one
+    /// collection, and only the daemon knows that. Same-named stores in
+    /// other collections share the lock too, which costs time only.
     fn lock_path(&self, runtime_dir: &Path) -> PathBuf {
         lock::keyed_lock_path(
             runtime_dir,
             BackendKind::SecretService.name(),
-            &[self.collection.as_bytes(), self.store.as_bytes()],
+            &[self.store.as_bytes()],
         )
     }
 
@@ -986,7 +990,7 @@ fn facts_rows(r: &mut Report, b: &SecretServiceBackend, store: &str, facts: Doct
 mod tests {
     use super::*;
 
-    /// The item attributes: `secret-tool lookup secrit-name NAME` finds
+    /// The item attributes: `secret-tool lookup` with all three finds
     /// them, and one store never sees another store's items.
     #[test]
     fn the_attribute_set() {
@@ -1201,17 +1205,41 @@ mod tests {
         );
     }
 
-    /// The lock key is the raw collection and store name, not the escaped
-    /// text: two collections that show the same text get their own locks.
+    /// The lock key is the raw store name. Every spelling of a collection
+    /// (an alias, the alias path, the object path that it resolves to)
+    /// gives one lock, so writers through two spellings of one collection
+    /// stay serialised (T32). Another store name gets its own lock, and the
+    /// raw name counts, not its escaped text.
     #[test]
-    fn the_lock_key_is_the_raw_location() {
-        let control = backend("a\u{1b}");
-        let literal = backend("a\\x1b");
-        assert_eq!(control.location.to_string(), literal.location.to_string());
+    fn the_lock_key_is_the_raw_store_name() {
         let dir = Path::new("/run/user/7");
-        assert_ne!(control.lock_path(dir), literal.lock_path(dir));
-        assert_eq!(control.lock_path(dir), backend("a\u{1b}").lock_path(dir));
-        assert_ne!(control.lock_path(dir), backend("b").lock_path(dir));
+        let env = env_of(&[("XDG_RUNTIME_DIR", "/run/user/7")]);
+        let of = |store: &str, collection: &str| {
+            SecretServiceBackend::new(
+                store,
+                &SecretServiceStore {
+                    collection: collection.to_owned(),
+                    unlock: Unlock::Refuse,
+                },
+                Duration::from_secs(1),
+                &env,
+            )
+            .lock_path(dir)
+        };
+        let main = of("main", "default");
+        for spelling in [
+            "login",
+            "/org/freedesktop/secrets/aliases/default",
+            "/org/freedesktop/secrets/collection/login",
+        ] {
+            assert_eq!(of("main", spelling), main, "{spelling}");
+        }
+        assert_eq!(main, backend("default").lock_path(dir));
+        assert_ne!(of("desk", "default"), main);
+        let control = of("a\u{1b}", "default");
+        let literal = of("a\\x1b", "default");
+        assert_ne!(control, literal);
+        assert_eq!(control, of("a\u{1b}", "default"));
     }
 
     /// The wait gives the result, or ends at the deadline with exit 1.

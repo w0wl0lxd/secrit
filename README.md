@@ -343,7 +343,7 @@ needs no sops and no age key for it.
 ```sh
 secrit init --backend secret-service --store desk   # checks the daemon, writes the config
 secrit --store desk store github-token
-secret-tool lookup secrit-name github-token          # libsecret reads the same item
+secret-tool lookup application secrit secrit-store desk secrit-name github-token
 ```
 
 `init --backend secret-service` checks that the daemon answers and that the collection
@@ -374,7 +374,8 @@ exists and is unlocked. Then it writes the config section. It creates nothing in
   its lock, so parallel `store` runs make one item. Another program can still add an item
   with the same attributes; then `get` exits 1 and names the count.
 - **Deadline.** Each daemon call has 120 seconds. SIGINT or SIGTERM during a call exits
-  130 and releases the lock; the daemon can still finish that call.
+  130 and releases the lock; the daemon can still finish that call. So after a 130,
+  check the item before you run the command again.
 - `wire` exits 3 on a Secret Service store: sops-nix cannot read it. A program reads the
   value with `secrit get --stdout NAME`.
 
@@ -495,7 +496,10 @@ Exit codes: `0` success, `1` failed, `2` usage error, `3` refused by a safety ru
 terminal, overwrite, name rule, an unsafe store file, store directory, config file, lock
 directory, `.sops.yaml` or `sops`, a locked collection or an unsafe session bus), `4` lock
 timeout or a
-concurrent change, `130` a signal cancelled the command before a write took effect. `init`
+concurrent change, `130` a signal cancelled the command. On a file store, a signal before
+the rename cancels the write. On a Secret Service store the daemon can still finish a call
+that secrit sent, so a write or a removal can take effect: check the item before you
+retry. `init`
 keeps the files of the steps it finished; run it again to finish the setup. `run` exits
 with the exit code of CMD once CMD has started.
 

@@ -91,8 +91,8 @@ All notable changes to this project are recorded here. The format follows
 - Secret Service backend (`backend = "secret-service"`, Linux): each name is one item of
   a collection on the D-Bus session bus (gnome-keyring, KWallet, or the KeePassXC Secret
   Service server), with the label `secrit: NAME` and the attributes `application=secrit`,
-  `secrit-store=<store>` and `secrit-name=NAME`, so `secret-tool lookup secrit-name NAME`
-  reads it too. The store keys are `collection` (an alias or an object path, default
+  `secrit-store=<store>` and `secrit-name=NAME`, so
+  `secret-tool lookup application secrit secrit-store STORE secrit-name NAME` reads it too. The store keys are `collection` (an alias or an object path, default
   `default`) and `unlock` (`refuse`, the default, or `prompt`). `store`, `get`, `ls`, `rm`
   and `doctor` work on it. `ls` reads the item attributes only.
 - `init --backend sops|secret-service`. For a Secret Service store, `init` checks that the
@@ -369,7 +369,8 @@ All notable changes to this project are recorded here. The format follows
 - A locked collection exits 3. With `unlock = "prompt"`, secrit asks the daemon to unlock
   only when no agent is detected and a terminal exists. Each daemon call runs in its own
   thread with a 120 s deadline (exit 1); SIGINT, SIGTERM, SIGHUP or SIGQUIT during a call
-  exits 130 and releases the lock.
+  exits 130 and releases the lock. The daemon can still finish a call that secrit sent, so
+  a 130 does not prove that nothing changed.
 - `store` without `--replace` on a Secret Service store searches, creates and searches
   again under the secrit lock. When another item of the same name appears meanwhile, it
   deletes its own item and exits 3, so parallel writers make one item.

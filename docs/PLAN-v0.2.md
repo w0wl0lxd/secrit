@@ -396,6 +396,8 @@ How commands use them:
   what }` and `Locked(Location)` (S10).
 - The lock key (PLAN 8.1 step 4) stays `<dir dev>-<dir ino>-<name hash>` for file
   locations. For other locations it is a hash of the backend kind and the location text.
+  A Secret Service store hashes the store name only, because an alias and an object path
+  can name one collection (S10).
   The lock serialises secrit writers only. It does not lock out other programs.
 
 ### 5.4 Names and key paths

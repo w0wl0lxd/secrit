@@ -64,6 +64,74 @@ fn stores_do_not_see_each_other() {
         "the main store value changed"
     );
     assert_eq!(f.item_count("n"), 1);
+    // The README lookup names the store, so it selects one of the two.
+    let lookup = |store| {
+        f.lookup(&[
+            "application",
+            "secrit",
+            "secrit-store",
+            store,
+            "secrit-name",
+            "n",
+        ])
+    };
+    assert!(
+        lookup("main").as_deref() == Some(&b"main-value"[..]),
+        "the main lookup read another value"
+    );
+    assert!(
+        lookup("other").as_deref() == Some(&b"other-value"[..]),
+        "the other lookup read another value"
+    );
+}
+
+/// T32: the secrit lock does not depend on how the config names the
+/// collection. While a writer through the alias `default` holds the lock, a
+/// writer through the object path of that alias waits and times out (exit
+/// 4). It makes no second item.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_alias_and_its_object_path_share_the_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let d = f.dirs();
+    let by_path = d.config_file.with_file_name("by-path.toml");
+    let text = format!(
+        "default_store = \"main\"\n\n[stores.main]\nbackend = \"secret-service\"\ncollection = \"{}\"\n\n[lock]\ntimeout_secs = 1\n",
+        common::fixture_secret_service::LOGIN_COLLECTION
+    );
+    std::fs::write(&by_path, text).unwrap();
+    std::fs::set_permissions(&by_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut first = d.cmd();
+    first
+        .env("SECRIT_TEST_HOOK", "after-lock=pause")
+        .env("SECRIT_TEST_HOOK_DIR", d.hook_dir())
+        .args(["store", "n"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut first = first.spawn().unwrap();
+    first.stdin.take().unwrap().write_all(b"by-alias").unwrap();
+    d.wait_for_hook(1);
+
+    let mut second = d.cmd();
+    second.env("SECRIT_CONFIG", &by_path);
+    let out = run_cmd(second, ["store", "n"], Some(b"by-path"));
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("waiting for lock"),
+        "{}",
+        stderr(&out)
+    );
+
+    std::fs::write(d.hook_dir().join("go"), b"").unwrap();
+    ok(&first.wait_with_output().unwrap());
+    assert_eq!(f.item_count("n"), 1);
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"by-alias"[..]),
+        "the item holds another value"
+    );
 }
 
 /// T32: 20 parallel `store` of one name make one item; the other 19 exit
@@ -80,12 +148,12 @@ fn parallel_create_only_makes_one_item() {
                 .stderr(Stdio::piped());
             let mut child = c.spawn().unwrap();
             let value = format!("writer-{i}");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(value.as_bytes())
-                .unwrap();
+            // A child that finds the name taken exits 3 before it reads
+            // stdin. The exit codes below still count it.
+            match child.stdin.take().unwrap().write_all(value.as_bytes()) {
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                r => r.unwrap(),
+            }
             child
         })
         .collect();

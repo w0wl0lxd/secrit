@@ -5,6 +5,7 @@ pub mod get;
 pub mod init;
 pub mod ls;
 pub mod rm;
+pub mod run;
 pub mod store;
 pub mod wire;
 

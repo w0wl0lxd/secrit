@@ -10,14 +10,10 @@ mod config;
 mod display;
 mod error;
 mod git;
+#[cfg(target_os = "linux")]
+mod handoff;
 mod harden;
 mod lock;
-// `run` (v0.2 plan S13) is the first reader; that slice removes the
-// `expect`. Under `cfg(test)` the unit tests read every item.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by `run` from v0.2 plan S13")
-)]
 mod mask;
 mod name;
 mod paths;
@@ -34,6 +30,7 @@ use std::process::ExitCode;
 use clap::CommandFactory;
 
 use crate::cli::{Cli, Command};
+use crate::cmd::run::Ended;
 use crate::cmd::{Ctx, StoreArgs, parse_name};
 use crate::error::Error;
 use crate::name::Name;
@@ -53,7 +50,12 @@ fn main() -> ExitCode {
         }
     }
     match dispatch(cli, hardened) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Ended::Code(code)) => ExitCode::from(code),
+        Ok(Ended::Signal(sig)) => {
+            // `run`: CMD ended by a signal, so secrit ends by it too (T45).
+            signals::die_by(sig);
+            ExitCode::from(u8::try_from(128 + sig).unwrap_or(1))
+        }
         Err(e) => {
             eprintln!("secrit: {e}");
             ExitCode::from(e.exit().code())
@@ -61,7 +63,33 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
+fn completions(shell: cli::CompletionShell) {
+    clap_complete::generate(
+        clap_complete::Shell::from(shell),
+        &mut Cli::command(),
+        "secrit",
+        &mut std::io::stdout(),
+    );
+}
+
+fn backend_kind(b: cli::InitBackend) -> config::BackendKind {
+    match b {
+        cli::InitBackend::Sops => config::BackendKind::Sops,
+        cli::InitBackend::Pass => config::BackendKind::Pass,
+    }
+}
+
+/// `secrit run`: the command line and the agent rules come before the
+/// config, so the plan is checked before `load` reads it.
+fn run_command(
+    args: cmd::run::RunArgs,
+    load: impl FnOnce() -> Result<Ctx, Error>,
+) -> Result<Ended, Error> {
+    let plan = cmd::run::check(args)?;
+    cmd::run::run(&load()?, &plan)
+}
+
+fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
     let Cli {
         config,
         store,
@@ -81,7 +109,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
         ctx.check_name(name)?;
         Ok(ctx)
     };
-    match command {
+    let done = match command {
         Command::Store {
             name,
             replace,
@@ -124,10 +152,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             store.as_deref(),
             quiet,
             &cmd::init::InitArgs {
-                backend: backend.map(|b| match b {
-                    cli::InitBackend::Sops => crate::config::BackendKind::Sops,
-                    cli::InitBackend::Pass => crate::config::BackendKind::Pass,
-                }),
+                backend: backend.map(backend_kind),
                 pass_dir,
                 sops_file,
                 format,
@@ -148,14 +173,26 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<(), Error> {
             let name = parse_name(&name)?;
             cmd::wire::run(&ctx_for(&name)?, &name, owner.as_deref(), format)
         }
+        Command::Run {
+            file,
+            env,
+            pristine,
+            no_mask,
+            command,
+        } => {
+            let args = cmd::run::RunArgs {
+                file,
+                env,
+                pristine,
+                no_mask,
+                command,
+            };
+            return run_command(args, ctx);
+        }
         Command::Completions { shell } => {
-            clap_complete::generate(
-                clap_complete::Shell::from(shell),
-                &mut Cli::command(),
-                "secrit",
-                &mut std::io::stdout(),
-            );
+            completions(shell);
             Ok(())
         }
-    }
+    };
+    done.map(|()| Ended::Code(0))
 }

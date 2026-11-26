@@ -63,6 +63,32 @@ fn main() -> ExitCode {
     }
 }
 
+fn completions(shell: cli::CompletionShell) {
+    clap_complete::generate(
+        clap_complete::Shell::from(shell),
+        &mut Cli::command(),
+        "secrit",
+        &mut std::io::stdout(),
+    );
+}
+
+fn backend_kind(b: cli::InitBackend) -> config::BackendKind {
+    match b {
+        cli::InitBackend::Sops => config::BackendKind::Sops,
+        cli::InitBackend::Pass => config::BackendKind::Pass,
+    }
+}
+
+/// `secrit run`: the command line and the agent rules come before the
+/// config, so the plan is checked before `load` reads it.
+fn run_command(
+    args: cmd::run::RunArgs,
+    load: impl FnOnce() -> Result<Ctx, Error>,
+) -> Result<Ended, Error> {
+    let plan = cmd::run::check(args)?;
+    cmd::run::run(&load()?, &plan)
+}
+
 fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
     let Cli {
         config,
@@ -126,10 +152,7 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             store.as_deref(),
             quiet,
             &cmd::init::InitArgs {
-                backend: backend.map(|b| match b {
-                    cli::InitBackend::Sops => crate::config::BackendKind::Sops,
-                    cli::InitBackend::Pass => crate::config::BackendKind::Pass,
-                }),
+                backend: backend.map(backend_kind),
                 pass_dir,
                 sops_file,
                 format,
@@ -157,23 +180,17 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             no_mask,
             command,
         } => {
-            // The command line and the agent rules come before the config.
-            let plan = cmd::run::check(cmd::run::RunArgs {
+            let args = cmd::run::RunArgs {
                 file,
                 env,
                 pristine,
                 no_mask,
                 command,
-            })?;
-            return cmd::run::run(&ctx()?, &plan);
+            };
+            return run_command(args, ctx);
         }
         Command::Completions { shell } => {
-            clap_complete::generate(
-                clap_complete::Shell::from(shell),
-                &mut Cli::command(),
-                "secrit",
-                &mut std::io::stdout(),
-            );
+            completions(shell);
             Ok(())
         }
     };

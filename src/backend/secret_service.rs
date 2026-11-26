@@ -130,9 +130,11 @@ impl SecretServiceBackend {
 
     /// Check the daemon and the collection with no change: `init
     /// --backend secret-service` runs this before it writes the config.
-    pub fn check(&self) -> Result<usize, BackendError> {
+    /// With `allow_unlock` false (a dry run), it never asks the daemon to
+    /// unlock: a locked collection is the "locked" error.
+    pub fn check(&self, allow_unlock: bool) -> Result<usize, BackendError> {
         let store = self.store.clone();
-        self.call("check", Need::Unlocked, move |c, step| {
+        self.call_with("check", Need::Unlocked, allow_unlock, move |c, step| {
             Ok(c.search_items(attributes(&store, None))
                 .map_err(|e| step.err(e))?
                 .len())
@@ -142,6 +144,21 @@ impl SecretServiceBackend {
     /// Run `f` on the collection in a spawned thread, and wait for it (see
     /// the module docs).
     fn call<T, F>(&self, step: &'static str, need: Need, f: F) -> Result<T, BackendError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Collection<'_>, &Step) -> Result<T, BackendError> + Send + 'static,
+    {
+        self.call_with(step, need, true, f)
+    }
+
+    /// [`Self::call`] with the choice to forbid the unlock prompt.
+    fn call_with<T, F>(
+        &self,
+        step: &'static str,
+        need: Need,
+        allow_unlock: bool,
+        f: F,
+    ) -> Result<T, BackendError>
     where
         T: Send + 'static,
         F: FnOnce(&Collection<'_>, &Step) -> Result<T, BackendError> + Send + 'static,
@@ -157,7 +174,7 @@ impl SecretServiceBackend {
         let collection = self.collection.clone();
         // Ask the daemon to unlock only when the config allows it and no
         // agent runs secrit (Q30): the prompt is the owner's to answer.
-        let may_unlock = self.unlock == Unlock::Prompt && agent::detect().is_none();
+        let may_unlock = allow_unlock && self.unlock == Unlock::Prompt && agent::detect().is_none();
         let (tx, rx) = mpsc::channel();
         let worker_step = step.clone();
         std::thread::Builder::new()
@@ -192,7 +209,7 @@ impl SecretServiceBackend {
     fn lock_path(&self, runtime_dir: &Path) -> PathBuf {
         lock::keyed_lock_path(
             runtime_dir,
-            BackendKind::SecretService.as_str(),
+            BackendKind::SecretService.name(),
             &[self.collection.as_bytes(), self.store.as_bytes()],
         )
     }

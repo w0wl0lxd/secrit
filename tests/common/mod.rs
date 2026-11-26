@@ -3,6 +3,7 @@
 //! - `env`: the temp directories, the secrit command and the pty helpers.
 //!   Its items are re-exported here, so a test file uses `common::TestEnv`.
 //! - `fixture`: the `Fixture` trait, one implementation per backend.
+//! - `fixture_pass`: the pass layout fixture, with a temp `GNUPGHOME`.
 //! - `fixture_secret_service`: the Secret Service fixture, with its own
 //!   session bus and gnome-keyring (Linux only).
 //! - `conformance`: the cases that every backend passes, and the
@@ -13,6 +14,7 @@
 pub mod conformance;
 pub mod env;
 pub mod fixture;
+pub mod fixture_pass;
 #[cfg(target_os = "linux")]
 pub mod fixture_secret_service;
 

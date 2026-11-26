@@ -88,9 +88,12 @@ pub enum Command {
     },
     /// Set up a machine: age key, sops file, config (never overwrites)
     Init {
-        /// The backend of the store [default: the configured store's, else sops]
-        #[arg(long, value_enum, value_name = "BACKEND")]
+        /// The backend of the store [default: the store's backend in the config, else sops]
+        #[arg(long, value_enum)]
         backend: Option<InitBackend>,
+        /// pass: the password-store directory to check (it must hold a .gpg-id)
+        #[arg(long, value_name = "PATH")]
+        pass_dir: Option<PathBuf>,
         /// The sops file to create [default: the store file from the config]
         #[arg(long, value_name = "PATH")]
         sops_file: Option<PathBuf>,
@@ -146,8 +149,10 @@ pub enum WireFormat {
 #[allow(clippy::doc_markdown, reason = "doc comments are clap help text")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InitBackend {
-    /// A sops + age file
+    /// A sops file with an age key
     Sops,
+    /// A password-store directory, written with gpg
+    Pass,
     /// A Secret Service collection on the session bus (gnome-keyring, KWallet, KeePassXC)
     SecretService,
 }

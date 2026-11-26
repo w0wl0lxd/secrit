@@ -23,7 +23,7 @@ pub fn run(ctx: &Ctx, name: &Name, owner: Option<&str>, format: WireFormat) -> R
         return Err(Error::Refused(format!(
             "store {} uses the {} backend, and wire needs a sops store: sops-nix cannot read {}. A program reads the value with 'secrit get --stdout {name}'",
             escape(&ctx.store.name),
-            ctx.store.backend.kind().as_str(),
+            ctx.store.backend.kind().name(),
             ctx.backend.location()
         )));
     }

@@ -12,13 +12,13 @@ use serde::Serialize;
 
 use super::{interrupted, shell_path};
 use crate::backend::atomic;
+use crate::backend::pass::PassBackend;
 use crate::backend::secret_service::SecretServiceBackend;
 use crate::backend::sops::{SopsBackend, SopsFormat};
 use crate::child;
-use crate::cli::InitBackend;
 use crate::config::{
-    BackendConfig, BackendKind, Config, ConfigError, DEFAULT_COLLECTION, Env, SecretServiceStore,
-    SopsStore, StoreConfig, ToolSetting, ToolsConfig, Unlock, config_path, home,
+    BackendConfig, BackendKind, Config, ConfigError, DEFAULT_COLLECTION, Env, PassStore, PassValue,
+    Pinentry, SecretServiceStore, SopsStore, StoreConfig, ToolsConfig, Unlock, config_path, home,
 };
 use crate::display::{escape, escape_path};
 use crate::error::{Error, Exit};
@@ -33,7 +33,9 @@ const MAX_RECIPIENTS_BYTES: usize = 64 * 1024;
 /// The flags of `secrit init`.
 #[derive(Debug)]
 pub struct InitArgs {
-    pub backend: Option<InitBackend>,
+    /// `None`: the backend of the store in the config, else sops.
+    pub backend: Option<BackendKind>,
+    pub pass_dir: Option<PathBuf>,
     pub sops_file: Option<PathBuf>,
     /// The store file format; written to the config as `format`.
     pub format: Option<SopsFormat>,
@@ -101,32 +103,34 @@ fn steps(
     };
     let name = store_name(store_flag, existing.as_ref());
     let configured = existing.as_ref().and_then(|c| c.stores.get(&name));
-    let backend = match (args.backend, configured.map(|s| s.backend.kind())) {
-        (Some(InitBackend::Sops), _) | (None, None | Some(BackendKind::Sops)) => BackendKind::Sops,
-        (Some(InitBackend::SecretService), _) | (None, Some(BackendKind::SecretService)) => {
-            BackendKind::SecretService
-        }
-    };
+    let kind = args
+        .backend
+        .or(configured.map(StoreConfig::kind))
+        .unwrap_or(BackendKind::Sops);
     if let Some(have) = configured
-        && have.backend.kind() != backend
+        && have.kind() != kind
     {
         return Err(Error::Usage(format!(
-            "the config already names store '{name}' with backend {}; init never edits the config. Pass --store with a new name, or edit the config first",
-            have.backend.kind().as_str()
+            "the config already names store '{name}' with the {} backend; init never edits the config. Pass --store with a new name, or edit the config first",
+            have.kind().name()
         )));
     }
-    if backend == BackendKind::SecretService {
+    if kind == BackendKind::Pass {
+        return pass_steps(&config_file, existing.as_ref(), name, args, &out);
+    }
+    if args.pass_dir.is_some() {
+        return Err(Error::Usage(
+            "--pass-dir needs --backend pass, or a pass store in the config".into(),
+        ));
+    }
+    if kind == BackendKind::SecretService {
         return secret_service_steps(&config_file, existing.as_ref(), name, args, &out);
     }
-    let store = store_config(args, name, existing.as_ref())?;
+    let store = store_config(args, store_flag, existing.as_ref())?;
     let sops_store = store.require_sops()?;
-    let tools_config = existing.as_ref().map_or(
-        ToolsConfig {
-            sops: ToolSetting::Auto,
-            age_keygen: ToolSetting::Auto,
-        },
-        |c| c.tools.clone(),
-    );
+    let tools_config = existing
+        .as_ref()
+        .map_or_else(ToolsConfig::default, |c| c.tools.clone());
     let lock_timeout = existing
         .as_ref()
         .map_or(Duration::from_secs(30), |c| c.lock_timeout);
@@ -191,13 +195,107 @@ fn steps(
     interrupted()
 }
 
-/// The store that this run sets up: `--store`, else the default store of
-/// the config, else `main`.
+/// The name of the store that this run sets up.
 fn store_name(store_flag: Option<&str>, existing: Option<&Config>) -> String {
     store_flag
         .or(existing.and_then(|c| c.default_store.as_deref()))
         .unwrap_or(DEFAULT_STORE)
         .to_owned()
+}
+
+/// `init` for a pass store (v0.2 plan 6.4). secrit does not create a
+/// password store: `pass init` or `gopass init` does, with its git setup.
+/// init checks the directory, the `.gpg-id` and that each recipient key is
+/// in the keyring, then writes or prints the config section.
+fn pass_steps(
+    config_file: &Path,
+    existing: Option<&Config>,
+    name: String,
+    args: &InitArgs,
+    out: &Out,
+) -> Result<(), Error> {
+    if args.sops_file.is_some()
+        || args.sops_config.is_some()
+        || args.age_key.is_some()
+        || args.write_sops_config
+    {
+        return Err(Error::Usage(
+            "--sops-file, --sops-config, --age-key and --write-sops-config are for a sops store, not a pass store".into(),
+        ));
+    }
+    let env = |k: &str| std::env::var_os(k);
+    let configured = existing.and_then(|c| c.stores.get(&name));
+    let configured_pass = match configured.map(|s| &s.backend) {
+        Some(BackendConfig::Pass(p)) => Some(p),
+        Some(other) => {
+            return Err(Error::Usage(format!(
+                "the config names store '{name}' with the {} backend; pass --store with a new name",
+                other.kind().name()
+            )));
+        }
+        None => None,
+    };
+    let absolute = |p: &Path| {
+        std::path::absolute(p).map_err(|e| Error::Usage(format!("{}: {e}", p.display())))
+    };
+    let store = match (&args.pass_dir, configured_pass) {
+        (Some(d), Some(have)) => {
+            let dir = absolute(d)?;
+            if dir != have.dir {
+                return Err(Error::Usage(format!(
+                    "the config already names store '{name}', and --pass-dir differs (the config has dir = {}); init never edits the config. Drop the flag, pass --store with a new name, or edit the config first",
+                    escape(&have.dir.to_string_lossy())
+                )));
+            }
+            have.clone()
+        }
+        (None, Some(have)) => have.clone(),
+        (Some(d), None) => PassStore {
+            dir: absolute(d)?,
+            prefix: None,
+            gnupg_home: None,
+            value: PassValue::default(),
+            pinentry: Pinentry::default(),
+        },
+        (None, None) => {
+            return Err(Error::Usage(format!(
+                "no config names store '{name}'; pass --pass-dir PATH"
+            )));
+        }
+    };
+    let tools_config = existing.map_or_else(ToolsConfig::default, |c| c.tools.clone());
+    let lock_timeout = existing.map_or(Duration::from_secs(30), |c| c.lock_timeout);
+    let gpg = tools::resolve(tools::GPG, &tools_config.gpg, None)?;
+    let backend = PassBackend::new(&store, gpg.path.clone(), lock_timeout, &env)?;
+    let (a, b, c) = backend.gpg_version()?;
+    out.note(&format!(
+        "gpg {a}.{b}.{c} at {}",
+        escape(&gpg.path.to_string_lossy())
+    ));
+    let (gpg_id, recipients) = backend.check_setup()?;
+    out.note(&format!(
+        "store directory {} exists; unchanged",
+        escape_path(&store.dir)
+    ));
+    out.note(&format!(
+        "{}: recipients: {}",
+        escape_path(&gpg_id),
+        recipients
+            .iter()
+            .map(|(line, fpr)| format!("{} ({fpr})", escape(line)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    interrupted()?;
+    let config = StoreConfig {
+        name,
+        wire_hint: false,
+        backend: BackendConfig::Pass(store),
+    };
+    write_config(config_file, existing, &config, args, out)?;
+    interrupted()?;
+    out.note("next: 'secrit store NAME'. secrit never commits: it prints the git commands after each write");
+    interrupted()
 }
 
 /// `init --backend secret-service` (v0.2 plan 6.3): check that the daemon
@@ -215,6 +313,7 @@ fn secret_service_steps(
         (args.sops_config.is_some(), "--sops-config"),
         (args.age_key.is_some(), "--age-key"),
         (args.write_sops_config, "--write-sops-config"),
+        (args.format.is_some(), "--format"),
     ]
     .into_iter()
     .filter_map(|(set, flag)| set.then_some(flag))
@@ -236,15 +335,15 @@ fn secret_service_steps(
     };
     let lock_timeout = existing.map_or(Duration::from_secs(30), |c| c.lock_timeout);
     let backend = SecretServiceBackend::new(&name, &ss, lock_timeout, &env);
-    // Read-only, so a dry run checks too.
-    let items = backend.check()?;
+    // A dry run changes nothing, so it never asks the daemon to unlock.
+    let items = backend.check(!args.dry_run)?;
     out.note(&format!(
         "{} is reachable and unlocked ({items} secrit items)",
         crate::backend::Backend::location(&backend)
     ));
     interrupted()?;
     let store = StoreConfig {
-        wire_hint: configured.is_some_and(|s| s.wire_hint),
+        wire_hint: false,
         name,
         backend: BackendConfig::SecretService(ss),
     };
@@ -254,12 +353,13 @@ fn secret_service_steps(
     Ok(())
 }
 
-/// The sops store that this run sets up: the flags, else the config.
+/// The store that this run sets up: the flags, else the config.
 fn store_config(
     args: &InitArgs,
-    name: String,
+    store_flag: Option<&str>,
     existing: Option<&Config>,
 ) -> Result<StoreConfig, Error> {
+    let name = store_name(store_flag, existing);
     let configured = existing.and_then(|c| c.stores.get(&name));
     // sops is the only backend that init sets up.
     let configured_sops = configured.map(StoreConfig::require_sops).transpose()?;
@@ -653,13 +753,15 @@ struct NewStore<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    collection: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sops_config: Option<&'a Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     age_key_file: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dir: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection: Option<&'a str>,
 }
 
 fn write_config(
@@ -709,23 +811,36 @@ fn new_stores<'a>(
 ) -> std::collections::BTreeMap<&'a str, NewStore<'a>> {
     let new = match &store.backend {
         BackendConfig::Sops(sops) => NewStore {
-            backend: BackendKind::Sops.as_str(),
+            backend: "sops",
             file: Some(&sops.file),
-            collection: None,
             format: args.format.map(SopsFormat::name),
             sops_config: args.sops_config.as_ref().and(sops.sops_config.as_deref()),
             age_key_file: args.age_key.as_ref().and(sops.age_key_file.as_deref()),
+            dir: None,
+            collection: None,
         },
-        BackendConfig::SecretService(ss) => NewStore {
-            backend: BackendKind::SecretService.as_str(),
+        BackendConfig::Pass(pass) => NewStore {
+            backend: "pass",
             file: None,
-            collection: Some(&ss.collection),
             format: None,
             sops_config: None,
             age_key_file: None,
+            dir: Some(&pass.dir),
+            collection: None,
+        },
+        BackendConfig::SecretService(ss) => NewStore {
+            backend: "secret-service",
+            file: None,
+            format: None,
+            sops_config: None,
+            age_key_file: None,
+            dir: None,
+            collection: Some(&ss.collection),
         },
     };
-    std::collections::BTreeMap::from([(store.name.as_str(), new)])
+    let mut stores = std::collections::BTreeMap::new();
+    stores.insert(store.name.as_str(), new);
+    stores
 }
 
 fn to_toml(value: &impl Serialize) -> Result<String, Error> {

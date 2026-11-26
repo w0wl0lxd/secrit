@@ -65,51 +65,37 @@ fn collect(
 ) -> Report {
     let mut r = Report::default();
     process_checks(&mut r, hardened, env);
-    let config =
-        match config_path(config_flag, env)
-            .map_err(Error::from)
-            .and_then(|(path, source)| {
-                super::note_config_source(&path, source, quiet);
-                let config = Config::load(&path, &home(env)?)?;
-                Ok((config, source))
-            }) {
-            Ok((config, source)) => {
-                let from = if source == ConfigSource::Env {
-                    format!(" (from {ENV_CONFIG})")
-                } else {
-                    String::new()
-                };
-                r.add(
-                    "config",
-                    Status::Ok,
-                    format!("{}{from}", config.path.display()),
-                );
-                config
-            }
-            Err(e) => {
-                r.add("config", Status::Fail, format!("{e}; run 'secrit init'"));
-                return r;
-            }
-        };
+    let Some(config) = load_config(&mut r, config_flag, quiet, env) else {
+        return r;
+    };
     let stores: Result<Vec<&StoreConfig>, _> = match store_flag {
         Some(name) => config.store(Some(name)).map(|s| vec![s]),
         None => Ok(config.stores.values().collect()),
     };
-    // sops is required only when a store that doctor checks uses it.
-    let sops_note = match &stores {
-        Ok(s) if !s.iter().any(|s| s.backend.kind() == BackendKind::Sops) => {
-            Some(" (no store here uses sops)")
-        }
-        _ => None,
+    // Tool rows only for the backends in use; with no store, the sops rows
+    // as in v0.1.
+    let uses = |kind: BackendKind| match &stores {
+        Ok(s) if !s.is_empty() => s.iter().any(|s| s.kind() == kind),
+        _ => kind == BackendKind::Sops,
     };
-    let sops = tool_check(&mut r, tools::SOPS, &config.tools.sops, env, sops_note);
-    tool_check(
-        &mut r,
-        tools::AGE_KEYGEN,
-        &config.tools.age_keygen,
-        env,
-        Some(" (only 'secrit init' needs it)"),
-    );
+    let sops = if uses(BackendKind::Sops) {
+        let sops = tool_check(&mut r, tools::SOPS, &config.tools.sops, env, true);
+        tool_check(
+            &mut r,
+            tools::AGE_KEYGEN,
+            &config.tools.age_keygen,
+            env,
+            false,
+        );
+        sops
+    } else {
+        None
+    };
+    let gpg = if uses(BackendKind::Pass) {
+        tool_check(&mut r, tools::GPG, &config.tools.gpg, env, true)
+    } else {
+        None
+    };
     let stores = match stores {
         Ok(s) => s,
         Err(e) => {
@@ -120,13 +106,20 @@ fn collect(
     if stores.is_empty() {
         r.add("stores", Status::Fail, "the config names no store");
     }
-    // The tool rows above report a missing sops, so the store rows go on
-    // with a bare name that no check runs. The sops backend asks for sops
-    // only.
-    let sops_path = sops
-        .as_ref()
-        .map_or_else(|| PathBuf::from("sops"), |t| t.path.clone());
-    let tool = |_: tools::Program, _: &crate::config::ToolSetting| Ok(sops_path.clone());
+    // The tool rows above report a missing tool, so the store rows go on
+    // with a bare name that no check runs.
+    let found = |t: &Option<ResolvedTool>, bare: &str| {
+        t.as_ref()
+            .map_or_else(|| PathBuf::from(bare), |t| t.path.clone())
+    };
+    let (sops_path, gpg_path) = (found(&sops, "sops"), found(&gpg, "gpg"));
+    let tool = |program: tools::Program, _: &crate::config::ToolSetting| {
+        Ok(if program.name == tools::GPG.name {
+            gpg_path.clone()
+        } else {
+            sops_path.clone()
+        })
+    };
     // The backend kinds whose tool version has a row already.
     let mut versioned: Vec<BackendKind> = Vec::new();
     for store in stores {
@@ -140,7 +133,12 @@ fn collect(
         let kind = backend.kind();
         let ctx = DoctorCtx {
             store: &store.name,
-            tool_found: sops.is_some(),
+            tool_found: match kind {
+                BackendKind::Sops => sops.is_some(),
+                BackendKind::Pass => gpg.is_some(),
+                // No tool: the daemon is the backend.
+                BackendKind::SecretService => true,
+            },
             tool_version: !versioned.contains(&kind),
             env,
         };
@@ -150,6 +148,41 @@ fn collect(
         backend.doctor(&mut r, &ctx);
     }
     r
+}
+
+/// Load the config and add its row; `None` when it does not load.
+fn load_config(
+    r: &mut Report,
+    config_flag: Option<&Path>,
+    quiet: bool,
+    env: &Env,
+) -> Option<Config> {
+    let loaded = config_path(config_flag, env)
+        .map_err(Error::from)
+        .and_then(|(path, source)| {
+            super::note_config_source(&path, source, quiet);
+            let config = Config::load(&path, &home(env)?)?;
+            Ok((config, source))
+        });
+    match loaded {
+        Ok((config, source)) => {
+            let from = if source == ConfigSource::Env {
+                format!(" (from {ENV_CONFIG})")
+            } else {
+                String::new()
+            };
+            r.add(
+                "config",
+                Status::Ok,
+                format!("{}{from}", config.path.display()),
+            );
+            Some(config)
+        }
+        Err(e) => {
+            r.add("config", Status::Fail, format!("{e}; run 'secrit init'"));
+            None
+        }
+    }
 }
 
 fn process_checks(r: &mut Report, hardened: HardenReport, env: &dyn Fn(&str) -> Option<OsString>) {
@@ -195,7 +228,7 @@ fn tool_check(
     program: tools::Program,
     setting: &crate::config::ToolSetting,
     env: &dyn Fn(&str) -> Option<OsString>,
-    optional: Option<&str>,
+    required: bool,
 ) -> Option<ResolvedTool> {
     match tools::resolve(program, setting, env("PATH").as_deref()) {
         Ok(t) => {
@@ -224,9 +257,11 @@ fn tool_check(
             Some(t)
         }
         Err(e) => {
-            let (status, note) = match optional {
-                None => (Status::Fail, ""),
-                Some(note) => (Status::Warn, note),
+            let status = if required { Status::Fail } else { Status::Warn };
+            let note = if required {
+                ""
+            } else {
+                " (only 'secrit init' needs it)"
             };
             r.add(program.name, status, format!("{e}{note}"));
             None
@@ -265,12 +300,13 @@ mod tests {
             name: "secrit-fake-tool",
             config_key: "sops",
             baked: None,
+            path_fallback: true,
         };
         let row = |setting: &crate::config::ToolSetting, path_dir: &Path| {
             let mut r = Report::default();
             let path_env = path_dir.as_os_str().to_owned();
             let env = move |k: &str| (k == "PATH").then(|| path_env.clone());
-            assert!(tool_check(&mut r, program, setting, &env, None).is_some());
+            assert!(tool_check(&mut r, program, setting, &env, true).is_some());
             assert_eq!(r.rows().len(), 1, "{:?}", r.rows());
             r.rows()[0].clone()
         };

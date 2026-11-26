@@ -68,6 +68,7 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     if no_backup {
         ctx.status(NO_BACKUP);
     }
+    ctx.commit_hint(name, "Store");
     // The hint is for a name that `wire` can expose.
     let wired = matches!(
         ctx.backend.wire_source(name),

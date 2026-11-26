@@ -33,17 +33,20 @@
           };
           sopsBin = "${pkgs.sops}/bin/sops";
           ageKeygenBin = "${pkgs.age}/bin/age-keygen";
+          gpgBin = "${pkgs.gnupg}/bin/gpg";
           commonArgs = {
             inherit src;
             strictDeps = true;
           };
           # Baked into the binary with option_env! (PLAN 10.2): installing
-          # secrit through Nix installs the exact sops and age-keygen it runs.
+          # secrit through Nix installs the exact sops, age-keygen and gpg it
+          # runs.
           # Kept out of buildDepsOnly, so a sops or age bump does not rebuild
           # the dependencies (NIX-2).
           bakedEnv = {
             SECRIT_SOPS_BIN = sopsBin;
             SECRIT_AGE_KEYGEN_BIN = ageKeygenBin;
+            SECRIT_GPG_BIN = gpgBin;
           };
           # The integration tests run the real tools against a temp dir only.
           testEnv = {
@@ -51,6 +54,9 @@
             SECRIT_TEST_AGE_KEYGEN = ageKeygenBin;
             SECRIT_TEST_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
             SECRIT_TEST_GIT = "${pkgs.git}/bin/git";
+            SECRIT_TEST_GPG = gpgBin;
+            SECRIT_TEST_PASS = "${pkgs.pass}/bin/pass";
+            SECRIT_TEST_GOPASS = "${pkgs.gopass}/bin/gopass";
             # The Secret Service fixture (v0.2 plan S10): a private session
             # bus and gnome-keyring per test, read back with secret-tool.
             SECRIT_TEST_DBUS_DAEMON = "${pkgs.dbus}/bin/dbus-daemon";
@@ -60,7 +66,9 @@
             SECRIT_TEST_SECRET_TOOL = "${pkgs.libsecret}/bin/secret-tool";
           };
           # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and
-          # git; dbus-daemon, gnome-keyring-daemon and secret-tool.
+          # git; gpg and gpgconf for the pass backend, pass and gopass for its
+          # interop tests (v0.2 plan S11), and dbus-daemon, gnome-keyring-daemon
+          # and secret-tool for the Secret Service fixture (S10).
           testTools = [
             pkgs.util-linux
             pkgs.openssh
@@ -70,6 +78,9 @@
             pkgs.dbus
             pkgs.gnome-keyring
             pkgs.libsecret
+            pkgs.gnupg
+            pkgs.pass
+            pkgs.gopass
           ];
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           secrit = craneLib.buildPackage (
@@ -184,6 +195,12 @@
                           backend = "secret-service";
                           collection = "default";
                           unlock = "refuse";
+                        };
+                        stores.pw = {
+                          backend = "pass";
+                          dir = "~/.password-store";
+                          prefix = "secrit";
+                          value = "first-line";
                         };
                         lock.timeout_secs = 5;
                       };

@@ -44,6 +44,7 @@ pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
             "removed {name}. secrit kept no backup, but the daemon may keep the old value in its own files; rotate it at its source if it leaked."
         ));
     }
+    ctx.commit_hint(name, "Remove");
     Ok(())
 }
 

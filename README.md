@@ -17,6 +17,14 @@ Read this first.
 - **A hostile process of your own user.** Such a process can run `sops decrypt` with your
   key, read `/run/secrets/*`, or read your terminal. secrit's agent and terminal rules
   prevent accidents. They are not a security boundary.
+- **An agent that works around the write gate.** The typed-name question stops accidents,
+  not an agent that wants to write. An agent can allocate a terminal, unset its variable
+  and start secrit outside its own process tree (for example with
+  `systemd-run --user --pty`), so detection finds no agent. An agent that drives a
+  terminal (a pty mode, `tmux send-keys`, terminal remote control) sees the question and
+  can type the name. A writer can type the answer after secrit discards the input typed
+  ahead. A direct `sops set`, `sops edit` or `git` change to the store file never meets
+  the gate. Some agents set no variable at all.
 - **Secret names are not secret.** sops keeps key names in cleartext, in the file and in
   git history. `secrit ls` prints them without a key.
 - **Copies outside secrit.** sops (a Go program) holds the value in memory that secrit
@@ -151,10 +159,79 @@ Paths must be absolute or start with `~/`. A configured `tools.sops` and the `.s
 must be owned by you, root or the Nix store, and neither the file nor its directory may be
 writable by group or others.
 
-**Keys.** secrit gives sops only an age key file (`SOPS_AGE_KEY_FILE`). sops runs with no
-usable `HOME`, so it never tries `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. Age keys from SSH
-keys, `SOPS_AGE_KEY` and `SOPS_AGE_KEY_CMD` are not used. A passphrase-protected key fails
-at once with a clear message; sops cannot prompt.
+**Keys.** secrit runs sops with a cleared environment and `HOME=/nonexistent`, so sops
+never tries `~/.ssh/id_ed25519`, `~/.ssh/id_rsa` or a key in an environment variable.
+sops gets only the key sources that the store names, each one as a path:
+
+| Store key | sops variable | Rules |
+|---|---|---|
+| `age_key_file` | `SOPS_AGE_KEY_FILE` | The default: `$XDG_CONFIG_HOME/sops/age/keys.txt`, when the store names no other key source. |
+| `age_ssh_key_file` | `SOPS_AGE_SSH_PRIVATE_KEY_FILE` | An OpenSSH ed25519 or RSA key with no passphrase, mode 0600, not a symlink. |
+| `age_key_cmd` | `SOPS_AGE_KEY_CMD` | An absolute path to an executable that prints age identities. No arguments, and no space, tab, quote, backslash or `#` in the path, because sops splits the string. The file and its directory must be yours, root's or the Nix store's, and not writable by group or others (exit 3). |
+| `age_plugin_dir` | `PATH` | A directory that holds only `age-plugin-*` programs, under the same ownership rule. sops gets this directory as its only `PATH`. |
+
+```toml
+[stores.main]
+backend = "sops"
+file = "/etc/nixos/secrets/secrit.yaml"
+age_ssh_key_file = "~/.ssh/sops_ed25519"     # optional
+age_key_cmd = "~/.local/bin/sops-age-key"    # optional
+age_key_cmd_timeout_secs = 20                # the default
+age_plugin_dir = "~/.local/lib/age-plugins"  # optional
+```
+
+sops never gets the terminal, so a key that asks for a passphrase or a PIN fails at once,
+and the message names the key source. A key command or a plugin that waits for another
+reason ends after `age_key_cmd_timeout_secs` (default 20 s), not after the usual 120 s.
+
+sops runs the key command each time it loads identities, so the command can run more than
+once for one sops run (for example, a second recipient is another try), and `store`
+runs sops twice (the write and the read-back check). Do not rely on a count of runs.
+It runs with the environment of sops: no terminal, `HOME=/nonexistent`, and no `PATH`
+(or only `age_plugin_dir` as `PATH`). So `pass`, `rbw`, `op` or `secret-tool` fail unless the command sets
+its own `PATH` and `HOME`. secrit does not widen the environment for it. Use an absolute
+interpreter, as in this wrapper; `doctor` warns about a `#!/usr/bin/env` line:
+
+```sh
+#!/run/current-system/sw/bin/bash
+# sops-age-key: prints one age identity for sops. Mode 0700.
+export PATH=/run/current-system/sw/bin HOME=/home/alice
+exec secret-tool lookup service sops-age
+```
+
+**Plugin identity.** A store can name one identity in its own table instead. Then the
+store must not set `age_key_file`, `age_ssh_key_file`, `age_key_cmd` or `age_plugin_dir`,
+and sops gets no other key:
+
+```toml
+[stores.vault.identity]
+kind = "plugin"                             # or "file", "ssh-file", "key-cmd" with `path`
+stub = "~/.config/secrit/yubikey.identity"  # the identity file that the plugin wrote
+plugin_dir = "~/.local/lib/age-plugins"     # holds age-plugin-yubikey
+level = "touch"                             # optional; default: the strictest this build supports
+touch_timeout_secs = 30                     # the default
+```
+
+For a plugin identity, secrit:
+
+- refuses each command that decrypts when there is no `/dev/tty` (exit 3);
+- refuses (exit 3) a stub file that holds a plain age key or that is larger than 16 KiB;
+- writes one line to `/dev/tty` before each sops run that decrypts, for example
+  `secrit: touch your key to read 'db_password' from vault (1 of 1)`;
+- ends a sops run that waits longer than `touch_timeout_secs`;
+- refuses (exit 3) a file with a fido2-hmac recipient of format version 2, a plain key
+  that you can read as a recipient (the default age key file, `~/.ssh/id_ed25519.pub` or
+  `~/.ssh/id_rsa.pub`), or a key type other than age;
+- for age-plugin-yubikey, reads the slot policy from `age-plugin-yubikey --list`. A slot
+  with touch policy `cached` is refused at every level. A level stricter than the slot is
+  an error, not a downgrade, for example
+  `level 'strict' needs PIN policy always; slot 1 on serial N has once`.
+
+This build serves the levels up to `touch`: touch policy `always` and PIN policy `never`.
+`session` and `strict` are refused after the slot check. secrit checks the slot policy of
+age-plugin-yubikey only; `doctor` says when it cannot check another plugin. A fido2-hmac
+key in its native X25519 form (`age1...`) looks like any other age key, so secrit cannot
+refuse it.
 
 ## Set up a store
 
@@ -305,7 +382,7 @@ secrit get github-token                # shows it on the alternate screen; any k
                                        # (a screen reader or recorder can see it too)
 secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused on a terminal
 
-secrit rm github-token                 # asks on the terminal; --yes to skip
+secrit rm github-token                 # asks on the terminal; --yes to skip (not under an agent)
 
 secrit run --file TOKEN_FILE=github-token -- some-cmd   # TOKEN_FILE=/dev/fd/N, a sealed memfd
 secrit run --env TOKEN=github-token -- some-cmd         # the value in the environment
@@ -320,6 +397,8 @@ secrit wire github-token --owner svc --format env   # GITHUB_TOKEN_FILE=/run/sec
 `doctor` checks the tools, the age key and its mode, the store file and directory, the
 `.sops.yaml` rule, cleartext entries, leftover temp copies and old backups, the backup
 directory, and the git state of the store file. It decrypts nothing and prints no value.
+It says what the write gate does when it detects an agent, and it warns when the binary
+was built with the `test-hooks` feature, which only the test suite uses.
 
 `--store NAME` picks another store from the config. `-q` prints errors only.
 
@@ -376,13 +455,28 @@ with the exit code of CMD once CMD has started.
   lists every leaf by its path (`a/b/c`), and an empty map by its own name.
 - **Values** are UTF-8 text up to 64 KiB, with no control characters except tab (and
   newline with `--multiline` or `--raw`). They are always stored as strings.
-- **Agents.** When a coding-agent variable is set and not empty (`CLAUDECODE`,
-  `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`,
-  `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE` or `OPENCODE_CLIENT`), `get` is refused. There is no override: an agent can set any
-  variable. With no terminal at all (`/dev/tty` cannot be opened, as in cron or
-  `ssh -T`), `get` is also refused. `run --env` and `run --no-mask` are refused in both
-  cases; `run --file` works and its output is always masked. `store`, `ls` and `rm --yes`
-  work.
+- **Agents.** secrit detects an agent when a coding-agent variable is set and not empty
+  (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX` (macOS
+  only), `CODEX_THREAD_ID`, `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE`, `OPENCODE`,
+  `OPENCODE_CLIENT` or `COPILOT_CLI`), in its own environment or in the environment of a
+  parent process (at most 64 levels up), or when there is no terminal at all (`/dev/tty`
+  cannot be opened, as in cron or `ssh -T`). There is no override: an agent can set any
+  variable. Under an agent, `get`, `run --env` and `run --no-mask` are refused; `run --file`
+  works and its output is always masked. The walk reads the environment that each
+  parent process had when it started. So a long-lived process that started in an agent
+  session (for example a terminal multiplexer server) makes every shell under it an agent.
+  The question and the `doctor` agent row name the pid and the name of that process. Start
+  that process again outside the agent session.
+- **The write gate.** Under an agent, `store`, `rm` and `init` ask on the terminal for the
+  secret name (the store name for `init`) and go on only when it is typed exactly. A `y`
+  does not confirm, and `rm --yes` still asks. secrit discards input that was typed before
+  the question. With no terminal they are refused with exit 3: CI or a remote job uses
+  `secrit seal`, a scheduled job runs as its own system service that reads an existing
+  secret (a service has no terminal either, so it cannot write the store: unattended
+  writes are not supported), and ssh uses `ssh -t`.
+  No variable, config key or flag turns the gate off. It stops accidents, not an agent
+  that works around it (see [What secrit does not protect
+  against](#what-secrit-does-not-protect-against)). `ls`, `doctor` and `wire` work.
 - **Terminal output.** `get` never writes a control character from the value to the
   terminal: it shows `\xNN` in reverse video instead. `ls` escapes names the same way.
 - **The write protocol.** secrit takes a lock in `$XDG_RUNTIME_DIR/secrit/`, copies the

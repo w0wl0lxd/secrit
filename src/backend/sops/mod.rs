@@ -9,6 +9,7 @@
 mod doctor;
 mod edit;
 mod format;
+mod keys;
 mod runner;
 
 use std::cell::Cell;
@@ -22,12 +23,15 @@ use self::format::{
     REGEX_RULES, Slot, has_plaintext, has_recipients, leaf_names, leaves, lookup, non_string_kind,
     path_text,
 };
+use self::keys::KeySources;
 use self::runner::{MAX_NEW_FILE_BYTES, Runner};
 use super::atomic::{self, FileStore};
 use super::{
     Backend, BackendError, Capabilities, DoctorCtx, Location, PutMode, Target, WireSource,
     WriteReport,
 };
+#[cfg(test)]
+use crate::config::SopsKeys;
 use crate::config::{BackendKind, Env, SopsStore};
 use crate::name::Name;
 use crate::paths;
@@ -81,17 +85,11 @@ impl SopsBackend {
             .sops_config
             .clone()
             .or_else(|| nearest_sops_config(file.dir()));
-        // sops's own default, made explicit because sops gets no real HOME.
-        let age_key_file = store
-            .age_key_file
-            .clone()
-            .or_else(|| paths::default_age_key_file(env));
-        let runner = Runner::new(
-            sops,
-            sops_config,
-            age_key_file.as_deref(),
-            file.dir().to_path_buf(),
-        );
+        // The key sources (v0.2 plan 6.2). With none, sops's own default
+        // age key file, made explicit because sops gets no real HOME.
+        let keys = KeySources::new(store, env);
+        let age_key_file = keys.age_key_file().map(Path::to_path_buf);
+        let runner = Runner::new(sops, sops_config, keys, file.dir().to_path_buf());
         Ok(Self {
             location: Location::File(store.file.clone()),
             store: file,
@@ -99,6 +97,14 @@ impl SopsBackend {
             runner,
             age_key_file,
         })
+    }
+
+    /// The store name in the touch line of a plugin identity (v0.2 S8).
+    /// Without it, the line names the file stem.
+    #[must_use]
+    pub fn with_store_name(mut self, name: &str) -> Self {
+        self.runner.keys_mut().set_label(name);
+        self
     }
 
     /// The git sample and the `.gitignore` pattern of this store's temp
@@ -304,6 +310,9 @@ impl Backend for SopsBackend {
 
     fn check_put(&self, name: &Name, mode: PutMode) -> Result<(), BackendError> {
         let doc = self.read_doc_to_write()?;
+        // v0.2 S8: key source checks; set and readback decrypt.
+        self.runner.keys().preflight(&doc.meta)?;
+        self.runner.keys().plan(2);
         let existed = self.check_path(name, &doc.entries, true)?;
         if mode == PutMode::CreateOnly && existed {
             return Err(self.exists_error(name));
@@ -314,6 +323,9 @@ impl Backend for SopsBackend {
 
     fn check_remove(&self, name: &Name) -> Result<(), BackendError> {
         let doc = self.read_doc_to_write()?;
+        // v0.2 S8: key source checks. The touch plan is set by the write
+        // itself, which knows whether an ancestor is pruned too.
+        self.runner.keys().preflight(&doc.meta)?;
         if !self.check_path(name, &doc.entries, false)? {
             return Err(self.missing_error(name));
         }
@@ -322,6 +334,9 @@ impl Backend for SopsBackend {
 
     fn get_many(&self, names: &[Name]) -> Result<Vec<(Name, SecretValue)>, BackendError> {
         let (bytes, doc) = self.read_doc()?;
+        // v0.2 S8: key source checks; one decrypt per name.
+        self.runner.keys().preflight(&doc.meta)?;
+        self.runner.keys().plan(names.len());
         for n in names {
             let path: Vec<&str> = n.segments().collect();
             let Slot::Value(entry) = lookup(&doc.entries, &path) else {
@@ -528,6 +543,7 @@ mod tests {
             format: None,
             sops_config: None,
             age_key_file: None,
+            keys: SopsKeys::default(),
         };
         let (of_store, of_backend) = (TempIgnore::of(&store), b.temp_ignore());
         assert_eq!(of_store.sample, of_backend.sample);
@@ -553,6 +569,7 @@ mod tests {
                 format,
                 sops_config: None,
                 age_key_file: None,
+                keys: SopsKeys::default(),
             };
             SopsBackend::new(&store, "/nonexistent/sops".into(), Duration::ZERO, &|_| {
                 None
@@ -734,6 +751,7 @@ mod tests {
             format: None,
             sops_config: None,
             age_key_file: None,
+            keys: SopsKeys::default(),
         };
         SopsBackend::new(&store, "/nonexistent/sops".into(), Duration::ZERO, &|_| {
             None

@@ -88,6 +88,38 @@ All notable changes to this project are recorded here. The format follows
 - README: the screen (Kitty remote control, a screen recorder or share) can read a
   revealed value; sops is dumpable again after exec, so `PR_SET_DUMPABLE=0` covers secrit
   only; v0.1 has no clipboard support; all ten agent variables are listed.
+- sops key sources (v0.2 plan S8): `age_ssh_key_file` (an SSH key with no passphrase),
+  `age_key_cmd` (an absolute, trusted program; `age_key_cmd_timeout_secs`, default 20)
+  and `age_plugin_dir` (the only `PATH` that sops gets; it holds only trusted
+  `age-plugin-*` programs). An unsafe key command or plugin directory exits 3.
+- A `[stores.NAME.identity]` table with `kind` `file`, `ssh-file`, `key-cmd` or `plugin`.
+  A plugin identity never falls back to the age key file, needs `/dev/tty`, writes one
+  touch line per decrypting sops run, and uses `touch_timeout_secs` (default 30) as the
+  sops deadline. It refuses a fido2-hmac v2 recipient, a plain key that the user can
+  read, a non-age key type, a YubiKey slot with touch policy `cached`, and a `level`
+  stricter than the slot. This build serves levels up to `touch`. A stub file that holds
+  a plain age key, or that is larger than 16 KiB, exits 3. A store name shows in the
+  touch line with its control characters escaped, and a run that secrit refuses before
+  sops starts writes no touch line.
+- `doctor` rows for the SSH key (owner, mode and passphrase, from the key header only),
+  the key command (trust rule and shebang), the plugin directory and the plugin identity.
+  `doctor` runs `age-plugin-yubikey --list` only from a plugin directory that passes the
+  trust rule.
+- The write gate (owner ruling Q13(b), PLAN-v0.2 section 4). Under agent detection,
+  `store` (also `--replace`), `rm` (also `--yes`) and `init` (once, before its first write)
+  ask on `/dev/tty` for the name: `an agent runs secrit (CLAUDECODE is set). To store
+  'NAME' in FILE, type the name:`. `init` asks for the store name and lists the files it
+  creates and the recipients. Only the exact name confirms; anything else exits 3 with
+  `not confirmed`. secrit discards input typed before the question. `store` asks after its
+  checks and before it reads the value.
+- With no terminal, `store`, `rm` and `init` exit 3 with `refused: no terminal to confirm
+  on. CI or a remote job: use 'secrit seal'. A scheduled job: run it as its own system
+  service. Over ssh: use ssh -t.` (owner ruling Q19). No variable, config key or flag
+  turns this off. So a write from cron, a systemd unit or CI is refused.
+- `secrit --version` prints `features: test-hooks`, and `doctor` shows a `warn` row
+  `build: test hooks are compiled in`, when the test hooks are compiled in. The flake check
+  `release-features` fails when the package's `--version` names `test-hooks`.
+- README "What secrit does not protect against" lists the ways around the write gate.
 - `secrit run [--file VAR=NAME]... [--env VAR=NAME]... [--pristine] [--no-mask] -- CMD`
   (v0.2, Linux). It reads every value first, then starts CMD. `--file` hands a value
   through a sealed memfd named `secrit` (`VAR=/dev/fd/N`, readable more than once).
@@ -160,10 +192,28 @@ All notable changes to this project are recorded here. The format follows
   `store x_unencrypted` still exit 3 before a value is read. `get` and `rm` no longer
   refuse such a name by its form: `get sops` and `rm sops` say that it does not exist,
   and `rm x_unencrypted` removes a cleartext entry of that name.
+- The message for a sops run that stopped to ask on the terminal names the configured key
+  source, not "v0.1 supports only an age key file". A key command that fails because it
+  needs `PATH` gets a note on the cleared environment. A run that hits the shorter key
+  source deadline says what it may wait on.
+- The default age key file applies only when the store names no other key source.
 - The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
   `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML
   store, so `doctor` passes it there; for a JSON store, `doctor` warns and names the new
   line.
+- Agent detection adds `OPENCODE` and `COPILOT_CLI`, and reads the environment of the
+  ancestor processes through `/proc` (at most 64 levels). A variable that an agent removes
+  only for secrit (`env -u CLAUDECODE secrit ...`) is still found in its shell; the
+  question then names that process. `get` uses the same detection. Each environment
+  goes through one fixed 64 KiB buffer that is wiped, at most 4 MiB per process. A
+  process reports the environment it had at start, so a long-lived process that started
+  in an agent session (for example a terminal multiplexer server) makes every shell under
+  it an agent. The README says how to find and restart it.
+- `rm` with no terminal and no `--yes` prints the Q19 text above instead of `pass --yes to
+  remove without asking`.
+- The `doctor` agent row says what the gate does: `get` and `run --env` are off; every
+  decrypt of a gated store is off; `store`, `rm`, `generate` and `init` need the typed
+  name, or are off with no terminal; `seal` works.
 - Internal refactor for v0.2 backends, with no change to the config format, the messages
   or the exit codes. A `[stores.NAME]` table now parses to one settings type per
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a

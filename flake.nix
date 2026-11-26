@@ -48,25 +48,54 @@
             SECRIT_AGE_KEYGEN_BIN = ageKeygenBin;
             SECRIT_GPG_BIN = gpgBin;
           };
+          # The age-plugin-unencrypted example of rage: a stand-in for a
+          # hardware plugin in the plugin identity tests (v0.2 plan S8). It
+          # wraps the file key with no secret, so it needs no token.
+          agePluginUnencrypted = pkgs.rage.overrideAttrs (old: {
+            pname = "age-plugin-unencrypted";
+            cargoBuildFlags = [
+              "-p"
+              "age-plugin"
+              "--example"
+              "age-plugin-unencrypted"
+            ];
+            doCheck = false;
+            nativeBuildInputs = builtins.filter (
+              p: (p.pname or "") != "installShellFiles"
+            ) old.nativeBuildInputs;
+            postBuild = "";
+            preInstall = "";
+            postInstall = "";
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 -t $out/bin "$(find target -path '*/release/examples/age-plugin-unencrypted' -type f | head -n1)"
+              runHook postInstall
+            '';
+            meta = old.meta // {
+              mainProgram = "age-plugin-unencrypted";
+            };
+          });
           # The integration tests run the real tools against a temp dir only.
           testEnv = {
             SECRIT_TEST_SOPS = sopsBin;
             SECRIT_TEST_AGE_KEYGEN = ageKeygenBin;
             SECRIT_TEST_SSH_KEYGEN = "${pkgs.openssh}/bin/ssh-keygen";
             SECRIT_TEST_GIT = "${pkgs.git}/bin/git";
+            SECRIT_TEST_AGE_PLUGIN_UNENCRYPTED = "${agePluginUnencrypted}/bin/age-plugin-unencrypted";
             SECRIT_TEST_GPG = gpgBin;
             SECRIT_TEST_PASS = "${pkgs.pass}/bin/pass";
             SECRIT_TEST_GOPASS = "${pkgs.gopass}/bin/gopass";
           };
           # script, setsid and kill (util-linux), ssh-keygen, stty, cmp and
-          # git; gpg and gpgconf for the pass backend, and pass and gopass for
-          # its interop tests (v0.2 plan S11).
+          # git; the test age plugin; gpg and gpgconf for the pass backend, and
+          # pass and gopass for its interop tests (v0.2 plan S11).
           testTools = [
             pkgs.util-linux
             pkgs.openssh
             pkgs.coreutils
             pkgs.diffutils
             pkgs.git
+            agePluginUnencrypted
             pkgs.gnupg
             pkgs.pass
             pkgs.gopass
@@ -226,6 +255,19 @@
             inherit (p) src;
             cargoDenyChecks = "bans licenses sources";
           };
+
+          # T54: the package that ships has no test hooks. A `test-hooks`
+          # build names the feature in `--version` (PLAN-v0.2 4.3).
+          release-features = pkgs.runCommand "secrit-release-features" { } ''
+            ${p.secrit}/bin/secrit --version > version
+            cat version
+            grep -q '^secrit ' version
+            if grep -q test-hooks version; then
+              echo "the package has the test-hooks feature" >&2
+              exit 1
+            fi
+            touch $out
+          '';
 
           # PF-2: the module installs the package and writes a config that
           # secrit accepts. secrit parses the generated file (unknown keys are

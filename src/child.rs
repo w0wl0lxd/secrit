@@ -184,7 +184,8 @@ fn read_capped(
 /// Poll the child without reaping it (`WNOWAIT`), so its pid stays valid
 /// for the group kill that follows.
 fn wait_child(pid: Pid, overflow: &AtomicBool, timeout: Duration) -> Result<(), ChildError> {
-    let deadline = Instant::now() + timeout;
+    // A timeout that Instant cannot add is no deadline at all.
+    let deadline = Instant::now().checked_add(timeout);
     loop {
         let exited = match waitid(
             WaitId::Pid(pid),
@@ -209,7 +210,7 @@ fn wait_child(pid: Pid, overflow: &AtomicBool, timeout: Duration) -> Result<(), 
         if overflow.load(Ordering::SeqCst) {
             return Err(ChildError::Overflow);
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(ChildError::Timeout);
         }
         std::thread::sleep(POLL);

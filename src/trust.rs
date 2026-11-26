@@ -1,6 +1,7 @@
 //! Ownership and mode checks for files that steer secrit but are not the
 //! store file: a configured `tools.sops` binary (SEC-10) and the `.sops.yaml`
-//! that secrit passes to sops (SEC-12).
+//! that secrit passes to sops (SEC-12), and the sops key sources of v0.2
+//! (plan 6.2): a key command and an age plugin directory.
 //!
 //! The rule: after symlinks are followed, the file is a regular file owned by
 //! this user or root, and neither the file nor its directory is writable by
@@ -80,6 +81,47 @@ pub fn check_file(path: &Path) -> Result<PathBuf, TrustError> {
     Ok(target)
 }
 
+/// [`check_file`], and the owner may execute the file (v0.2 plan 6.2: a
+/// key command or an age plugin).
+pub fn check_executable(path: &Path) -> Result<PathBuf, TrustError> {
+    let target = check_file(path)?;
+    let meta = std::fs::metadata(&target)?;
+    if meta.mode() & 0o100 == 0 {
+        return Err(TrustError::Unsafe("not executable by its owner"));
+    }
+    Ok(target)
+}
+
+/// The rule of [`check_file`] for a directory that secrit searches, such
+/// as `age_plugin_dir` (v0.2 plan 6.2). The directory itself must not be
+/// writable by group or others, sticky or not: anyone who can add a file
+/// there could add a plugin. Its parent may be sticky.
+pub fn check_dir(path: &Path) -> Result<PathBuf, TrustError> {
+    let target = std::fs::canonicalize(path)?;
+    let meta = std::fs::metadata(&target)?;
+    if !meta.is_dir() {
+        return Err(TrustError::Unsafe("not a directory"));
+    }
+    if !owner_ok(&target, &meta) {
+        return Err(TrustError::Unsafe("owned by another user"));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(TrustError::Unsafe("writable by group or others"));
+    }
+    if let Some(parent) = target.parent() {
+        let pmeta = std::fs::metadata(parent)?;
+        if !owner_ok(parent, &pmeta) {
+            return Err(TrustError::Unsafe("its parent is owned by another user"));
+        }
+        if pmeta.mode() & 0o022 != 0 && pmeta.mode() & STICKY == 0 {
+            return Err(TrustError::Unsafe(
+                "its parent is writable by group or others",
+            ));
+        }
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +171,58 @@ mod tests {
         assert!(!nix_store_owner_ok(p, 65534, 0o755, 65534));
         let outside = Path::new("/tmp/nix/store/x");
         assert!(!nix_store_owner_ok(outside, 65534, 0o555, 65534));
+    }
+
+    #[test]
+    fn executables_need_the_owner_execute_bit() {
+        let d = tempfile::tempdir().unwrap();
+        chmod(d.path(), 0o700);
+        let f = d.path().join("cmd");
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        chmod(&f, 0o600);
+        assert!(matches!(
+            check_executable(&f),
+            Err(TrustError::Unsafe("not executable by its owner"))
+        ));
+        chmod(&f, 0o700);
+        assert!(check_executable(&f).is_ok());
+        chmod(&f, 0o720);
+        assert!(matches!(
+            check_executable(&f),
+            Err(TrustError::Unsafe("writable by group or others"))
+        ));
+    }
+
+    #[test]
+    fn a_searched_directory_is_private() {
+        let d = tempfile::tempdir().unwrap();
+        chmod(d.path(), 0o755);
+        let p = d.path().join("plugins");
+        std::fs::create_dir(&p).unwrap();
+        chmod(&p, 0o700);
+        assert!(check_dir(&p).is_ok());
+        chmod(&p, 0o1777);
+        assert!(matches!(
+            check_dir(&p),
+            Err(TrustError::Unsafe("writable by group or others"))
+        ));
+        chmod(&p, 0o700);
+        chmod(d.path(), 0o777);
+        assert!(matches!(
+            check_dir(&p),
+            Err(TrustError::Unsafe(
+                "its parent is writable by group or others"
+            ))
+        ));
+        chmod(d.path(), 0o1777);
+        assert!(check_dir(&p).is_ok());
+        chmod(d.path(), 0o700);
+        let f = p.join("f");
+        std::fs::write(&f, "").unwrap();
+        assert!(matches!(
+            check_dir(&f),
+            Err(TrustError::Unsafe("not a directory"))
+        ));
     }
 
     #[test]

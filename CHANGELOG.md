@@ -247,9 +247,9 @@ All notable changes to this project are recorded here. The format follows
 - `wire` exits 3 on a store that is not a sops store, for every format, and prints no
   stanza. `store` prints the `secrit wire` hint only for a sops store.
 - A key of another backend in a `[stores.NAME]` table is an error that names the key and
-  the backend, for example `config key stores.desk.file does not apply to backend
-  secret-service`. `wire_hint` applies to a sops store only. A sops store with no `file` gives `config key stores.NAME.file is
-  required for backend sops`.
+  the backend, for example `config key stores.desk.file does not apply to the
+  secret-service backend; remove it`. `wire_hint` applies to a sops store only. A sops store with no `file` gives `config key stores.NAME.file is
+  required for the sops backend`.
 - Internal refactor for v0.2 backends, with no change to the config format, the messages
   or the exit codes. A `[stores.NAME]` table now parses to one settings type per
   `backend` value, and each type refuses unknown keys. Every command and `doctor` build a

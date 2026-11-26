@@ -311,6 +311,40 @@ fn the_typed_name_confirms_a_write_with_no_backup_under_an_agent() {
     assert_eq!(f.read_back("n"), None);
 }
 
+/// Under an agent, `--yes` does not confirm a replace: an item that another
+/// process makes while the person types the name stays (T55, PLAN-v0.2 4.2).
+#[test]
+fn yes_under_an_agent_keeps_an_item_made_meanwhile() {
+    let f = fixture();
+    let d = f.dirs();
+    let mut agent = d.gate_cmd();
+    agent
+        .env("CLAUDECODE", "1")
+        .env("SECRIT_TEST_HOOK", "after-lock=pause")
+        .env("SECRIT_TEST_HOOK_DIR", d.hook_dir());
+    let bin = common::sh_quote(std::path::Path::new(common::BIN));
+    let inner = format!("printf mine | {bin} store n --replace --yes");
+    let out = std::thread::scope(|s| {
+        let run = s.spawn(|| d.under_script_answer(&agent, &inner, b"type the name: ", b"n\n"));
+        d.wait_for_hook(1);
+        f.tool_store("n", b"theirs");
+        std::fs::write(d.hook_dir().join("go"), b"").unwrap();
+        run.join().unwrap()
+    });
+    let t = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code(&out), 3, "{t}");
+    assert!(
+        t.contains("appeared while secrit waited; nothing was replaced"),
+        "{t}"
+    );
+    assert!(!t.contains("or pass --yes"), "{t}");
+    assert_eq!(f.item_count("n"), 1);
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"theirs"[..]),
+        "the other item changed"
+    );
+}
+
 /// The doctor rows of v0.2 plan 6.3, and the same-uid reader note (T29).
 /// No store uses sops, so a missing sops is a warning only.
 #[test]

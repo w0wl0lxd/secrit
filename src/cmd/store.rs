@@ -65,10 +65,12 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
                 confirm_replace(ctx, name, args.yes)?;
             }
             no_backup = true;
-        } else if !args.yes {
-            // Nothing was confirmed, so the write must not replace an item
-            // that another process makes before it (T55, Q37). The backend
-            // checks again under its lock.
+        } else if !args.yes || gated == Gated::Confirmed {
+            // Nothing confirmed the loss of a value, so the write must not
+            // replace an item that another process makes before it (T55, Q37).
+            // Under an agent the typed name confirmed a new item only, and
+            // `--yes` does not count (4.2, step 6). The backend checks again
+            // under its lock.
             write_mode = PutMode::CreateOnly;
         }
     }
@@ -81,8 +83,15 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     drop(value);
     let report = match written {
         Err(BackendError::Exists { .. }) if write_mode != put_mode => {
+            // Under an agent `--yes` does not confirm, so only a new run that
+            // shows the no-backup note in the gate question can.
+            let yes = if gated == Gated::Confirmed {
+                ""
+            } else {
+                ", or pass --yes"
+            };
             return Err(Error::Refused(format!(
-                "'{name}' appeared while secrit waited; nothing was replaced. {} keeps no backup, so run the command again to confirm the replace, or pass --yes",
+                "'{name}' appeared while secrit waited; nothing was replaced. {} keeps no backup, so run the command again to confirm the replace{yes}",
                 ctx.backend.location()
             )));
         }

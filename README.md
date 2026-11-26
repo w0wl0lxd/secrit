@@ -367,8 +367,9 @@ exists and is unlocked. Then it writes the config section. It creates nothing in
   ask for `y` on the terminal, even for you. `--yes` skips the question. Under an agent
   the typed name of [the write gate](#rules-secrit-enforces) replaces the `y`, and with no
   terminal the write gate refuses them. When the name is free, `store --replace` asks
-  nothing. If another process makes the name before secrit writes, secrit keeps that item
-  and exits 3; run the command again to confirm the replace.
+  nothing more. If another process makes the name before secrit writes, secrit keeps that
+  item and exits 3; run the command again to confirm the replace. Only `--yes` with no
+  agent replaces that item; under an agent, `--yes` does not.
 - **Create only.** Without `--replace`, secrit searches, creates and searches again under
   its lock, so parallel `store` runs make one item. Another program can still add an item
   with the same attributes; then `get` exits 1 and names the count.

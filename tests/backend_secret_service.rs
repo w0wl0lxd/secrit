@@ -156,11 +156,15 @@ fn unlock_prompt_is_refused_for_agents() {
     );
     ok(&f.dirs().store_value("n", b"v"));
     f.lock_values();
-    let mut cmd = f.dirs().cmd();
-    cmd.env("CLAUDECODE", "1");
-    let out = run_cmd(cmd, ["store", "m"], Some(b"v"));
-    assert_eq!(code(&out), 3, "{}", stderr(&out));
-    assert!(stderr(&out).contains("is locked"), "{}", stderr(&out));
+    // On a terminal, the agent variable is the only reason to refuse.
+    let inner = format!(
+        "CLAUDECODE=1 exec {} store m",
+        common::env::sh_quote(std::path::Path::new(common::BIN))
+    );
+    let out = f.dirs().under_script_with(&inner, b"");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code(&out), 3, "{text}");
+    assert!(text.contains("is locked"), "{text}");
     // No terminal counts as an agent too.
     let mut cmd = no_tty(&f.dirs().cmd());
     cmd.args(["store", "m"]);
@@ -284,6 +288,15 @@ fn init_writes_a_secret_service_config() {
     assert!(stderr(&out).contains("--sops-file apply only to a sops store"));
     assert!(!d.config_file.exists());
 
+    // `--format` is a sops flag too: it is refused, not dropped.
+    let out = d.run(
+        ["init", "--backend", "secret-service", "--format", "json"],
+        None,
+    );
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(stderr(&out).contains("--format apply only to a sops store"));
+    assert!(!d.config_file.exists());
+
     let out = d.run(["init", "--backend", "secret-service"], None);
     ok(&out);
     assert!(stderr(&out).contains("is reachable and unlocked (0 secrit items)"));
@@ -304,7 +317,7 @@ fn init_writes_a_secret_service_config() {
     );
     let out = d.run(["init", "--backend", "sops"], None);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
-    assert!(stderr(&out).contains("with backend secret-service"));
+    assert!(stderr(&out).contains("with the secret-service backend"));
 }
 
 /// R13: a signal while a D-Bus call is blocked exits 130 through the
@@ -315,7 +328,7 @@ fn a_signal_during_a_blocked_call_exits_130() {
     let f = fixture();
     let d = f.dirs();
     let mut cmd = d.cmd();
-    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause")
+    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause,in-wait=pause")
         .env("SECRIT_TEST_HOOK_DIR", d.hook_dir())
         .args(["store", "n"])
         .stdin(Stdio::piped())
@@ -327,7 +340,8 @@ fn a_signal_during_a_blocked_call_exits_130() {
     // The daemon stops answering; secrit's next D-Bus call blocks.
     f.signal_keyring("STOP");
     std::fs::write(d.hook_dir().join("go"), b"").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(700));
+    // The second hook line shows that the child is inside the D-Bus wait.
+    d.wait_for_hook(2);
     let st = std::process::Command::new(common::bin("kill"))
         .args(["-INT", &child.id().to_string()])
         .status()
@@ -403,7 +417,7 @@ fn wire_is_refused_on_a_secret_service_store() {
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     assert!(
         stderr(&out)
-            .contains("config key stores.main.wire_hint does not apply to backend secret-service"),
+            .contains("config key stores.main.wire_hint does not apply to the secret-service backend; remove it"),
         "{}",
         stderr(&out)
     );

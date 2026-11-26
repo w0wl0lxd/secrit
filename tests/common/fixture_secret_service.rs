@@ -20,6 +20,31 @@ const KEYRING_PASSWORD: &[u8] = b"secrit-fixture";
 /// The object path of the login collection, which `default` names.
 pub const LOGIN_COLLECTION: &str = "/org/freedesktop/secrets/collection/login";
 
+/// A daemon that is killed and reaped when this goes out of scope, from the
+/// moment of the spawn. Rust does not stop or reap a child by itself.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        // `Child::kill` sends SIGKILL, which also ends a stopped child.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The programs that the fixture runs.
 pub struct Tools {
     pub dbus_daemon: PathBuf,
@@ -62,8 +87,8 @@ pub struct SecretServiceFixture {
     /// The bus socket: `<XDG_RUNTIME_DIR>/bus`.
     pub bus: PathBuf,
     data_home: PathBuf,
-    dbus: Child,
-    keyring: Option<Child>,
+    dbus: Reaped,
+    keyring: Option<Reaped>,
 }
 
 impl SecretServiceFixture {
@@ -95,8 +120,11 @@ impl SecretServiceFixture {
     /// A `dbus-send --print-reply` call on the fixture bus.
     pub fn dbus_send(&self, dest: &str, path: &str, method: &str, args: &[&str]) -> Output {
         let mut c = self.helper(&self.tools.dbus_send);
+        // A bus that stops answering must not block a probe for the default
+        // 25 s reply wait.
         c.arg("--session")
             .arg("--print-reply")
+            .arg("--reply-timeout=2000")
             .arg(format!("--dest={dest}"))
             .arg(path)
             .arg(method)
@@ -131,11 +159,13 @@ impl SecretServiceFixture {
             .stdin(if login { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = c.spawn().expect("start gnome-keyring-daemon");
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(KEYRING_PASSWORD).unwrap();
+        // The fixture owns the daemon before anything can panic.
+        self.keyring = Some(Reaped(c.spawn().expect("start gnome-keyring-daemon")));
+        if let Some(mut stdin) = self.keyring.as_mut().and_then(|k| k.stdin.take()) {
+            stdin
+                .write_all(KEYRING_PASSWORD)
+                .expect("write the keyring password");
         }
-        self.keyring = Some(child);
         let control = self.dirs.runtime.join("keyring").join("control");
         wait_for("the gnome-keyring control socket", || control.exists());
         // Lab V24: only `--start` registers org.freedesktop.secrets.
@@ -155,8 +185,14 @@ impl SecretServiceFixture {
 
     fn stop_keyring(&mut self) {
         if let Some(mut k) = self.keyring.take() {
-            signal(&k, "TERM");
-            let _ = k.wait();
+            // TERM first. A failed signal, or a daemon that is still up at
+            // the deadline, is killed and reaped when `k` drops.
+            if signal(&k, "TERM") {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while k.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
         }
         wait_for("org.freedesktop.secrets to leave the bus", || {
             !self.secrets_owned()
@@ -178,22 +214,23 @@ impl SecretServiceFixture {
     }
 
     /// The `attribute.secrit-name` values of every item of store `main`,
-    /// from `secret-tool search`. Its other output (the values) is dropped
-    /// unread.
+    /// from `secret-tool search`. The tool prints attributes on stderr and
+    /// values on stdout, so only stderr is parsed and stdout is dropped
+    /// unread. A failed search is a failure here, not an empty store.
     fn search_names(&self, extra: &[&str]) -> Vec<String> {
         let mut c = self.helper(&self.tools.secret_tool);
         c.args(["search", "--all", "secrit-store", "main"])
             .args(extra);
         let out = Self::output(c);
-        let mut names: Vec<String> = [&out.stdout, &out.stderr]
-            .into_iter()
-            .flat_map(|b| {
-                String::from_utf8_lossy(b)
-                    .lines()
-                    .filter_map(|l| l.strip_prefix("attribute.secrit-name = "))
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
+        assert!(
+            out.status.success(),
+            "secret-tool search failed with {}",
+            out.status
+        );
+        let mut names: Vec<String> = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter_map(|l| l.strip_prefix("attribute.secrit-name = "))
+            .map(str::to_owned)
             .collect();
         names.sort();
         names
@@ -232,12 +269,22 @@ impl SecretServiceFixture {
         assert!(child.wait().expect("wait for secret-tool").success());
     }
 
-    /// `secret-tool lookup` with `attrs`; `None` when no item matches.
+    /// `secret-tool lookup` with `attrs`; `None` when no item matches. The
+    /// tool exits 1 for no match (with no message) and for a service error
+    /// (with a message on stderr); an error panics here.
     pub fn lookup(&self, attrs: &[&str]) -> Option<Vec<u8>> {
         let mut c = self.helper(&self.tools.secret_tool);
         c.arg("lookup").args(attrs);
         let out = Self::output(c);
-        out.status.success().then_some(out.stdout)
+        if out.status.success() {
+            return Some(out.stdout);
+        }
+        assert!(
+            out.stderr.is_empty(),
+            "secret-tool lookup failed with {}",
+            out.status
+        );
+        None
     }
 }
 
@@ -268,6 +315,8 @@ impl Fixture for SecretServiceFixture {
             .stderr(Stdio::null())
             .spawn()
             .expect("start dbus-daemon");
+        // Owned from the spawn, so a failed wait still kills it.
+        let dbus = Reaped(dbus);
         wait_for("the fixture bus socket", || bus.exists());
         let mut address = OsString::from("unix:path=");
         address.push(&bus);
@@ -328,29 +377,33 @@ impl Fixture for SecretServiceFixture {
 
 impl Drop for SecretServiceFixture {
     fn drop(&mut self) {
-        if let Some(k) = self.keyring.as_mut() {
-            signal(k, "CONT");
-            let _ = k.kill();
-            let _ = k.wait();
-        }
+        // The keyring first, then the bus; both before the temp dir goes.
+        self.keyring = None;
         let _ = self.dbus.kill();
         let _ = self.dbus.wait();
     }
 }
 
-/// `kill -<sig> <pid>` with util-linux or coreutils `kill`.
-fn signal(child: &Child, sig: &str) {
-    let _ = Command::new(bin("kill"))
+/// `kill -<sig> <pid>` with util-linux or coreutils `kill`; whether it
+/// worked.
+fn signal(child: &Child, sig: &str) -> bool {
+    Command::new(bin("kill"))
         .arg(format!("-{sig}"))
         .arg(child.id().to_string())
-        .status();
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
-/// Poll `ready` every 20 ms, at most 20 s.
+/// Poll `ready` every 20 ms, at most 20 s. A probe that returns after the
+/// deadline fails the wait, even when it succeeds.
 fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !ready() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+    loop {
+        let done = ready();
+        assert!(Instant::now() <= deadline, "timed out waiting for {what}");
+        if done {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

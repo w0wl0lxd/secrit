@@ -142,14 +142,20 @@ fn steps(
         escape(&keygen.path.to_string_lossy())
     ));
 
-    // 2. Age key.
-    let Some(key) = backend.age_key_file().map(Path::to_path_buf) else {
-        return Err(Error::Usage(
-            "no age key path: pass --age-key, or set HOME or XDG_CONFIG_HOME".into(),
-        ));
-    };
-    let recipients = age_key(&keygen.path, &key, &out)?;
-    interrupted()?;
+    // The gate lists the store file only when it is absent now.
+    let store_planned = !sops_store.file.exists();
+
+    // 2. Age key, and the write gate before the first write.
+    let recipients = key_and_gate(
+        &backend,
+        &keygen.path,
+        sops_store,
+        &store.name,
+        &config_file,
+        existing.is_none(),
+        args,
+        &out,
+    )?;
 
     // 3 and 4. The store file, and the .sops.yaml it needs when it is new.
     if sops_store.file.exists() {
@@ -160,6 +166,14 @@ fn steps(
             facts.names
         ));
     } else {
+        if !store_planned && !args.dry_run {
+            // The write gate did not list this file: it was removed after the
+            // plan. A new gate decision must cover it.
+            return Err(Error::Failed(format!(
+                "the store file {} was removed while init ran; run 'secrit init' again",
+                escape_path(&sops_store.file)
+            )));
+        }
         let backend = sops_config(
             backend,
             sops_store,
@@ -181,6 +195,123 @@ fn steps(
     // 6. Next steps.
     next_steps(sops_store, &env, &out)?;
     interrupted()
+}
+
+/// Step 2 of `init`: the age key and its recipients, with the write gate
+/// asked once before the first write.
+#[allow(clippy::too_many_arguments, reason = "one step of init, called once")]
+fn key_and_gate(
+    backend: &SopsBackend,
+    keygen: &Path,
+    sops_store: &SopsStore,
+    store_name: &str,
+    config_file: &Path,
+    config_is_new: bool,
+    args: &InitArgs,
+    out: &Out,
+) -> Result<Vec<String>, Error> {
+    let Some(key) = backend.age_key_file().map(Path::to_path_buf) else {
+        return Err(Error::Usage(
+            "no age key path: pass --age-key, or set HOME or XDG_CONFIG_HOME".into(),
+        ));
+    };
+    // An existing key is only read, so its recipients can go into the
+    // question of the write gate, which comes before the first write.
+    let key_exists = !matches!(
+        std::fs::symlink_metadata(&key),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let known = if key_exists {
+        Some(existing_key(keygen, &key, Some(out))?)
+    } else {
+        None
+    };
+    interrupted()?;
+    if !args.dry_run {
+        let plan = WritePlan {
+            key: (!key_exists).then_some(key.as_path()),
+            store_file: (!sops_store.file.exists()).then_some(sops_store.file.as_path()),
+            sops_config: args.write_sops_config,
+            config: config_is_new.then_some(config_file),
+        };
+        gate(store_name, &plan, known.as_deref())?;
+    }
+    let recipients = match known {
+        // The gate waited on the operator: the key must still be the one
+        // that the question showed.
+        Some(shown) => {
+            let now = existing_key(keygen, &key, None)?;
+            if now != shown {
+                return Err(Error::Failed(format!(
+                    "the age key {} changed while init waited for the confirmation; run 'secrit init' again",
+                    escape_path(&key)
+                )));
+            }
+            now
+        }
+        None => age_key(keygen, &key, out)?,
+    };
+    interrupted()?;
+    Ok(recipients)
+}
+
+/// The files that this run creates, for the write gate question.
+struct WritePlan<'a> {
+    key: Option<&'a Path>,
+    store_file: Option<&'a Path>,
+    /// `--write-sops-config`: a `.sops.yaml` when none covers the new file.
+    sops_config: bool,
+    config: Option<&'a Path>,
+}
+
+impl WritePlan<'_> {
+    fn creates(&self) -> Vec<String> {
+        let mut c = Vec::new();
+        if let Some(k) = self.key {
+            c.push(format!("the age key {}", escape_path(k)));
+        }
+        if let Some(f) = self.store_file {
+            c.push(format!("the store file {}", escape_path(f)));
+            if self.sops_config {
+                c.push("a .sops.yaml when none covers the store file".to_owned());
+            }
+        }
+        if let Some(p) = self.config {
+            c.push(format!("the config {}", escape_path(p)));
+        }
+        c
+    }
+}
+
+/// The write gate of `init` (PLAN-v0.2 4.1): once, before the first write,
+/// and only when the run writes a file. The question lists the files and
+/// the recipients, because `.sops.yaml` decides the recipients of a new
+/// store file (4.2, step 3). The answer is the store name.
+fn gate(store: &str, plan: &WritePlan<'_>, recipients: Option<&[String]>) -> Result<(), Error> {
+    let creates = plan.creates();
+    if creates.is_empty() {
+        return Ok(());
+    }
+    let mut keys = match recipients {
+        Some(r) => format!("the age key has the recipients {}", r.join(", ")),
+        None => "a new age key becomes the recipient".to_owned(),
+    };
+    if plan.store_file.is_some() {
+        keys.push_str(
+            "; the creation rule in .sops.yaml decides the recipients of the new store file",
+        );
+    }
+    super::write_gate(
+        |agent| {
+            format!(
+                "an agent runs secrit ({agent}). init will create {}. Recipients: {keys}. To set up store '{}', type the store name: ",
+                creates.join(", "),
+                escape(store)
+            )
+        },
+        store,
+    )
+    .map(|_| ())
 }
 
 /// The name of the store that this run sets up.
@@ -438,28 +569,57 @@ fn run_keygen(cmd: Command, cap: usize, what: &str) -> Result<child::ChildOutput
     }
 }
 
+/// The checks on an existing age key file: a regular file of mine, mode 0600,
+/// not empty.
+fn check_key_file(key: &Path, shown: &str, m: &std::fs::Metadata) -> Result<(), Error> {
+    if !m.is_file() {
+        return Err(Error::Refused(format!(
+            "the age key {shown} is a symlink or not a regular file"
+        )));
+    }
+    if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o077 != 0 {
+        return Err(Error::Refused(format!(
+            "the age key {shown} must be yours with mode 0600; run 'chmod 600 {}'",
+            shell_path(key)
+        )));
+    }
+    if m.len() == 0 {
+        return Err(Error::Refused(format!(
+            "the age key {shown} is empty, so it holds no key; remove it ('rm {}') and run 'secrit init' again",
+            shell_path(key)
+        )));
+    }
+    Ok(())
+}
+
+/// The recipients of an age key that must already exist. It never creates
+/// the key, so it is safe before the write gate: a key that vanished is an
+/// error, not a new key made with no confirmation.
+fn existing_key(keygen: &Path, key: &Path, out: Option<&Out>) -> Result<Vec<String>, Error> {
+    let shown = escape(&key.to_string_lossy()).into_owned();
+    match std::fs::symlink_metadata(key) {
+        Ok(m) => {
+            check_key_file(key, &shown, &m)?;
+            if let Some(out) = out {
+                out.note(&format!("age key {shown} exists; unchanged"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::Failed(format!(
+                "the age key {shown} was removed while init ran; run 'secrit init' again"
+            )));
+        }
+        Err(e) => return Err(Error::Failed(format!("{shown}: {e}"))),
+    }
+    recipients_of(keygen, key, &shown, out)
+}
+
 /// Use the key at `key`, or create it. Returns its public recipients.
 fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
     let shown = escape(&key.to_string_lossy()).into_owned();
     match std::fs::symlink_metadata(key) {
         Ok(m) => {
-            if !m.is_file() {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} is a symlink or not a regular file"
-                )));
-            }
-            if m.uid() != rustix::process::getuid().as_raw() || m.mode() & 0o077 != 0 {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} must be yours with mode 0600; run 'chmod 600 {}'",
-                    shell_path(key)
-                )));
-            }
-            if m.len() == 0 {
-                return Err(Error::Refused(format!(
-                    "the age key {shown} is empty, so it holds no key; remove it ('rm {}') and run 'secrit init' again",
-                    shell_path(key)
-                )));
-            }
+            check_key_file(key, &shown, &m)?;
             out.note(&format!("age key {shown} exists; unchanged"));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -479,6 +639,15 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
         }
         Err(e) => return Err(Error::Failed(format!("{shown}: {e}"))),
     }
+    recipients_of(keygen, key, &shown, Some(out))
+}
+
+fn recipients_of(
+    keygen: &Path,
+    key: &Path,
+    shown: &str,
+    out: Option<&Out>,
+) -> Result<Vec<String>, Error> {
     let mut cmd = keygen_command(keygen);
     cmd.arg("-y").arg(key);
     let found = run_keygen(cmd, MAX_RECIPIENTS_BYTES, "-y")?;
@@ -493,7 +662,9 @@ fn age_key(keygen: &Path, key: &Path, out: &Out) -> Result<Vec<String>, Error> {
             "age-keygen -y found no age recipient in {shown}"
         )));
     }
-    out.note(&format!("age recipient: {}", recipients.join(", ")));
+    if let Some(out) = out {
+        out.note(&format!("age recipient: {}", recipients.join(", ")));
+    }
     Ok(recipients)
 }
 

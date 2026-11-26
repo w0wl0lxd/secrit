@@ -242,6 +242,13 @@ fn with_git(env: &TestEnv) -> Command {
     c
 }
 
+/// [`with_git`] with the write gate in force.
+fn gated_with_git(env: &TestEnv) -> Command {
+    let mut c = with_git(env);
+    c.env_remove("SECRIT_TEST_GATE");
+    c
+}
+
 fn git(env: &TestEnv, repo: &Path, args: &[&str]) {
     let st = Command::new(common::git())
         .env_clear()
@@ -1005,7 +1012,8 @@ fn doctor_fails_each_store_check() {
 /// v0.2 plan S3: the sops module split moves the store rows out of the
 /// doctor command and changes no row. This pins every row of a full setup
 /// (a value, a backup, a git repository with a flake) in order. The
-/// hardening rows depend on the host, so the test drops them. The status of
+/// hardening rows depend on the host, so the test drops them; it also drops
+/// the build row that a test build adds (pinned elsewhere). The status of
 /// the agent and tool rows depends on the host and the build, so the test
 /// compares only their names.
 #[test]
@@ -1024,7 +1032,7 @@ fn doctor_rows_keep_their_order() {
     let host_dependent = ["agent", "sops", "age-keygen"];
     let got: Vec<(String, String)> = rows(&out)
         .into_iter()
-        .filter(|(c, _)| c != "hardening")
+        .filter(|(c, _)| c != "hardening" && c != "build")
         .map(|(c, s)| {
             let s = if host_dependent.contains(&c.as_str()) {
                 "*".to_owned()
@@ -1053,4 +1061,99 @@ fn doctor_rows_keep_their_order() {
     ]
     .map(|(c, s)| (c.to_owned(), s.to_owned()));
     assert_eq!(got, want, "{}", stdout(&out));
+}
+
+/// T27, Q19: with no terminal, `init` is refused before its first write,
+/// with or without an agent variable.
+#[test]
+fn init_is_refused_without_a_terminal() {
+    let env = TestEnv::new();
+    let f = Fresh::new(&env, "notty");
+    for agent in [false, true] {
+        let mut base = gated_with_git(&env);
+        base.env("SECRIT_CONFIG", &f.config);
+        if agent {
+            base.env("CLAUDECODE", "1");
+        }
+        let args = [
+            "init",
+            "--sops-file",
+            f.file.to_str().unwrap(),
+            "--age-key",
+            f.key.to_str().unwrap(),
+            "--write-sops-config",
+        ];
+        let out = run_cmd(common::no_tty(&base), args, None);
+        assert_eq!(code(&out), 3, "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("refused: no terminal to confirm on."),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!f.key.exists() && !f.file.exists() && !f.config.exists());
+    }
+}
+
+/// T27: under an agent, `init` asks once for the store name and lists what
+/// it creates, then sets up the store.
+#[test]
+fn init_under_an_agent_asks_for_the_store_name() {
+    let env = TestEnv::new();
+    let f = Fresh::new(&env, "agent");
+    let mut base = gated_with_git(&env);
+    base.env("SECRIT_CONFIG", &f.config).env("CLAUDECODE", "1");
+    let inner = format!(
+        "'{}' init --sops-file '{}' --age-key '{}' --write-sops-config",
+        common::BIN,
+        f.file.display(),
+        f.key.display()
+    );
+    let out = env.under_script_answer(&base, &inner, b"type the store name: ", b"main\n");
+    let t = stdout(&out);
+    assert_eq!(code(&out), 0, "{t}");
+    assert_eq!(t.matches("type the store name").count(), 1, "{t}");
+    assert!(t.contains("a new age key"), "{t}");
+    assert!(f.key.exists() && f.file.exists() && f.config.exists());
+}
+
+/// T54: a `test-hooks` build shows a `warn` row; a normal build shows none.
+#[test]
+fn doctor_warns_when_test_hooks_are_compiled_in() {
+    let env = TestEnv::new();
+    let out = env.run(["doctor", "--json"], None);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let r = rows(&out);
+    let want: &[&str] = if cfg!(feature = "test-hooks") {
+        &["warn"]
+    } else {
+        &[]
+    };
+    assert_eq!(status_of(&r, "build"), want, "{r:?}");
+    if cfg!(feature = "test-hooks") {
+        assert!(stdout(&out).contains("test hooks are compiled in"));
+    }
+}
+
+/// The `doctor` agent row says what the gate does (PLAN-v0.2 S1b).
+#[test]
+fn doctor_agent_row_names_the_write_gate() {
+    let env = TestEnv::new();
+    let mut cmd = env.cmd();
+    cmd.env("CLAUDECODE", "1");
+    let out = run_cmd(cmd, ["doctor"], None);
+    let t = stdout(&out);
+    assert!(
+        t.contains("agent: agent detected (CLAUDECODE is set)"),
+        "{t}"
+    );
+    assert!(t.contains("'get' and 'run --env' are off"), "{t}");
+    assert!(
+        t.contains("every decrypt of a gated store is off, with no typed-name path"),
+        "{t}"
+    );
+    assert!(
+        t.contains("'store', 'rm', 'generate' and 'init' need the name typed on the terminal, or are off with no terminal"),
+        "{t}"
+    );
+    assert!(t.contains("'seal' works"), "{t}");
 }

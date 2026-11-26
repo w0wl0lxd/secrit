@@ -28,7 +28,7 @@ use crate::display::escape;
 use crate::name::{DOTENV_METADATA_PREFIX, Name, NameError, RESERVED};
 
 /// The recipient keys of the sops metadata.
-const KEY_TYPES: &[&str] = &[
+pub(super) const KEY_TYPES: &[&str] = &[
     "age",
     "pgp",
     "kms",

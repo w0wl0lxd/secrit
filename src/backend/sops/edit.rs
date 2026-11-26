@@ -51,6 +51,8 @@ impl FileEdit for SopsEdit<'_> {
     fn precheck(&self, original: &[u8]) -> Result<(SopsDoc, bool), BackendError> {
         let b = self.backend;
         let doc = b.format.parse_to_write(original, b.store.file())?;
+        // v0.2 S8: the recipients may have changed since the check.
+        b.runner.keys().preflight(&doc.meta)?;
         let put = matches!(self.op, Op::Put(..));
         let existed = b.check_path(self.name, &doc.entries, put)?;
         match self.op {
@@ -61,7 +63,11 @@ impl FileEdit for SopsEdit<'_> {
             Op::Put(..) => b.check_cleartext_rules(self.name, &doc.meta)?,
             Op::Remove => {
                 let path: Vec<&str> = self.name.segments().collect();
-                self.prune.set(prune_depth(&doc.entries, &path));
+                let depth = prune_depth(&doc.entries, &path);
+                self.prune.set(depth);
+                // One unset for the name, and one more for a pruned
+                // ancestor: each decrypts, so each is a touch.
+                b.runner.keys().plan(1 + usize::from(depth.is_some()));
             }
         }
         Ok((doc, existed))

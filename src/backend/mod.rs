@@ -2,13 +2,14 @@
 //! factory that builds a store's backend from the config.
 
 pub mod atomic;
+pub mod pass;
 pub mod sops;
 
 use std::fmt;
 use std::path::PathBuf;
 
 use crate::config::{BackendConfig, BackendKind, Config, Env, StoreConfig, ToolSetting};
-use crate::display::escape_path;
+use crate::display::{escape, escape_path};
 use crate::error::{Error, Exit};
 use crate::lock::LockError;
 use crate::name::{Name, NameError};
@@ -16,6 +17,7 @@ use crate::report::Report;
 use crate::secret::SecretValue;
 use crate::tools::{self, Program, ResolvedTool, ToolSource};
 
+use self::pass::PassBackend;
 use self::sops::{SopsBackend, SopsFormat};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,12 @@ pub trait Backend {
     /// What `wire` can tell a consumer about NAME, if anything (v0.2 plan
     /// 5.7). Must not decrypt.
     fn wire_source(&self, name: &Name) -> Option<WireSource>;
+    /// The file of `name` that `store` and `rm` name in the git commands
+    /// they print, for a store that is often its own git repository.
+    /// secrit never commits (v0.2 plan 6.4, Q25).
+    fn commit_hint(&self, _name: &Name) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Where a consumer such as sops-nix reads a secret (v0.2 plan 5.7).
@@ -160,6 +168,15 @@ pub fn open_with(
                     .with_store_name(&store.name),
             ))
         }
+        BackendConfig::Pass(pass) => {
+            let path = tool(tools::GPG, &config.tools.gpg)?;
+            Ok(Box::new(PassBackend::new(
+                pass,
+                path,
+                config.lock_timeout,
+                env,
+            )?))
+        }
     }
 }
 
@@ -182,13 +199,15 @@ pub const MAX_RETRIES: usize = 3;
 pub enum Location {
     /// One file that holds every name.
     File(PathBuf),
+    /// A directory with one file per name.
+    Dir(PathBuf),
 }
 
 /// Control characters are escaped, so a path cannot drive the terminal.
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Location::File(p) => f.write_str(&escape_path(p)),
+            Location::File(p) | Location::Dir(p) => f.write_str(&escape_path(p)),
         }
     }
 }
@@ -353,6 +372,36 @@ pub enum BackendError {
         path: PathBuf,
         need: &'static str,
     },
+    #[error(
+        "the store directory {} does not exist; create the store first (for example 'pass init KEY')",
+        escape_path(.0)
+    )]
+    NoStoreDir(PathBuf),
+    #[error(
+        "no .gpg-id in {} or above it in the store, so the entry has no recipients; run 'pass init KEY' first",
+        escape_path(.0)
+    )]
+    NoGpgId(PathBuf),
+    /// `entry` is one line of the `.gpg-id` at `path`.
+    #[error("{}: recipient '{}' {reason}", escape_path(path), escape(entry))]
+    Recipient {
+        path: PathBuf,
+        entry: String,
+        reason: &'static str,
+    },
+    #[error("neither gnupg_home, GNUPGHOME nor HOME is an absolute path; secrit needs one for gpg")]
+    NoGnupgHome,
+    #[error(
+        "gpg needs the passphrase of the secret key for {target}, and secrit lets no pinentry start. Cache the passphrase in gpg-agent first (decrypt any entry in a terminal, or use gpg-preset-passphrase), or set pinentry = \"agent\" for this store"
+    )]
+    NeedsPassphrase { target: Target },
+    /// The store cannot hold the value; `reason` names the store option.
+    #[error("refusing to store '{name}' in {location}: {reason}")]
+    ValueRefused {
+        name: Name,
+        location: Location,
+        reason: &'static str,
+    },
 }
 
 impl BackendError {
@@ -363,6 +412,7 @@ impl BackendError {
             | BackendError::KeyPath { .. }
             | BackendError::Capability { .. }
             | BackendError::Unsafe { .. }
+            | BackendError::ValueRefused { .. }
             | BackendError::Name(_)
             | BackendError::CleartextRule { .. }
             | BackendError::Lock(LockError::UnsafeDir { .. }) => Exit::Refused,

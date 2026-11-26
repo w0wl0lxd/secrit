@@ -142,38 +142,17 @@ fn steps(
         escape(&keygen.path.to_string_lossy())
     ));
 
-    // 2. Age key.
-    let Some(key) = backend.age_key_file().map(Path::to_path_buf) else {
-        return Err(Error::Usage(
-            "no age key path: pass --age-key, or set HOME or XDG_CONFIG_HOME".into(),
-        ));
-    };
-    // An existing key is only read, so its recipients can go into the
-    // question of the write gate, which comes before the first write.
-    let key_exists = !matches!(
-        std::fs::symlink_metadata(&key),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-    );
-    let known = if key_exists {
-        Some(age_key(&keygen.path, &key, &out)?)
-    } else {
-        None
-    };
-    interrupted()?;
-    if !args.dry_run {
-        let plan = WritePlan {
-            key: (!key_exists).then_some(key.as_path()),
-            store_file: (!sops_store.file.exists()).then_some(sops_store.file.as_path()),
-            sops_config: args.write_sops_config,
-            config: existing.is_none().then_some(config_file.as_path()),
-        };
-        gate(&store.name, &plan, known.as_deref())?;
-    }
-    let recipients = match known {
-        Some(r) => r,
-        None => age_key(&keygen.path, &key, &out)?,
-    };
-    interrupted()?;
+    // 2. Age key, and the write gate before the first write.
+    let recipients = key_and_gate(
+        &backend,
+        &keygen.path,
+        sops_store,
+        &store.name,
+        &config_file,
+        existing.is_none(),
+        args,
+        &out,
+    )?;
 
     // 3 and 4. The store file, and the .sops.yaml it needs when it is new.
     if sops_store.file.exists() {
@@ -205,6 +184,53 @@ fn steps(
     // 6. Next steps.
     next_steps(sops_store, &env, &out)?;
     interrupted()
+}
+
+/// Step 2 of `init`: the age key and its recipients, with the write gate
+/// asked once before the first write.
+#[allow(clippy::too_many_arguments, reason = "one step of init, called once")]
+fn key_and_gate(
+    backend: &SopsBackend,
+    keygen: &Path,
+    sops_store: &SopsStore,
+    store_name: &str,
+    config_file: &Path,
+    config_is_new: bool,
+    args: &InitArgs,
+    out: &Out,
+) -> Result<Vec<String>, Error> {
+    let Some(key) = backend.age_key_file().map(Path::to_path_buf) else {
+        return Err(Error::Usage(
+            "no age key path: pass --age-key, or set HOME or XDG_CONFIG_HOME".into(),
+        ));
+    };
+    // An existing key is only read, so its recipients can go into the
+    // question of the write gate, which comes before the first write.
+    let key_exists = !matches!(
+        std::fs::symlink_metadata(&key),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let known = if key_exists {
+        Some(age_key(keygen, &key, out)?)
+    } else {
+        None
+    };
+    interrupted()?;
+    if !args.dry_run {
+        let plan = WritePlan {
+            key: (!key_exists).then_some(key.as_path()),
+            store_file: (!sops_store.file.exists()).then_some(sops_store.file.as_path()),
+            sops_config: args.write_sops_config,
+            config: config_is_new.then_some(config_file),
+        };
+        gate(store_name, &plan, known.as_deref())?;
+    }
+    let recipients = match known {
+        Some(r) => r,
+        None => age_key(keygen, &key, out)?,
+    };
+    interrupted()?;
+    Ok(recipients)
 }
 
 /// The files that this run creates, for the write gate question.

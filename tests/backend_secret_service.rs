@@ -328,7 +328,7 @@ fn a_signal_during_a_blocked_call_exits_130() {
     let f = fixture();
     let d = f.dirs();
     let mut cmd = d.cmd();
-    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause,in-wait=pause")
+    cmd.env("SECRIT_TEST_HOOK", "after-lock=pause,in-wait=log")
         .env("SECRIT_TEST_HOOK_DIR", d.hook_dir())
         .args(["store", "n"])
         .stdin(Stdio::piped())
@@ -336,12 +336,15 @@ fn a_signal_during_a_blocked_call_exits_130() {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(b"v").unwrap();
-    d.wait_for_hook(1);
+    // Line 1 is the wait of the check before the write; line 2 is the
+    // pause after the lock.
+    d.wait_for_hook(2);
     // The daemon stops answering; secrit's next D-Bus call blocks.
     f.signal_keyring("STOP");
     std::fs::write(d.hook_dir().join("go"), b"").unwrap();
-    // The second hook line shows that the child is inside the D-Bus wait.
-    d.wait_for_hook(2);
+    // The third hook line shows that the child is inside the D-Bus wait of
+    // the write.
+    d.wait_for_hook(3);
     let st = std::process::Command::new(common::bin("kill"))
         .args(["-INT", &child.id().to_string()])
         .status()

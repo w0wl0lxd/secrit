@@ -21,7 +21,10 @@
 //!   steps inside a [`Critical`] section: a signal exits 130, and no answer
 //!   in 120 s exits 1. Both go through the normal error path, so the lock is
 //!   released and secrit's buffers are zeroized. The abandoned thread ends
-//!   with the process.
+//!   with the process. A writing thread owns the store lock, so the lock
+//!   stays held while that thread can still change the daemon, and the thread
+//!   checks a cancel flag before each change: work that has not started
+//!   never starts, and a call already sent has an unknown outcome.
 //! - **Locked collection.** Refused with [`BackendError::Locked`], unless the
 //!   config says `unlock = "prompt"` and no agent is detected (Q30). `ls`
 //!   reads names from the item attributes and works while the daemon shows
@@ -40,6 +43,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -167,10 +172,7 @@ impl SecretServiceBackend {
             .bus
             .clone()
             .map_err(|reason| BackendError::UnsafeBus { reason })?;
-        let step = Step {
-            name: step,
-            location: self.location.clone(),
-        };
+        let step = Step::new(step, self.location.clone());
         let collection = self.collection.clone();
         // Ask the daemon to unlock only when the config allows it and no
         // agent runs secrit (Q30): the prompt is the owner's to answer.
@@ -254,9 +256,33 @@ enum Need {
 struct Step {
     name: &'static str,
     location: Location,
+    /// Set when the caller stopped waiting (a signal or the deadline). The
+    /// worker checks it before each call that changes the daemon, so work
+    /// that has not started never starts.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Step {
+    fn new(name: &'static str, location: Location) -> Self {
+        Self {
+            name,
+            location,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Refuse to start a change once the caller has stopped waiting. A call
+    /// that was already sent has an unknown outcome and is not covered.
+    fn before_change(&self) -> Result<(), BackendError> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(BackendError::DaemonInterrupted {
+                daemon: DAEMON,
+                step: self.name,
+            });
+        }
+        Ok(())
+    }
+
     fn failed(&self, what: String) -> BackendError {
         BackendError::Daemon {
             daemon: DAEMON,
@@ -289,18 +315,31 @@ fn wait<T>(
     deadline: Duration,
 ) -> Result<T, BackendError> {
     let _critical = Critical::enter();
+    testhook::hook("in-wait");
     let end = Instant::now() + deadline;
     loop {
         match rx.recv_timeout(STEP) {
-            Ok(result) => return result,
-            Err(RecvTimeoutError::Timeout) => {
+            Ok(result) => {
+                // A signal that arrived while the reply was on its way still
+                // ends the command with 130; the call has already run.
                 if signals::pending() {
                     return Err(BackendError::DaemonInterrupted {
                         daemon: DAEMON,
                         step: step.name,
                     });
                 }
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if signals::pending() {
+                    step.cancelled.store(true, Ordering::SeqCst);
+                    return Err(BackendError::DaemonInterrupted {
+                        daemon: DAEMON,
+                        step: step.name,
+                    });
+                }
                 if Instant::now() >= end {
+                    step.cancelled.store(true, Ordering::SeqCst);
                     return Err(step.failed(format!(
                         "no answer within {} s; the daemon may be waiting for an unlock prompt",
                         deadline.as_secs()
@@ -666,60 +705,99 @@ impl Backend for SecretServiceBackend {
         value: &SecretValue,
         mode: PutMode,
     ) -> Result<WriteReport, BackendError> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
         testhook::hook("after-lock");
         let store = self.store.clone();
         let label = label(name);
         let key = name.as_str().to_owned();
         // The thread may outlive this call (signal or deadline), so it gets
-        // its own copy, wiped when the thread drops it.
+        // its own copy, wiped when the thread drops it. It also owns the
+        // lock: a worker that is still running keeps other secrit writers
+        // out until it ends.
         let secret = Zeroizing::new(value.expose().to_vec());
-        let created = self.call("write", Need::Unlocked, move |c, step| {
+        let outcome = self.call("write", Need::Unlocked, move |c, step| {
+            let _lock = lock;
             let attrs = attributes(&store, Some(&key));
+            let found = c
+                .search_items(attrs.clone())
+                .map_err(|e| step.err(e))?
+                .len();
+            if found > 1 {
+                // The daemon would replace one of them, and `get` would
+                // still refuse the name: change nothing.
+                return Ok(Put::Ambiguous(found));
+            }
             if mode == PutMode::Replace {
+                step.before_change()?;
                 c.create_item(&label, attrs, &secret, true, CONTENT_TYPE)
                     .map_err(|e| step.err(e))?;
-                return Ok(true);
+                return Ok(Put::Done);
             }
             // CreateOnly: the daemon does not refuse a duplicate by itself,
             // so search, create, and search again (T32).
-            if !c
-                .search_items(attrs.clone())
-                .map_err(|e| step.err(e))?
-                .is_empty()
-            {
-                return Ok(false);
+            if found > 0 {
+                return Ok(Put::Exists);
             }
+            step.before_change()?;
             let item = c
                 .create_item(&label, attrs.clone(), &secret, false, CONTENT_TYPE)
                 .map_err(|e| step.err(e))?;
-            if c.search_items(attrs).map_err(|e| step.err(e))?.len() > 1 {
+            let after = match c.search_items(attrs) {
+                Ok(items) => items.len(),
+                Err(e) => {
+                    // The item exists, so a retry would refuse. Take back
+                    // only the item that this call made.
+                    let cause = step.err(e);
+                    return Err(match item.delete() {
+                        Ok(()) => cause,
+                        Err(_) => step.failed(format!(
+                            "{cause}; the new item for '{key}' may remain in the collection: check for it before you retry"
+                        )),
+                    });
+                }
+            };
+            if after > 1 {
                 // Another program made the same name meanwhile: keep theirs.
                 item.delete().map_err(|e| step.err(e))?;
-                return Ok(false);
+                return Ok(Put::Exists);
             }
-            Ok(true)
+            Ok(Put::Done)
         })?;
-        if created {
-            Ok(WriteReport::default())
-        } else {
-            Err(self.exists_error(name))
+        match outcome {
+            Put::Done => Ok(WriteReport::default()),
+            Put::Exists => Err(self.exists_error(name)),
+            Put::Ambiguous(n) => Err(Step::new("write", self.location.clone())
+            .failed(format!(
+                "{n} items hold '{name}'; secrit changed none of them. Remove the extra ones (for example with seahorse or secret-tool)"
+            ))),
         }
     }
 
     fn remove(&self, name: &Name) -> Result<WriteReport, BackendError> {
-        let _lock = self.lock()?;
+        let lock = self.lock()?;
         testhook::hook("after-lock");
         let store = self.store.clone();
         let key = name.as_str().to_owned();
         let removed = self.call("delete", Need::Unlocked, move |c, step| {
+            let _lock = lock;
             let items = c
                 .search_items(attributes(&store, Some(&key)))
                 .map_err(|e| step.err(e))?;
-            for item in &items {
-                item.delete().map_err(|e| step.err(e))?;
+            let total = items.len();
+            for (done, item) in items.iter().enumerate() {
+                step.before_change()?;
+                if let Err(e) = item.delete() {
+                    let cause = step.err(e);
+                    return Err(if done == 0 {
+                        cause
+                    } else {
+                        step.failed(format!(
+                            "removed {done} of {total} items for '{key}' before an error, and secrit keeps no backup: {cause}"
+                        ))
+                    });
+                }
             }
-            Ok(items.len())
+            Ok(total)
         })?;
         if removed == 0 {
             return Err(self.missing(name));
@@ -730,6 +808,16 @@ impl Backend for SecretServiceBackend {
     fn doctor(&self, r: &mut Report, ctx: &DoctorCtx<'_>) {
         doctor_rows(r, self, ctx.store);
     }
+}
+
+/// How a `put` call ended in the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Put {
+    Done,
+    /// Create-only, and the name is taken.
+    Exists,
+    /// More than one item holds the name; nothing changed.
+    Ambiguous(usize),
 }
 
 /// What `doctor` learns from the daemon, one result per row.
@@ -819,10 +907,7 @@ fn doctor_rows(r: &mut Report, b: &SecretServiceBackend, store: &str) {
         }
         Ok(bus) => {
             r.add(row("bus"), Status::Ok, crate::display::escape_path(bus));
-            let step = Step {
-                name: "doctor",
-                location: b.location.clone(),
-            };
+            let step = Step::new("doctor", b.location.clone());
             let (tx, rx) = mpsc::channel();
             let (bus, collection, owner) = (bus.clone(), b.collection.clone(), b.store.clone());
             let worker_step = step.clone();
@@ -867,10 +952,17 @@ fn facts_rows(r: &mut Report, b: &SecretServiceBackend, store: &str, facts: Doct
             Status::Ok,
             format!("{shown} is unlocked"),
         ),
-        Ok(true) if b.unlock == Unlock::Prompt => r.add(
+        Ok(true) if b.unlock == Unlock::Prompt && agent::detect().is_none() => r.add(
             row("collection"),
             Status::Warn,
             format!("{shown} is locked; secrit asks the daemon to unlock it (unlock = \"prompt\")"),
+        ),
+        Ok(true) if b.unlock == Unlock::Prompt => r.add(
+            row("collection"),
+            Status::Fail,
+            format!(
+                "{shown} is locked; unlock = \"prompt\" cannot ask here (an agent is detected or there is no terminal): unlock it outside secrit"
+            ),
         ),
         Ok(true) => r.add(
             row("collection"),
@@ -1082,10 +1174,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         // A peer that hangs up at once, so a handshake fails fast.
         std::thread::spawn(move || drop(listener.accept()));
-        let step = Step {
-            name: "doctor",
-            location: Location::collection("default", "main"),
-        };
+        let step = Step::new("doctor", Location::collection("default", "main"));
         let other: PeerUid = |_| Ok(rustix::process::getuid().as_raw().wrapping_add(1));
         let facts = doctor_facts_with(&sock, "default", "main", &step, other);
         let reason = facts.reachable.as_ref().unwrap_err().clone();
@@ -1128,10 +1217,7 @@ mod tests {
     /// The wait gives the result, or ends at the deadline with exit 1.
     #[test]
     fn the_wait_ends_at_the_deadline() {
-        let step = Step {
-            name: "read",
-            location: Location::collection("default", "desk"),
-        };
+        let step = Step::new("read", Location::collection("default", "desk"));
         let (tx, rx) = mpsc::channel::<Result<u8, BackendError>>();
         tx.send(Ok(7)).unwrap();
         assert_eq!(wait(&rx, &step, Duration::from_millis(300)).unwrap(), 7);
@@ -1149,10 +1235,7 @@ mod tests {
     /// only, and secrit escapes it.
     #[test]
     fn daemon_errors_name_the_step() {
-        let step = Step {
-            name: "write",
-            location: Location::collection("default", "desk"),
-        };
+        let step = Step::new("write", Location::collection("default", "desk"));
         assert_eq!(
             step.err(secret_service::Error::Locked).to_string(),
             "Secret Service collection 'default' (secrit-store=desk) is locked; unlock it (log in to the desktop session, or use the keyring manager), or set unlock = \"prompt\" in the config"

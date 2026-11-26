@@ -113,6 +113,8 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             cmd::rm::run(&ctx_for(&name)?, &name, yes)
         }
         Command::Init {
+            backend,
+            pass_dir,
             sops_file,
             format,
             sops_config,
@@ -124,6 +126,11 @@ fn dispatch(cli: Cli, hardened: harden::HardenReport) -> Result<Ended, Error> {
             store.as_deref(),
             quiet,
             &cmd::init::InitArgs {
+                backend: backend.map(|b| match b {
+                    cli::InitBackend::Sops => crate::config::BackendKind::Sops,
+                    cli::InitBackend::Pass => crate::config::BackendKind::Pass,
+                }),
+                pass_dir,
                 sops_file,
                 format,
                 sops_config,

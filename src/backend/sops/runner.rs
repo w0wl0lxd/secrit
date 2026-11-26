@@ -374,7 +374,7 @@ const MAX_STDERR_LINES: usize = 20;
 /// where a short value sits in otherwise fixed text (SEC-15). The rest is
 /// escaped and cut to [`MAX_STDERR_LINES`] lines; a note says how many more
 /// there were.
-fn redact(stderr: &[u8], secrets: &[&[u8]]) -> String {
+pub fn redact(stderr: &[u8], secrets: &[&[u8]]) -> String {
     let mut needles: Vec<&[u8]> = Vec::new();
     for s in secrets.iter().filter(|s| !s.is_empty()) {
         needles.push(s);

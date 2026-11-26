@@ -12,18 +12,20 @@ use crate::trust::{self, TrustError};
 
 pub const BAKED_SOPS: Option<&str> = option_env!("SECRIT_SOPS_BIN");
 pub const BAKED_AGE_KEYGEN: Option<&str> = option_env!("SECRIT_AGE_KEYGEN_BIN");
+pub const BAKED_GPG: Option<&str> = option_env!("SECRIT_GPG_BIN");
 
 /// The text of `secrit --version`: the version and the baked-in tool paths.
-/// It also keeps both store paths in the binary, so the Nix closure carries
-/// `age` as the README says (NIX-1).
+/// It also keeps the store paths in the binary, so the Nix closure carries
+/// `age` and `gnupg` as the README says (NIX-1).
 #[must_use]
 pub fn long_version() -> String {
     let show = |p: Option<&'static str>| p.unwrap_or("not baked in (resolved from config or PATH)");
     format!(
-        "{}\nsops: {}\nage-keygen: {}",
+        "{}\nsops: {}\nage-keygen: {}\ngpg: {}",
         env!("CARGO_PKG_VERSION"),
         show(BAKED_SOPS),
-        show(BAKED_AGE_KEYGEN)
+        show(BAKED_AGE_KEYGEN),
+        BAKED_GPG.unwrap_or("not baked in (set tools.gpg in the config)")
     )
 }
 
@@ -33,6 +35,15 @@ pub enum ToolError {
         "{program} not found; install it (for example 'nix profile add nixpkgs#sops nixpkgs#age') or set tools.{key} in the config"
     )]
     NotFound {
+        program: &'static str,
+        key: &'static str,
+    },
+    /// A tool that secrit does not look up on `PATH` (v0.2 plan 6.4: gpg
+    /// until the `PATH` trust rule of S16).
+    #[error(
+        "{program} has no configured or baked-in path; set tools.{key} in the config to an absolute path, or install secrit with Nix"
+    )]
+    NotConfigured {
         program: &'static str,
         key: &'static str,
     },
@@ -67,18 +78,29 @@ pub struct Program {
     pub name: &'static str,
     pub config_key: &'static str,
     pub baked: Option<&'static str>,
+    /// Whether `"auto"` falls back to `PATH`.
+    pub path_fallback: bool,
 }
 
 pub const SOPS: Program = Program {
     name: "sops",
     config_key: "sops",
     baked: BAKED_SOPS,
+    path_fallback: true,
 };
 
 pub const AGE_KEYGEN: Program = Program {
     name: "age-keygen",
     config_key: "age_keygen",
     baked: BAKED_AGE_KEYGEN,
+    path_fallback: true,
+};
+
+pub const GPG: Program = Program {
+    name: "gpg",
+    config_key: "gpg",
+    baked: BAKED_GPG,
+    path_fallback: false,
 };
 
 /// Resolve `program` by the rules above. `path_env` is the value of `PATH`.
@@ -110,6 +132,12 @@ pub fn resolve(
         return Ok(ResolvedTool {
             path: b.to_path_buf(),
             source: ToolSource::Baked,
+        });
+    }
+    if !program.path_fallback {
+        return Err(ToolError::NotConfigured {
+            program: program.name,
+            key: program.config_key,
         });
     }
     let not_found = || ToolError::NotFound {
@@ -150,7 +178,26 @@ mod tests {
             name: "secrit-fake-tool",
             config_key: "sops",
             baked,
+            path_fallback: true,
         }
+    }
+
+    /// gpg comes from the config or the build only (v0.2 plan 6.4).
+    #[test]
+    fn a_tool_without_path_fallback_ignores_path() {
+        let d = tempfile::tempdir().unwrap();
+        fake_bin(d.path(), "secrit-fake-tool");
+        let strict = Program {
+            path_fallback: false,
+            ..program(Some("/nonexistent/x"))
+        };
+        let e = resolve(strict, &ToolSetting::Auto, Some(d.path().as_os_str())).unwrap_err();
+        assert!(matches!(e, ToolError::NotConfigured { .. }), "{e}");
+        assert!(e.to_string().contains("set tools.sops"), "{e}");
+        let configured = fake_bin(d.path(), "configured");
+        let r = resolve(strict, &ToolSetting::Path(configured), None).unwrap();
+        assert_eq!(r.source, ToolSource::Configured);
+        const { assert!(!GPG.path_fallback && SOPS.path_fallback && AGE_KEYGEN.path_fallback) };
     }
 
     /// T18: configured path, then baked path, then PATH.

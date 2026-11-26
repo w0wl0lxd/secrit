@@ -9,7 +9,7 @@ pub mod store;
 pub mod wire;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend::sops::TempIgnore;
 use crate::backend::{self, Backend};
@@ -27,6 +27,8 @@ pub struct Ctx {
     pub store: StoreConfig,
     pub nix: Option<NixConfig>,
     pub backend: Box<dyn Backend>,
+    /// The `--config` flag of this run, so a command hint repeats it.
+    pub config_flag: Option<PathBuf>,
 }
 
 impl Ctx {
@@ -47,6 +49,7 @@ impl Ctx {
             store,
             nix: config.nix,
             backend,
+            config_flag: config_flag.map(Path::to_path_buf),
         })
     }
 

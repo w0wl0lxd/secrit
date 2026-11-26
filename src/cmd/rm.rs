@@ -18,11 +18,7 @@ pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
     } else {
         format!(" {NO_BACKUP}.")
     };
-    if yes {
-        if !backups {
-            ctx.status(NO_BACKUP);
-        }
-    } else {
+    if !yes {
         let question = format!(
             "remove {name} from {}?{note} [y/N] ",
             ctx.backend.location()
@@ -32,6 +28,10 @@ pub fn run(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
         }
     }
     let report = ctx.backend.remove(name)?;
+    // After the delete: a refused delete leaves the item in place.
+    if !backups {
+        ctx.status(NO_BACKUP);
+    }
     if let Some(b) = &report.backup {
         ctx.status(&format!("backup of the old file: {}", escape_path(b)));
     }

@@ -67,6 +67,11 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     ));
     if no_backup {
         ctx.status(NO_BACKUP);
+    } else if write_mode == PutMode::Replace && !ctx.backend.capabilities().backups {
+        // The name was free at the check, and another process may have made
+        // it before the write: say that a replaced value has no backup, and
+        // do not claim that there was one.
+        ctx.status("secrit keeps no backup of a value that a replace overwrites");
     }
     ctx.commit_hint(name, "Store");
     // The hint is for a name that `wire` can expose.

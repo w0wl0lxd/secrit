@@ -6,9 +6,10 @@ prompt or from stdin. The value never goes on the command line, never reaches th
 scrollback, and the write is crash-safe and lock-protected. The design is in
 [`docs/PLAN.md`](docs/PLAN.md).
 
-Status: v0.1. Every v0.1 command works: `store`, `get`, `ls`, `rm`, `init`, `doctor` and
-`wire`. `run` moved to v0.2 (see [What works](#what-works)). v0.2 adds a second backend:
-a [Secret Service store](#secret-service-store) keeps each value as an item of
+Status: v0.1, with v0.2 work in progress. Every v0.1 command works: `store`, `get`, `ls`,
+`rm`, `init`, `doctor` and `wire`. `run` (v0.2) works on Linux (see
+[What works](#what-works)). v0.2 adds a second backend: a
+[Secret Service store](#secret-service-store) keeps each value as an item of
 gnome-keyring, KWallet or the KeePassXC Secret Service server.
 
 ## What secrit does not protect against
@@ -18,6 +19,14 @@ Read this first.
 - **A hostile process of your own user.** Such a process can run `sops decrypt` with your
   key, read `/run/secrets/*`, or read your terminal. secrit's agent and terminal rules
   prevent accidents. They are not a security boundary.
+- **An agent that works around the write gate.** The typed-name question stops accidents,
+  not an agent that wants to write. An agent can allocate a terminal, unset its variable
+  and start secrit outside its own process tree (for example with
+  `systemd-run --user --pty`), so detection finds no agent. An agent that drives a
+  terminal (a pty mode, `tmux send-keys`, terminal remote control) sees the question and
+  can type the name. A writer can type the answer after secrit discards the input typed
+  ahead. A direct `sops set`, `sops edit` or `git` change to the store file never meets
+  the gate. Some agents set no variable at all.
 - **Secret names are not secret.** sops keeps key names in cleartext, in the file and in
   git history. `secrit ls` prints them without a key.
 - **Copies outside secrit.** sops (a Go program) holds the value in memory that secrit
@@ -30,6 +39,19 @@ Read this first.
   can read it too: for example Kitty remote control, a screen recorder or a screen share.
 - **No clipboard in v0.1.** secrit has no clipboard support: clipboard history daemons
   keep values on disk. Use `get --stdout` into a pipe instead.
+- **`secrit run` hands values to another program.** Masking of its output prevents
+  accidents only. A program can print a value in a form that secrit does not know (T44),
+  and base64 that is wrapped into lines is not matched. Masking covers stdout and stderr
+  only, and the command sees pipes, not a terminal. After 100 ms of idle output secrit
+  shows the bytes that it holds, so a prefix of a value can show. When the rest of the
+  value follows later, the rest is masked; the prefix stays shown. While secrit masks,
+  it stops the copy of the output when CMD has exited and the output stays idle for
+  100 ms. A background process that CMD leaves running and that writes later gets `EPIPE`
+  or `SIGPIPE`, and its output is lost. Any process of your user can read an `--env`
+  value in `/proc/PID/environ` (also `ps eww` and `docker inspect`), and a `--file` value
+  through `/proc/PID/fd/N` (T42, T57); masking covers neither. The memfd and `VAR` pass
+  to grandchildren; `sudo` and other programs that close every fd above 2 lose `--file`
+  values; memfd pages can reach swap.
 - **gpg-agent (pass stores).** Any process that can use your gpg-agent can decrypt the
   entries of a pass store while the agent caches the passphrase, or at any time when the
   key has no passphrase. secrit's agent rules do not change that.
@@ -154,13 +176,83 @@ collection = "default"   # optional; an alias, or an object path that starts wit
 unlock = "refuse"        # optional; "refuse" (default) or "prompt"
 ```
 
-A sops key (`file`, `sops_config`, `age_key_file`) or `wire_hint` in a Secret Service
-store is an error, and so is `collection` or `unlock` in a sops store.
+A sops key (`file`, `sops_config`, `age_key_file`, a key source of the table below, or an
+`identity` table) or `wire_hint` in a Secret Service store is an error, and so is
+`collection` or `unlock` in a sops store.
 
-**Keys.** secrit gives sops only an age key file (`SOPS_AGE_KEY_FILE`). sops runs with no
-usable `HOME`, so it never tries `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. Age keys from SSH
-keys, `SOPS_AGE_KEY` and `SOPS_AGE_KEY_CMD` are not used. A passphrase-protected key fails
-at once with a clear message; sops cannot prompt.
+**Keys.** secrit runs sops with a cleared environment and `HOME=/nonexistent`, so sops
+never tries `~/.ssh/id_ed25519`, `~/.ssh/id_rsa` or a key in an environment variable.
+sops gets only the key sources that the store names, each one as a path:
+
+| Store key | sops variable | Rules |
+|---|---|---|
+| `age_key_file` | `SOPS_AGE_KEY_FILE` | The default: `$XDG_CONFIG_HOME/sops/age/keys.txt`, when the store names no other key source. |
+| `age_ssh_key_file` | `SOPS_AGE_SSH_PRIVATE_KEY_FILE` | An OpenSSH ed25519 or RSA key with no passphrase, mode 0600, not a symlink. |
+| `age_key_cmd` | `SOPS_AGE_KEY_CMD` | An absolute path to an executable that prints age identities. No arguments, and no space, tab, quote, backslash or `#` in the path, because sops splits the string. The file and its directory must be yours, root's or the Nix store's, and not writable by group or others (exit 3). |
+| `age_plugin_dir` | `PATH` | A directory that holds only `age-plugin-*` programs, under the same ownership rule. sops gets this directory as its only `PATH`. |
+
+```toml
+[stores.main]
+backend = "sops"
+file = "/etc/nixos/secrets/secrit.yaml"
+age_ssh_key_file = "~/.ssh/sops_ed25519"     # optional
+age_key_cmd = "~/.local/bin/sops-age-key"    # optional
+age_key_cmd_timeout_secs = 20                # the default
+age_plugin_dir = "~/.local/lib/age-plugins"  # optional
+```
+
+sops never gets the terminal, so a key that asks for a passphrase or a PIN fails at once,
+and the message names the key source. A key command or a plugin that waits for another
+reason ends after `age_key_cmd_timeout_secs` (default 20 s), not after the usual 120 s.
+
+sops runs the key command each time it loads identities, so the command can run more than
+once for one sops run (for example, a second recipient is another try), and `store`
+runs sops twice (the write and the read-back check). Do not rely on a count of runs.
+It runs with the environment of sops: no terminal, `HOME=/nonexistent`, and no `PATH`
+(or only `age_plugin_dir` as `PATH`). So `pass`, `rbw`, `op` or `secret-tool` fail unless the command sets
+its own `PATH` and `HOME`. secrit does not widen the environment for it. Use an absolute
+interpreter, as in this wrapper; `doctor` warns about a `#!/usr/bin/env` line:
+
+```sh
+#!/run/current-system/sw/bin/bash
+# sops-age-key: prints one age identity for sops. Mode 0700.
+export PATH=/run/current-system/sw/bin HOME=/home/alice
+exec secret-tool lookup service sops-age
+```
+
+**Plugin identity.** A store can name one identity in its own table instead. Then the
+store must not set `age_key_file`, `age_ssh_key_file`, `age_key_cmd` or `age_plugin_dir`,
+and sops gets no other key:
+
+```toml
+[stores.vault.identity]
+kind = "plugin"                             # or "file", "ssh-file", "key-cmd" with `path`
+stub = "~/.config/secrit/yubikey.identity"  # the identity file that the plugin wrote
+plugin_dir = "~/.local/lib/age-plugins"     # holds age-plugin-yubikey
+level = "touch"                             # optional; default: the strictest this build supports
+touch_timeout_secs = 30                     # the default
+```
+
+For a plugin identity, secrit:
+
+- refuses each command that decrypts when there is no `/dev/tty` (exit 3);
+- refuses (exit 3) a stub file that holds a plain age key or that is larger than 16 KiB;
+- writes one line to `/dev/tty` before each sops run that decrypts, for example
+  `secrit: touch your key to read 'db_password' from vault (1 of 1)`;
+- ends a sops run that waits longer than `touch_timeout_secs`;
+- refuses (exit 3) a file with a fido2-hmac recipient of format version 2, a plain key
+  that you can read as a recipient (the default age key file, `~/.ssh/id_ed25519.pub` or
+  `~/.ssh/id_rsa.pub`), or a key type other than age;
+- for age-plugin-yubikey, reads the slot policy from `age-plugin-yubikey --list`. A slot
+  with touch policy `cached` is refused at every level. A level stricter than the slot is
+  an error, not a downgrade, for example
+  `level 'strict' needs PIN policy always; slot 1 on serial N has once`.
+
+This build serves the levels up to `touch`: touch policy `always` and PIN policy `never`.
+`session` and `strict` are refused after the slot check. secrit checks the slot policy of
+age-plugin-yubikey only; `doctor` says when it cannot check another plugin. A fido2-hmac
+key in its native X25519 form (`age1...`) looks like any other age key, so secrit cannot
+refuse it.
 
 ## Set up a store
 
@@ -272,10 +364,11 @@ exists and is unlocked. Then it writes the config section. It creates nothing in
   terminal. A gnome-keyring that started with the keyring locked shows no names, so `ls`
   exits 3 too.
 - **No backup.** `store --replace` and `rm` print `no backup; the old value is gone` and
-  ask for `y` on the terminal, even for you. `--yes` skips the question; with no terminal
-  it is the only way. When the name is free, `store --replace` asks nothing. If another
-  process makes the name before secrit writes, secrit keeps that item and exits 3; run the
-  command again to confirm the replace.
+  ask for `y` on the terminal, even for you. `--yes` skips the question. Under an agent
+  the typed name of [the write gate](#rules-secrit-enforces) replaces the `y`, and with no
+  terminal the write gate refuses them. When the name is free, `store --replace` asks
+  nothing. If another process makes the name before secrit writes, secrit keeps that item
+  and exits 3; run the command again to confirm the replace.
 - **Create only.** Without `--replace`, secrit searches, creates and searches again under
   its lock, so parallel `store` runs make one item. Another program can still add an item
   with the same attributes; then `get` exits 1 and names the count.
@@ -354,7 +447,11 @@ secrit get github-token                # shows it on the alternate screen; any k
                                        # (a screen reader or recorder can see it too)
 secrit get github-token --stdout | some-cmd   # exact bytes to a pipe; refused on a terminal
 
-secrit rm github-token                 # asks on the terminal; --yes to skip
+secrit rm github-token                 # asks on the terminal; --yes to skip (not under an agent)
+
+secrit run --file TOKEN_FILE=github-token -- some-cmd   # TOKEN_FILE=/dev/fd/N, a sealed memfd
+secrit run --env TOKEN=github-token -- some-cmd         # the value in the environment
+secrit run --pristine --file KEY=db-pass -- server      # only the --file and --env variables
 
 secrit doctor                          # read-only checks; exit 1 when one fails
 secrit doctor --json
@@ -365,12 +462,29 @@ secrit wire github-token --owner svc --format env   # GITHUB_TOKEN_FILE=/run/sec
 `doctor` checks the tools, the age key and its mode, the store file and directory, the
 `.sops.yaml` rule, cleartext entries, leftover temp copies and old backups, the backup
 directory, and the git state of the store file. It decrypts nothing and prints no value.
+It says what the write gate does when it detects an agent, and it warns when the binary
+was built with the `test-hooks` feature, which only the test suite uses.
 
 `--store NAME` picks another store from the config. `-q` prints errors only.
 
 At the terminal prompt, a tab is kept. The terminal limits one line to 4095 bytes; pipe a
 longer value. `--multiline` at the prompt reads lines until a line that holds only `.`, and
 asks once, not twice.
+
+`run` (Linux) reads every value first, then starts CMD. `--file VAR=NAME` puts the value
+in a sealed memfd named `secrit` and sets `VAR=/dev/fd/N`; the command can open that path
+more than once. `--env VAR=NAME` puts the value itself in `VAR` and refuses a value with a
+NUL byte. `--pristine` starts CMD with only those variables. When stdout or stderr is not
+a terminal, or an agent is detected, secrit stays the parent and masks the output: each
+value, and its base64, URL-safe base64, hex, percent and JSON forms, becomes
+`[secrit:NAME]`. A value shorter than 4 bytes is not masked, with a warning. Otherwise,
+and with `--no-mask`, secrit replaces itself with CMD. Ctrl-C and Ctrl-Z reach CMD as
+usual; TERM and HUP are forwarded to it. A signal that the caller ignores (`nohup`,
+`trap '' HUP`) stays ignored in secrit and in CMD, and secrit does not forward it (Linux;
+on other systems CMD starts with the default action). `run` exits with CMD's exit code,
+or ends by the signal that ended CMD. CMD runs with the umask that secrit started with.
+CMD keeps `RLIMIT_CORE=0` on purpose: it holds the values too, so it writes no core dump.
+The hard limit is 0 too, so an unprivileged CMD cannot raise it.
 
 `get --stdout` writes to a pipe, a socket or a character device. It writes to a regular
 file only when the file is yours and group and others cannot read it (for example after
@@ -381,7 +495,8 @@ terminal, overwrite, name rule, an unsafe store file, store directory, config fi
 directory, `.sops.yaml` or `sops`, a locked collection or an unsafe session bus), `4` lock
 timeout or a
 concurrent change, `130` a signal cancelled the command before a write took effect. `init`
-keeps the files of the steps it finished; run it again to finish the setup.
+keeps the files of the steps it finished; run it again to finish the setup. `run` exits
+with the exit code of CMD once CMD has started.
 
 ### Rules secrit enforces
 
@@ -406,11 +521,28 @@ keeps the files of the steps it finished; run it again to finish the setup.
   lists every leaf by its path (`a/b/c`), and an empty map by its own name.
 - **Values** are UTF-8 text up to 64 KiB, with no control characters except tab (and
   newline with `--multiline` or `--raw`). They are always stored as strings.
-- **Agents.** When a coding-agent variable is set and not empty (`CLAUDECODE`,
-  `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX`, `CODEX_THREAD_ID`,
-  `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE` or `OPENCODE_CLIENT`), `get` is refused. There is no override: an agent can set any
-  variable. With no terminal at all (`/dev/tty` cannot be opened, as in cron or
-  `ssh -T`), `get` is also refused. `store`, `ls` and `rm --yes` work.
+- **Agents.** secrit detects an agent when a coding-agent variable is set and not empty
+  (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `AGENT`, `CODEX_SANDBOX` (macOS
+  only), `CODEX_THREAD_ID`, `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE`, `OPENCODE`,
+  `OPENCODE_CLIENT` or `COPILOT_CLI`), in its own environment or in the environment of a
+  parent process (at most 64 levels up), or when there is no terminal at all (`/dev/tty`
+  cannot be opened, as in cron or `ssh -T`). There is no override: an agent can set any
+  variable. Under an agent, `get`, `run --env` and `run --no-mask` are refused; `run --file`
+  works and its output is always masked. The walk reads the environment that each
+  parent process had when it started. So a long-lived process that started in an agent
+  session (for example a terminal multiplexer server) makes every shell under it an agent.
+  The question and the `doctor` agent row name the pid and the name of that process. Start
+  that process again outside the agent session.
+- **The write gate.** Under an agent, `store`, `rm` and `init` ask on the terminal for the
+  secret name (the store name for `init`) and go on only when it is typed exactly. A `y`
+  does not confirm, and `rm --yes` still asks. secrit discards input that was typed before
+  the question. With no terminal they are refused with exit 3: CI or a remote job uses
+  `secrit seal`, a scheduled job runs as its own system service that reads an existing
+  secret (a service has no terminal either, so it cannot write the store: unattended
+  writes are not supported), and ssh uses `ssh -t`.
+  No variable, config key or flag turns the gate off. It stops accidents, not an agent
+  that works around it (see [What secrit does not protect
+  against](#what-secrit-does-not-protect-against)). `ls`, `doctor` and `wire` work.
 - **Terminal output.** `get` never writes a control character from the value to the
   terminal: it shows `\xNN` in reverse video instead. `ls` escapes names the same way.
 - **The write protocol.** secrit takes a lock in `$XDG_RUNTIME_DIR/secrit/`, copies the
@@ -443,7 +575,7 @@ not one that lands after it.
 | `completions bash\|fish\|zsh` | Works (hidden) | |
 | home-manager module | Works | |
 | pass layout store (`backend = "pass"`) | Not in v0.1 | Works on this branch (v0.2, S11) |
-| `run` (memfd, masking) | Not in v0.1 | v0.2 (M6) |
+| `run` (memfd, masking) | Works on Linux (v0.2, S13) | `--file` needs Linux |
 | `--clip` (clipboard) | Not in v0.1 | v0.2, optional (Q4) |
 
 ## Develop

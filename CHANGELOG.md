@@ -103,12 +103,62 @@ All notable changes to this project are recorded here. The format follows
   process of the user on the session bus can read the values. `doctor` needs `sops` only
   when a store that it checks uses sops.
 - `store --replace --yes`: on a store that keeps no backup, `--yes` confirms the
-  replacement without a question.
+  replacement without a question. Under agent detection the write gate still asks for the
+  name, and the question says that the store keeps no backup.
 - Tests: the conformance suite runs on a Secret Service store too
   (`tests/backend_secret_service.rs`), with a private `dbus-daemon` and
   `gnome-keyring-daemon` per test and `secret-tool` to read values back. It runs in
   `nix flake check`: the Nix build sandbox can run both daemons.
-- Internal: the output masker for the coming `secrit run` (v0.2). No command uses it yet.
+- sops key sources (v0.2 plan S8): `age_ssh_key_file` (an SSH key with no passphrase),
+  `age_key_cmd` (an absolute, trusted program; `age_key_cmd_timeout_secs`, default 20)
+  and `age_plugin_dir` (the only `PATH` that sops gets; it holds only trusted
+  `age-plugin-*` programs). An unsafe key command or plugin directory exits 3.
+- A `[stores.NAME.identity]` table with `kind` `file`, `ssh-file`, `key-cmd` or `plugin`.
+  A plugin identity never falls back to the age key file, needs `/dev/tty`, writes one
+  touch line per decrypting sops run, and uses `touch_timeout_secs` (default 30) as the
+  sops deadline. It refuses a fido2-hmac v2 recipient, a plain key that the user can
+  read, a non-age key type, a YubiKey slot with touch policy `cached`, and a `level`
+  stricter than the slot. This build serves levels up to `touch`. A stub file that holds
+  a plain age key, or that is larger than 16 KiB, exits 3. A store name shows in the
+  touch line with its control characters escaped, and a run that secrit refuses before
+  sops starts writes no touch line.
+- `doctor` rows for the SSH key (owner, mode and passphrase, from the key header only),
+  the key command (trust rule and shebang), the plugin directory and the plugin identity.
+  `doctor` runs `age-plugin-yubikey --list` only from a plugin directory that passes the
+  trust rule.
+- The write gate (owner ruling Q13(b), PLAN-v0.2 section 4). Under agent detection,
+  `store` (also `--replace`), `rm` (also `--yes`) and `init` (once, before its first write)
+  ask on `/dev/tty` for the name: `an agent runs secrit (CLAUDECODE is set). To store
+  'NAME' in FILE, type the name:`. `init` asks for the store name and lists the files it
+  creates and the recipients. Only the exact name confirms; anything else exits 3 with
+  `not confirmed`. secrit discards input typed before the question. `store` asks after its
+  checks and before it reads the value.
+- With no terminal, `store`, `rm` and `init` exit 3 with `refused: no terminal to confirm
+  on. CI or a remote job: use 'secrit seal'. A scheduled job: run it as its own system
+  service. Over ssh: use ssh -t.` (owner ruling Q19). No variable, config key or flag
+  turns this off. So a write from cron, a systemd unit or CI is refused.
+- `secrit --version` prints `features: test-hooks`, and `doctor` shows a `warn` row
+  `build: test hooks are compiled in`, when the test hooks are compiled in. The flake check
+  `release-features` fails when the package's `--version` names `test-hooks`.
+- README "What secrit does not protect against" lists the ways around the write gate.
+- `secrit run [--file VAR=NAME]... [--env VAR=NAME]... [--pristine] [--no-mask] -- CMD`
+  (v0.2, Linux). It reads every value first, then starts CMD. `--file` hands a value
+  through a sealed memfd named `secrit` (`VAR=/dev/fd/N`, readable more than once).
+  `--env` puts the value in the environment and refuses a value with NUL. `--pristine`
+  starts CMD with only those variables. When stdout or stderr is not a terminal, or an
+  agent is detected, the output is masked; otherwise, and with `--no-mask`, secrit
+  replaces itself with CMD. Under agent detection `--env` and `--no-mask` exit 3, and
+  `--file` runs with masking. Ctrl-C and Ctrl-Z reach CMD; when CMD stops, secrit stops
+  too, and `fg` resumes both. TERM and HUP are forwarded. A signal that the caller ignores
+  (`nohup`, `trap '' HUP`) stays ignored in secrit and in CMD and is not forwarded
+  (Linux). secrit exits with CMD's exit code, or ends by the signal that ended CMD. CMD
+  gets the umask that secrit started with.
+  Held output goes out after 100 ms with no new output, so a prompt with no newline is
+  shown. When that output is the start of a value and the rest follows later, the rest is
+  masked. While secrit masks, the copy of the output stops when CMD has exited and the
+  output stays idle for 100 ms, so a background process that CMD leaves running gets
+  `EPIPE` or `SIGPIPE` when it writes later. CMD keeps `RLIMIT_CORE=0` on purpose.
+- Internal: the output masker for `secrit run` (v0.2).
   It replaces a value and its base64 (both alphabets, three byte offsets, with and without
   padding), percent, JSON and hex forms with `[secrit:NAME]`. It holds back only a
   possible start of a match, so a prompt with no newline goes out at once. A value shorter
@@ -121,9 +171,15 @@ All notable changes to this project are recorded here. The format follows
   - Overlapping values are masked as one region, labelled `[secrit:A+B]`. Before, the
     second value of an overlap stayed partly visible.
   - `flush_held` releases held bytes after an idle period, so a prompt that starts like a
-    value is shown. It never shows a full match.
+    value is shown. It never shows a full match. The masker keeps the last released
+    bytes, so the rest of a value that follows later becomes the label; the released
+    prefix stays shown.
   - Comparisons of secret bytes run in constant time. A small write after a large one no
     longer wipes the whole output buffer.
+  - A constant-time compare of the first 8 bytes of each pattern runs before the full
+    compare (issue #10). With a 4 KiB value and 64 MiB of output that often holds the
+    first byte of the value, a release build masked about 0.4 MiB/s before and about
+    120 MiB/s after.
 
 - pass layout backend (`backend = "pass"`, v0.2 plan 6.4): one gpg file per name in a
   password-store directory, read and written with `gpg`; secrit never runs `pass` or
@@ -157,14 +213,34 @@ All notable changes to this project are recorded here. The format follows
   `store x_unencrypted` still exit 3 before a value is read. `get` and `rm` no longer
   refuse such a name by its form: `get sops` and `rm sops` say that it does not exist,
   and `rm x_unencrypted` removes a cleartext entry of that name.
+- The message for a sops run that stopped to ask on the terminal names the configured key
+  source, not "v0.1 supports only an age key file". A key command that fails because it
+  needs `PATH` gets a note on the cleared environment. A run that hits the shorter key
+  source deadline says what it may wait on.
+- The default age key file applies only when the store names no other key source.
 - The `.gitignore` line for temp copies is now `.*.secrit-*`, for all formats. `init`,
   `wire` and `doctor` print it. The v0.1 line `.*.secrit-*.yaml` still covers a YAML
   store, so `doctor` passes it there; for a JSON store, `doctor` warns and names the new
   line.
+- Agent detection adds `OPENCODE` and `COPILOT_CLI`, and reads the environment of the
+  ancestor processes through `/proc` (at most 64 levels). A variable that an agent removes
+  only for secrit (`env -u CLAUDECODE secrit ...`) is still found in its shell; the
+  question then names that process. `get` uses the same detection. Each environment
+  goes through one fixed 64 KiB buffer that is wiped, at most 4 MiB per process. A
+  process reports the environment it had at start, so a long-lived process that started
+  in an agent session (for example a terminal multiplexer server) makes every shell under
+  it an agent. The README says how to find and restart it.
+- `rm` with no terminal and no `--yes` prints the Q19 text above instead of `pass --yes to
+  remove without asking`.
+- The `doctor` agent row says what the gate does: `get` and `run --env` are off; every
+  decrypt of a gated store is off; `store`, `rm`, `generate` and `init` need the typed
+  name, or are off with no terminal; `seal` works.
 - `store --replace` and `rm` on a store that keeps no backup (Secret Service) print
   `no backup; the old value is gone` and ask for `y` on the terminal, even for the owner;
-  with no terminal, only `--yes` confirms (exit 3 otherwise). The value is not read before
-  the answer. `rm` also says that the daemon may keep the old value in its own files.
+  `--yes` skips that question. Under agent detection the typed name of the write gate
+  replaces the `y`. With no terminal the write gate refuses them (exit 3). The value is
+  not read before the answer. `rm` also says that the daemon may keep the old value in its
+  own files.
 - `store --replace` without `--yes` on a free name of a store that keeps no backup does
   not replace an item that another process makes before the write. secrit checks again
   under its lock, keeps that item, and exits 3.

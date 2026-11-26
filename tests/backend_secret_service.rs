@@ -238,6 +238,79 @@ fn rm_says_no_backup_is_kept() {
     assert!(stderr(&out).contains("does not exist"));
 }
 
+/// The write gate (PLAN-v0.2 4.1) covers a Secret Service store: with no
+/// terminal, `store`, `store --replace --yes`, `rm --yes` and `init` exit 3
+/// with the Q19 text, and the collection and the config stay unchanged.
+#[test]
+fn the_write_gate_refuses_without_a_terminal() {
+    let f = fixture();
+    let d = f.dirs();
+    ok(&d.store_value("n", b"old"));
+    let refused = |args: &[&str], stdin: Option<&[u8]>| {
+        let out = run_cmd(no_tty(&d.gate_cmd()), args.iter().copied(), stdin);
+        assert_eq!(code(&out), 3, "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("refused: no terminal to confirm on."),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    };
+    refused(&["store", "m"], Some(b"v"));
+    refused(&["store", "n", "--replace", "--yes"], Some(b"new"));
+    refused(&["rm", "n", "--yes"], None);
+    assert_eq!(f.names(), ["n"]);
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"old"[..]),
+        "the store holds another value"
+    );
+
+    std::fs::remove_file(&d.config_file).unwrap();
+    refused(&["init", "--backend", "secret-service"], None);
+    assert!(!d.config_file.exists());
+}
+
+/// Under an agent the typed name replaces the `y` of T55: the question says
+/// that no backup is kept, and the name alone confirms `store --replace`
+/// and `rm`.
+#[test]
+fn the_typed_name_confirms_a_write_with_no_backup_under_an_agent() {
+    let f = fixture();
+    let d = f.dirs();
+    ok(&d.store_value("n", b"old"));
+    let mut agent = d.gate_cmd();
+    agent.env("CLAUDECODE", "1");
+    let bin = common::sh_quote(std::path::Path::new(common::BIN));
+
+    let inner = format!("printf new | {bin} store n --replace");
+    let out = d.under_script_answer(&agent, &inner, b"type the name: ", b"n\n");
+    let t = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code(&out), 0, "{t}");
+    assert!(
+        t.contains("an agent runs secrit (CLAUDECODE is set)"),
+        "{t}"
+    );
+    assert!(
+        t.contains("no backup; the old value is gone. To store 'n' in "),
+        "{t}"
+    );
+    assert!(!t.contains("[y/N]"), "{t}");
+    assert!(
+        f.read_back("n").as_deref() == Some(&b"new"[..]),
+        "the store holds another value"
+    );
+
+    let inner = format!("exec {bin} rm n");
+    let out = d.under_script_answer(&agent, &inner, b"type the name: ", b"n\n");
+    let t = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(code(&out), 0, "{t}");
+    assert!(
+        t.contains("no backup; the old value is gone. To remove 'n' from "),
+        "{t}"
+    );
+    assert!(!t.contains("[y/N]"), "{t}");
+    assert_eq!(f.read_back("n"), None);
+}
+
 /// The doctor rows of v0.2 plan 6.3, and the same-uid reader note (T29).
 /// No store uses sops, so a missing sops is a warning only.
 #[test]

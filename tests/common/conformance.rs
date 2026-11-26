@@ -210,7 +210,7 @@ pub fn replace_without_backup_needs_a_confirmation<F: Fixture>() {
     }
     assert_eq!(code(&out), 3, "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("pass --yes to replace without asking"),
+        stderr(&out).contains("refused: no terminal to confirm on."),
         "{}",
         stderr(&out)
     );

@@ -5,6 +5,10 @@ use rustix::fs::Mode;
 #[cfg(target_os = "linux")]
 use rustix::process::{DumpableBehavior, set_dumpable_behavior};
 use rustix::process::{Resource, Rlimit, setrlimit, umask};
+use std::sync::OnceLock;
+
+/// The umask before [`harden`] set 077, for the command of `secrit run`.
+static UMASK_BEFORE: OnceLock<Mode> = OnceLock::new();
 
 /// What [`harden`] managed to do. `main` prints a warning for each failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,10 +57,21 @@ pub fn harden() -> HardenReport {
     let not_dumpable = set_dumpable_behavior(DumpableBehavior::NotDumpable).is_ok();
     #[cfg(not(target_os = "linux"))]
     let not_dumpable = false;
-    umask(Mode::from_raw_mode(0o077));
+    let before = umask(Mode::from_raw_mode(0o077));
+    let _ = UMASK_BEFORE.set(before);
     HardenReport {
         no_core_dumps,
         not_dumpable,
+    }
+}
+
+/// Set the umask back to its value before [`harden`]. `secrit run` calls
+/// this after it made the memfds and before it starts the command, so the
+/// command creates files as the user expects. secrit creates no file after
+/// it. The core-dump limit stays 0 in the command: it holds the values too.
+pub fn restore_umask() {
+    if let Some(&mode) = UMASK_BEFORE.get() {
+        umask(mode);
     }
 }
 

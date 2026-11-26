@@ -1,7 +1,7 @@
 //! `secrit store NAME` (PLAN section 4.1).
 
-use super::rm::{NO_BACKUP, confirm};
-use super::{Ctx, StoreArgs};
+use super::rm::NO_BACKUP;
+use super::{Ctx, Gated, StoreArgs};
 use crate::backend::{BackendError, PutMode, WireSource};
 use crate::cli::ARGV_VALUE_MESSAGE;
 use crate::display::escape_path;
@@ -28,11 +28,42 @@ pub fn run(ctx: &Ctx, name: &Name, args: &StoreArgs) -> Result<(), Error> {
     // encrypt it), so nobody types a value that will be refused. The write
     // protocol checks again under the lock.
     ctx.backend.check_put(name, put_mode)?;
+    // On a backend with no backup, a replace of a name that exists needs a
+    // confirmation (T55, Q37). The check runs before the gate, so the gate
+    // question can say that the old value is lost.
+    let no_backup_replace = put_mode == PutMode::Replace
+        && !ctx.backend.capabilities().backups
+        && ctx.backend.exists(name)?;
+    // The write gate comes after the checks and before the value (PLAN-v0.2
+    // 4.2, step 1), so nobody types a value that the gate then refuses.
+    // Under an agent the typed name replaces the y/N question of T55, and
+    // `--yes` does not skip it (4.2, step 6).
+    let gated = super::write_gate(
+        |agent| {
+            let skip = if args.yes {
+                "--yes does not skip this question when an agent runs secrit.\n"
+            } else {
+                ""
+            };
+            let note = if no_backup_replace {
+                format!(" {NO_BACKUP}.")
+            } else {
+                String::new()
+            };
+            format!(
+                "{skip}an agent runs secrit ({agent}).{note} To store '{name}' in {}, type the name: ",
+                ctx.backend.location()
+            )
+        },
+        name.as_str(),
+    )?;
     let mut write_mode = put_mode;
     let mut no_backup = false;
     if put_mode == PutMode::Replace && !ctx.backend.capabilities().backups {
-        if ctx.backend.exists(name)? {
-            confirm_replace(ctx, name, args.yes)?;
+        if no_backup_replace {
+            if gated == Gated::Open {
+                confirm_replace(ctx, name, args.yes)?;
+            }
             no_backup = true;
         } else if !args.yes {
             // Nothing was confirmed, so the write must not replace an item
@@ -98,7 +129,7 @@ fn confirm_replace(ctx: &Ctx, name: &Name, yes: bool) -> Result<(), Error> {
         "replace {name} in {}? {NO_BACKUP}. [y/N] ",
         ctx.backend.location()
     );
-    if confirm(&question, "replace")? {
+    if crate::tty::confirm_yes(&question)? {
         Ok(())
     } else {
         Err(Error::Failed("not replaced".into()))
